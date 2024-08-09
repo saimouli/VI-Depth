@@ -1,9 +1,12 @@
 import argparse
-import os, datetime
+import wandb
+import os
+import datetime
 from tqdm import tqdm
 import cv2
 import numpy as np
-import torch, torchvision
+import torch
+import torchvision
 from torch.utils.tensorboard import SummaryWriter
 
 from modules.midas.midas_net_custom import MidasNet_small_videpth
@@ -55,7 +58,6 @@ def train_scale_consistency(
     learning_rates,
     learning_schedule,
     batch_size,
-    n_step_summary,
     n_step_per_checkpoint,
     # loss
     loss_func,
@@ -67,7 +69,7 @@ def train_scale_consistency(
     max_pred_depth,
     checkpoint_dir,
     n_threads,
-    DepthModel,
+    using_wandb=True,
 ):
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
@@ -89,11 +91,16 @@ def train_scale_consistency(
     n_train_step = learning_schedule[-1] * np.ceil(n_train_sample / batch_size).astype(
         np.int32
     )
+    print(
+        f"number of training sample: {n_train_sample}, number of training step: {n_train_step}"
+    )
 
     # n_train_step = learning_schedule[-1] * np.ceil(n_train_sample / batch_size).astype(np.int32)
 
     # transform
+    # Todo: constants
     model_transforms = transforms.get_transforms("dpt_hybrid", "void", "150")
+
     depth_model_transform = model_transforms["depth_model"]
     ScaleMapLearner_transform = model_transforms["sml_model"]
 
@@ -127,14 +134,12 @@ def train_scale_consistency(
     time_start = time.time()
 
     print("Start training", log_path)
-    for epoch in range(1, learning_schedule[-1] + 1):
-        print("Epoch", epoch)
 
+    for epoch in range(learning_schedule[-1]):
         # set learning rate
         if epoch > learning_schedule[learning_schedule_pos]:
             learning_schedule_pos = learning_schedule_pos + 1
             learning_rate = learning_rates[learning_schedule_pos]
-
             # update learning rate of all optimizers
             for g in optimizer.param_groups:
                 g["lr"] = learning_rate
@@ -142,6 +147,7 @@ def train_scale_consistency(
         # train the mode
         # tgt_img, tgt_gt_depth, tgt_ga_depth, tgt_interp, ref_img, \
         #             ref_ga_depth, ref_interp, ref_gt_depth, tgt_pose, ref_pose, intrinsics
+
         for train_step, batch_data in tqdm(enumerate(train_dataloader)):
             # Move each element in the batch to the device
             batch_data = [
@@ -165,15 +171,15 @@ def train_scale_consistency(
 
             ref_img = [img.to(device) for img in ref_img]
 
-            ## visualize the tgt_img, and ref_im
-            tgt_img_test_1 = tgt_img[0].squeeze().cpu().numpy()
-            tgt_img_test_2 = tgt_img[1].squeeze().cpu().numpy()
+            # visualize the tgt_img, and ref_im
+            # tgt_img_test_1 = tgt_img[0].squeeze().cpu().numpy()
+            # tgt_img_test_2 = tgt_img[1].squeeze().cpu().numpy()
 
-            ref_img0_test_1 = ref_img[0][0].squeeze().cpu().numpy()
-            ref_img0_test_2 = ref_img[0][1].squeeze().cpu().numpy()
+            # ref_img0_test_1 = ref_img[0][0].squeeze().cpu().numpy()
+            # ref_img0_test_2 = ref_img[0][1].squeeze().cpu().numpy()
 
-            ref_img1_test_1 = ref_img[1][0].squeeze().cpu().numpy()
-            ref_img1_test_2 = ref_img[1][1].squeeze().cpu().numpy()
+            # ref_img1_test_1 = ref_img[1][0].squeeze().cpu().numpy()
+            # ref_img1_test_2 = ref_img[1][1].squeeze().cpu().numpy()
 
             # plt.figure(1)
             # plt.subplot(1, 3, 1)
@@ -365,8 +371,9 @@ def train_scale_consistency(
             tgt_img_resize = resize_and_pad(
                 tgt_img, (tgt_output_depth.shape[-2], tgt_output_depth.shape[-1])
             ).permute(0, 3, 1, 2)
+
             # correct the batches before passing to the loss function
-            photo_loss, geomentry_loss = compute_consistency_loss(
+            photometric_loss, geometric_loss = compute_consistency_loss(
                 ref_img_resize,
                 tgt_img_resize,
                 batch_gt_tgt,
@@ -414,8 +421,17 @@ def train_scale_consistency(
             )
             metric_loss = metric_loss_ref0 + metric_loss_ref1 + metric_loss_tgt
 
-            loss = 0.0 * photo_loss + 0.3 * geomentry_loss + 0.7 * metric_loss
+            loss = 0.0 * photometric_loss + 0.0 * geometric_loss + 1 * metric_loss
 
+            if using_wandb:
+                wandb.log(
+                    {
+                        # "photometric_loss": photometric_loss,
+                        #"geometric_loss": geometric_loss,
+                        "metric_loss": metric_loss,
+                        #"loss": loss,
+                    }
+                )
             # print('{}/{} epoch:{}: {}'.format(train_step % n_train_step, n_train_step, epoch, loss.item()))
 
             # Compute gradient and backpropagate
@@ -427,12 +443,13 @@ def train_scale_consistency(
                 time_elapse = (time.time() - time_start) / 3600
                 time_remain = (n_train_step - train_step) * time_elapse / train_step
 
-                print(
-                    "Step={:6}/{} Loss={:.5f} Time Elapsed={:.2f}h Time Remaining={:.2f}h".format(
-                        train_step, n_train_step, loss.item(), time_elapse, time_remain
-                    ),
-                    log_path,
-                )
+                # print(
+                #     "Step={:6}/{} Loss={:.5f} Time Elapsed={:.2f}h Time Remaining={:.2f}h".format(
+                #         train_step, n_train_step, loss.item(), time_elapse, time_remain
+                #     ),
+                #     log_path,
+                # )
+
                 # Save chkpt
                 ScaleMapLearner.save(depth_model_checkpoint_path.format(train_step))
 
@@ -876,25 +893,14 @@ def log_summary(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        prog="Train VI-Depth",
-        description="What the program does",
-        epilog="Text at the bottom of help",
-    )
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--using-wandb", dest="using_wandb", action="store_true")
     parser.add_argument(
         "-dp",
         "--depth-predictor",
         type=str,
         default="dpt_hybrid",
         help="Name of depth predictor to use in pipeline.",
-    )
-    parser.add_argument(
-        "-ns",
-        "--nsamples",
-        type=int,
-        default=150,
-        help="Number of sparse metric depth samples available.",
     )
     parser.add_argument(
         "-sm",
@@ -913,25 +919,72 @@ if __name__ == "__main__":
         type=str,
         default="output/train/classroom6",
     )
-
+    parser.add_argument(
+        "--consistency",
+        dest="is_consistency",
+        action="store_true",
+    )
+    parser.set_defaults(is_consistency=True)
     # train_root = "/media/saimouli/Data6T/datasets/VOID_150_test"
     # '/media/saimouli/RPNG_FLASH_4/datasets/VOID_150'
     # result_root = "/media/saimouli/Data6T/datasets/VOID_150_test/results"  #'/media/vision/RPNG_FLASH_4/void_150_sample/results'
+    # sml_ckt_path = "/home/saimouli/Documents/github/VI_Depth_sai/weights/sml_model.dpredictor.dpt_hybrid.nsamples.150.ckpt"
+
     args = parser.parse_args()
 
-    current_time = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    config = {
+        "dataset": "void_150",
+        "machine": "Laptop (RTX 3070 Ti)",
+        "learning_rates": [2e-4, 1e-4],
+        "learning_schedule": [20, 80],
+        "batch_size": 3,
+        "loss_func": "smoothl1",
+        "w_smoothness": 0.0,
+        "loss_smoothness_kernel_size": -1,
+    }
 
-    # sml_ckt_path = "/home/saimouli/Documents/github/VI_Depth_sai/weights/sml_model.dpredictor.dpt_hybrid.nsamples.150.ckpt"
+    if args.using_wandb:
+        # os.environ["WANDB_API_KEY"] = YOUR_KEY_HERE
+        os.environ["WANDB_MODE"] = "offline"
+        run = wandb.init(
+            # Set the project where this run will be logged
+            project="consistent-vi-depth",
+            # Track hyperparameters and run metadata
+            config=config,
+        )
+
+    current_time = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
     image_path = os.path.join(args.train_dir, "image")
     gt_path = os.path.join(args.train_dir, "ground_truth")
     sparse_depth_path = os.path.join(args.train_dir, "sparse_depth")
 
+    if args.depth_predictor != "dpt_hybrid":
+        raise RuntimeError("Not using dpt_hybrid")
     DepthModel = torch.hub.load("intel-isl/MiDaS", "DPT_Hybrid")
 
-    train_consistency = True
-
-    if train_consistency == False:
+    if args.is_consistency:
+        train_scale_consistency(
+            # data load
+            train_dataset_path=args.train_dir,
+            # train params
+            learning_rates=config.get("learning_rates"),
+            learning_schedule=config.get("learning_schedule"),
+            batch_size=config.get("batch_size"),
+            n_step_per_checkpoint=100,
+            # loss settings
+            loss_func=config.get("loss_func"),
+            w_smoothness=config.get("w_smoothness"),
+            loss_smoothness_kernel_size=config.get("loss_smoothness_kernel_size"),
+            # model
+            chkpt_path=args.sml_model_path,
+            min_pred_depth=0.1,
+            max_pred_depth=8.0,
+            checkpoint_dir=os.path.join(args.train_dir, "checkpoints", current_time),
+            n_threads=1,
+            using_wandb=args.using_wandb,
+        )
+    else:
         train(
             # data load
             train_dataset_path=args.train_dir,
@@ -951,27 +1004,5 @@ if __name__ == "__main__":
             max_pred_depth=8.0,
             checkpoint_dir=os.path.join(args.train_dir, "checkpoints", current_time),
             n_threads=3,
-            DepthModel=DepthModel,
-        )
-    else:
-        train_scale_consistency(
-            # data load
-            train_dataset_path=args.train_dir,
-            # train params
-            learning_rates=[2e-4, 1e-4],
-            learning_schedule=[20, 80],
-            batch_size=3,
-            n_step_summary=5,
-            n_step_per_checkpoint=100,
-            # loss settings
-            loss_func="smoothl1",
-            w_smoothness=0.0,
-            loss_smoothness_kernel_size=-1,
-            # model
-            chkpt_path=args.sml_model_path,
-            min_pred_depth=0.1,
-            max_pred_depth=8.0,
-            checkpoint_dir=os.path.join(args.train_dir, "checkpoints", current_time),
-            n_threads=1,
             DepthModel=DepthModel,
         )
