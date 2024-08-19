@@ -21,6 +21,7 @@ from utils_eval import compute_ls_solution
 from data.SML_dataset import SML_dataset
 from data.SML_consistent_dataset import SML_consistent_dataset
 
+from varname import nameof
 import time
 import matplotlib.pyplot as plt
 
@@ -98,7 +99,7 @@ def train_scale_consistency(
     # n_train_step = learning_schedule[-1] * np.ceil(n_train_sample / batch_size).astype(np.int32)
 
     # transform
-    # Todo: constants
+    # TODO: constant strings to parameters
     model_transforms = transforms.get_transforms("dpt_hybrid", "void", "150")
 
     depth_model_transform = model_transforms["depth_model"]
@@ -169,42 +170,60 @@ def train_scale_consistency(
                 intrinsics,
             ) = batch_data
 
+            # tgt_gt_depth.shape = torch.Size([3, 480, 640])
+            # tgt_ga_depth.shape = torch.Size([3, 480, 640])
+            # tgt_interp.shape = torch.Size([3, 480, 640])
+            # ref_img[0].shape = torch.Size([3, 480, 640, 3])
+            # ref_img[1].shape = torch.Size([3, 480, 640, 3])
+            # ref_ga_depth[0].shape = torch.Size([3, 480, 640])
+            # ref_ga_depth[1].shape = torch.Size([3, 480, 640])
+            # ref_interp[0].shape = torch.Size([3, 480, 640])
+            # ref_interp[1].shape = torch.Size([3, 480, 640])
+            # ref_gt_depth[0].shape = torch.Size([3, 480, 640])
+            # ref_gt_depth[1].shape = torch.Size([3, 480, 640])
+            # tgt_pose[0].shape = torch.Size([3, 4])
+            # tgt_pose[1].shape = torch.Size([3, 4])
+            # ref_pose[0].shape = torch.Size([3, 3, 4])
+            # ref_pose[1].shape = torch.Size([3, 3, 4])
+            # intrinsics.shape = torch.Size([3, 3, 3])
+
             ref_img = [img.to(device) for img in ref_img]
 
             # visualize the tgt_img, and ref_im
-            # tgt_img_test_1 = tgt_img[0].squeeze().cpu().numpy()
-            # tgt_img_test_2 = tgt_img[1].squeeze().cpu().numpy()
+            # if train_step == 100:
+            #     tgt_img_test_1 = tgt_img[0].squeeze().cpu().numpy()
+            #     tgt_img_test_2 = tgt_img[1].squeeze().cpu().numpy()
 
-            # ref_img0_test_1 = ref_img[0][0].squeeze().cpu().numpy()
-            # ref_img0_test_2 = ref_img[0][1].squeeze().cpu().numpy()
+            #     ref_img0_test_1 = ref_img[0][0].squeeze().cpu().numpy()
+            #     ref_img0_test_2 = ref_img[0][1].squeeze().cpu().numpy()
 
-            # ref_img1_test_1 = ref_img[1][0].squeeze().cpu().numpy()
-            # ref_img1_test_2 = ref_img[1][1].squeeze().cpu().numpy()
+            #     ref_img1_test_1 = ref_img[1][0].squeeze().cpu().numpy()
+            #     ref_img1_test_2 = ref_img[1][1].squeeze().cpu().numpy()
 
-            # plt.figure(1)
-            # plt.subplot(1, 3, 1)
-            # plt.title("Tgt Img 1")
-            # plt.imshow(tgt_img_test_1)
-            # plt.subplot(1, 3, 2)
-            # plt.title("ref0 Img 1")
-            # plt.imshow(ref_img0_test_1)
-            # plt.subplot(1, 3, 3)
-            # plt.title("ref0 Img 2")
-            # plt.imshow(ref_img0_test_2)
+            #     plt.figure(1)
+            #     plt.subplot(1, 3, 1)
+            #     plt.title("Tgt Img 1")
+            #     plt.imshow(tgt_img_test_1)
+            #     plt.subplot(1, 3, 2)
+            #     plt.title("ref0 Img 1")
+            #     plt.imshow(ref_img0_test_1)
+            #     plt.subplot(1, 3, 3)
+            #     plt.title("ref0 Img 2")
+            #     plt.imshow(ref_img0_test_2)
 
-            # plt.figure(2)
-            # plt.subplot(1, 3, 1)
-            # plt.title("Tgt Img 2")
-            # plt.imshow(tgt_img_test_2)
-            # plt.subplot(1, 3, 2)
-            # plt.title("ref1 Img 1")
-            # plt.imshow(ref_img1_test_1)
-            # plt.subplot(1, 3, 3)
-            # plt.title("ref1 Img 2")
-            # plt.imshow(ref_img1_test_2)
-            # plt.show()
+            #     plt.figure(2)
+            #     plt.subplot(1, 3, 1)
+            #     plt.title("Tgt Img 2")
+            #     plt.imshow(tgt_img_test_2)
+            #     plt.subplot(1, 3, 2)
+            #     plt.title("ref1 Img 1")
+            #     plt.imshow(ref_img1_test_1)
+            #     plt.subplot(1, 3, 3)
+            #     plt.title("ref1 Img 2")
+            #     plt.imshow(ref_img1_test_2)
+            #     plt.show()
 
-            # #visualize for each batch
+            # # visualize for each batch
             # for i in range(batch_size):
             #     tgt_img_test = tgt_img_test[i].squeeze()
             #     ref_img0_test = ref_img0_test[i].squeeze()
@@ -362,11 +381,16 @@ def train_scale_consistency(
             poses_inv = [pose_CttoRef0_inv, pose_CttoRef1_inv]
 
             # TODO: make sure the output depth sizes match
+            # ! Modified by shuqi
             ref_img_resize = [
                 resize_and_pad(
-                    img, (ref_output_depth[0].shape[-2], ref_output_depth[0].shape[-1])
-                ).permute(0, 3, 1, 2)
-                for img in ref_img
+                    ref_img[0],
+                    (ref_output_depth[0].shape[-2], ref_output_depth[0].shape[-1]),
+                ).permute(0, 3, 1, 2),
+                resize_and_pad(
+                    ref_img[1],
+                    (ref_output_depth[1].shape[-2], ref_output_depth[1].shape[-1]),
+                ).permute(0, 3, 1, 2),
             ]
             tgt_img_resize = resize_and_pad(
                 tgt_img, (tgt_output_depth.shape[-2], tgt_output_depth.shape[-1])
@@ -402,9 +426,10 @@ def train_scale_consistency(
                 loss_smoothness_kernel_size,
             )
 
+            # ! Modified by shuqi
             metric_loss_ref1, _ = compute_loss(
                 batch_image_ref1_sml,
-                sml_pred_ref0,
+                sml_pred_ref1,
                 batch_gt_ref1_sml,
                 loss_func,
                 w_smoothness,
@@ -419,6 +444,7 @@ def train_scale_consistency(
                 w_smoothness,
                 loss_smoothness_kernel_size,
             )
+
             metric_loss = metric_loss_ref0 + metric_loss_ref1 + metric_loss_tgt
 
             loss = 0.0 * photometric_loss + 0.0 * geometric_loss + 1 * metric_loss
@@ -427,12 +453,17 @@ def train_scale_consistency(
                 wandb.log(
                     {
                         # "photometric_loss": photometric_loss,
-                        #"geometric_loss": geometric_loss,
+                        # "geometric_loss": geometric_loss,
                         "metric_loss": metric_loss,
-                        #"loss": loss,
+                        # "loss": loss,
                     }
                 )
-            # print('{}/{} epoch:{}: {}'.format(train_step % n_train_step, n_train_step, epoch, loss.item()))
+
+            print(
+                "{}/{} epoch:{}: {}".format(
+                    train_step % n_train_step, n_train_step, epoch, loss.item()
+                )
+            )
 
             # Compute gradient and backpropagate
             optimizer.zero_grad()
@@ -443,12 +474,12 @@ def train_scale_consistency(
                 time_elapse = (time.time() - time_start) / 3600
                 time_remain = (n_train_step - train_step) * time_elapse / train_step
 
-                # print(
-                #     "Step={:6}/{} Loss={:.5f} Time Elapsed={:.2f}h Time Remaining={:.2f}h".format(
-                #         train_step, n_train_step, loss.item(), time_elapse, time_remain
-                #     ),
-                #     log_path,
-                # )
+                print(
+                    "Step={:6}/{} Loss={:.5f} Time Elapsed={:.2f}h Time Remaining={:.2f}h".format(
+                        train_step, n_train_step, loss.item(), time_elapse, time_remain
+                    ),
+                    log_path,
+                )
 
                 # Save chkpt
                 ScaleMapLearner.save(depth_model_checkpoint_path.format(train_step))
@@ -477,6 +508,7 @@ def train(
     checkpoint_dir,
     n_threads,
     DepthModel,
+    using_wandb,
 ):
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
@@ -539,7 +571,7 @@ def train(
     optimizer = torch.optim.Adam([{"params": parameters_model}], lr=learning_rate)
 
     # Set up tensorboard summary writers
-    train_summary_writer = SummaryWriter(event_path + "-train")
+    # train_summary_writer = SummaryWriter(event_path + "-train")
 
     # Start training
     train_step = 0
@@ -665,6 +697,12 @@ def train(
                 loss_smoothness_kernel_size=loss_smoothness_kernel_size,
             )
 
+            if using_wandb:
+                wandb.log(
+                    {
+                        "loss": loss,
+                    }
+                )
             print(
                 "{}/{} epoch:{}: {}".format(
                     train_step % n_train_step, n_train_step, epoch, loss.item()
@@ -676,20 +714,20 @@ def train(
             loss.backward()
             optimizer.step()
 
-            if (train_step % n_step_summary) == 0:
-                with torch.no_grad():
-                    log_summary(
-                        summary_writer=train_summary_writer,
-                        tag="train",
-                        step=train_step,
-                        max_predict_depth=max_pred_depth,
-                        image=batch_image,
-                        input_depth=d,
-                        output_depth=sml_pred,
-                        ground_truth=batch_gt,
-                        scalars=loss_info,
-                        n_display=min(4, batch_size),
-                    )
+            # if (train_step % n_step_summary) == 0:
+            #     with torch.no_grad():
+            #         log_summary(
+            #             summary_writer=train_summary_writer,
+            #             tag="train",
+            #             step=train_step,
+            #             max_predict_depth=max_pred_depth,
+            #             image=batch_image,
+            #             input_depth=d,
+            #             output_depth=sml_pred,
+            #             ground_truth=batch_gt,
+            #             scalars=loss_info,
+            #             n_display=min(4, batch_size),
+            #         )
 
             if (train_step % n_step_per_checkpoint) == 0:
                 time_elapse = (time.time() - time_start) / 3600
@@ -894,7 +932,6 @@ def log_summary(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--using-wandb", dest="using_wandb", action="store_true")
     parser.add_argument(
         "-dp",
         "--depth-predictor",
@@ -912,7 +949,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--train-dir",
         type=str,
-        default="/home/shuqi/dev/data/void/void_release/void_150/",
+        default="./input/void_150/data",
     )
     parser.add_argument(
         "--result-dir",
@@ -924,7 +961,8 @@ if __name__ == "__main__":
         dest="is_consistency",
         action="store_true",
     )
-    parser.set_defaults(is_consistency=True)
+    parser.add_argument("--using-wandb", dest="using_wandb", action="store_true")
+    parser.set_defaults(is_consistency=False, using_wandb=False)
     # train_root = "/media/saimouli/Data6T/datasets/VOID_150_test"
     # '/media/saimouli/RPNG_FLASH_4/datasets/VOID_150'
     # result_root = "/media/saimouli/Data6T/datasets/VOID_150_test/results"  #'/media/vision/RPNG_FLASH_4/void_150_sample/results'
@@ -934,8 +972,8 @@ if __name__ == "__main__":
 
     config = {
         "dataset": "void_150",
-        "machine": "Laptop (RTX 3070 Ti)",
-        "learning_rates": [2e-4, 1e-4],
+        "machine": "RTX 4080",
+        "learning_rates": [2e-5, 1e-5],
         "learning_schedule": [20, 80],
         "batch_size": 3,
         "loss_func": "smoothl1",
@@ -943,17 +981,19 @@ if __name__ == "__main__":
         "loss_smoothness_kernel_size": -1,
     }
 
+    current_time = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
     if args.using_wandb:
+        # TODO:
         # os.environ["WANDB_API_KEY"] = YOUR_KEY_HERE
-        os.environ["WANDB_MODE"] = "offline"
+        # os.environ["WANDB_MODE"] = "offline"
         run = wandb.init(
             # Set the project where this run will be logged
             project="consistent-vi-depth",
             # Track hyperparameters and run metadata
             config=config,
+            name=current_time,
         )
-
-    current_time = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
     image_path = os.path.join(args.train_dir, "image")
     gt_path = os.path.join(args.train_dir, "ground_truth")
@@ -961,6 +1001,7 @@ if __name__ == "__main__":
 
     if args.depth_predictor != "dpt_hybrid":
         raise RuntimeError("Not using dpt_hybrid")
+
     DepthModel = torch.hub.load("intel-isl/MiDaS", "DPT_Hybrid")
 
     if args.is_consistency:
@@ -989,15 +1030,15 @@ if __name__ == "__main__":
             # data load
             train_dataset_path=args.train_dir,
             # train params
-            learning_rates=[2e-4, 1e-4],
-            learning_schedule=[20, 80],
-            batch_size=4,
+            learning_rates=config.get("learning_rates"),
+            learning_schedule=config.get("learning_schedule"),
+            batch_size=config.get("batch_size"),
             n_step_summary=5,
             n_step_per_checkpoint=100,
             # loss settings
-            loss_func="smoothl1",
-            w_smoothness=0.0,
-            loss_smoothness_kernel_size=-1,
+            loss_func=config.get("loss_func"),
+            w_smoothness=config.get("w_smoothness"),
+            loss_smoothness_kernel_size=config.get("loss_smoothness_kernel_size"),
             # model
             chkpt_path=args.sml_model_path,
             min_pred_depth=0.1,
@@ -1005,4 +1046,5 @@ if __name__ == "__main__":
             checkpoint_dir=os.path.join(args.train_dir, "checkpoints", current_time),
             n_threads=3,
             DepthModel=DepthModel,
+            using_wandb=True,
         )

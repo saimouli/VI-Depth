@@ -1,13 +1,14 @@
-__conda_setup="$("${XDG_PREFIX_HOME}/miniconda3/bin/conda" 'shell.zsh' 'hook' 2> /dev/null)"
+# <<< personal micromamba initialization <<<
+export MAMBA_EXE="${XDG_PREFIX_HOME}/bin/micromamba";
+export MAMBA_ROOT_PREFIX="${XDG_DATA_HOME}/micromamba";
+__mamba_setup="$("$MAMBA_EXE" shell hook --shell zsh --root-prefix "$MAMBA_ROOT_PREFIX" 2> /dev/null)"
 if [ $? -eq 0 ]; then
-    eval "$__conda_setup"
+    eval "$__mamba_setup"
 else
-    if [ -f "${XDG_PREFIX_HOME}/miniconda3/etc/profile.d/conda.sh" ]; then
-        . "${XDG_PREFIX_HOME}/miniconda3/etc/profile.d/conda.sh"
-    else
-        export PATH="${XDG_PREFIX_HOME}/miniconda3/bin:$PATH"
-    fi
+    alias micromamba="$MAMBA_EXE"  # Fallback on help from mamba activate
 fi
-conda_env_name=vi-depth
-conda activate ${conda_env_name}
-export CUDA_HOME=${CONDA_PREFIX}
+unset __mamba_setup
+# <<< personal micromamba initialization <<<
+#
+micromamba activate vi-depth
+# export CUDA_HOME=${CONDA_PREFIX}

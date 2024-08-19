@@ -1,2 +1,2 @@
-unset CUDA_HOME
-conda deactivate
+# unset CUDA_HOME
+micromamba deactivate

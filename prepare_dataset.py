@@ -208,11 +208,11 @@ def create_frame_index(data_dir, threshold_translation_centimeter=0.1):
 
 
 if __name__ == "__main__":
-    void_data_dir = "/home/shuqi/dev/data/void/void_release/void_150/data/"
-    # create_frame_index(void_data_dir)
-    save_priors(
-        depth_predictor="dpt_hybrid",
-        nsamples=150,
-        sml_model_path="./weights/sml_model.dpredictor.dpt_hybrid.nsamples.150.ckpt",
-        void_data_dir=void_data_dir,
-    )
+    void_data_dir = "./input/void_150/data"
+    create_frame_index(void_data_dir)
+    # save_priors(
+    #     depth_predictor="dpt_hybrid",
+    #     nsamples=150,
+    #     sml_model_path="./weights/sml_model.dpredictor.dpt_hybrid.nsamples.150.ckpt",
+    #     void_data_dir=void_data_dir,
+    # )
