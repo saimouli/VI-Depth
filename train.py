@@ -96,9 +96,7 @@ def train_scale_consistency(
         f"number of training sample: {n_train_sample}, number of training step: {n_train_step}"
     )
 
-    # n_train_step = learning_schedule[-1] * np.ceil(n_train_sample / batch_size).astype(np.int32)
-
-    # transform
+    # Pre-trained model from https://github.com/isl-org/VI-Depth
     # TODO: constant strings to parameters
     model_transforms = transforms.get_transforms("dpt_hybrid", "void", "150")
 
@@ -126,6 +124,7 @@ def train_scale_consistency(
     # Set up tensorboard summary writers
     train_summary_writer = SummaryWriter(event_path + "-train")
 
+    # Load a checkpoint
     if chkpt_path is not None and chkpt_path != "":
         ScaleMapLearner.load(chkpt_path)
 
@@ -326,6 +325,7 @@ def train_scale_consistency(
             d_ref1 = torch.stack(batch_d_ref1, 0)
 
             batch_image_ref0_sml = torch.stack(batch_image_ref0, 0)
+            # print(batch_image_ref0_sml.type)
             batch_gt_ref0_sml = torch.stack(batch_gt_ref0, 0)
             batch_image_ref1_sml = torch.stack(batch_image_ref1, 0)
             batch_gt_ref1_sml = torch.stack(batch_gt_ref1, 0)
@@ -380,8 +380,6 @@ def train_scale_consistency(
             pose_CttoRef1_inv = torch.inverse(pose_CttoRef1)
             poses_inv = [pose_CttoRef0_inv, pose_CttoRef1_inv]
 
-            # TODO: make sure the output depth sizes match
-            # ! Modified by shuqi
             ref_img_resize = [
                 resize_and_pad(
                     ref_img[0],
@@ -417,6 +415,20 @@ def train_scale_consistency(
             # output_depth = [sml_pred_tgt, sml_pred_ref0, sml_pred_ref1]
             # gt_depths = [batch_gt_tgt, batch_gt_ref]
 
+            if train_step == 20:
+                np.save(
+                    file="./output/debug/batch_image_ref0_sml.npy",
+                    arr=sml_pred_ref0.detach().cpu().numpy(),
+                )
+                np.save(
+                    file="./output/debug/sml_pred_ref0.npy",
+                    arr=sml_pred_ref0.detach().cpu().numpy(),
+                )
+                np.save(
+                    file="./output/debug/batch_gt_ref0_sml.npy",
+                    arr=batch_gt_ref0_sml.detach().cpu().numpy(),
+                )
+
             metric_loss_ref0, _ = compute_loss(
                 batch_image_ref0_sml,
                 sml_pred_ref0,
@@ -426,7 +438,6 @@ def train_scale_consistency(
                 loss_smoothness_kernel_size,
             )
 
-            # ! Modified by shuqi
             metric_loss_ref1, _ = compute_loss(
                 batch_image_ref1_sml,
                 sml_pred_ref1,
@@ -454,6 +465,9 @@ def train_scale_consistency(
                     {
                         # "photometric_loss": photometric_loss,
                         # "geometric_loss": geometric_loss,
+                        "metric_loss_ref0": metric_loss_ref0,
+                        "metric_loss_ref1": metric_loss_ref1,
+                        "metric_loss_tgt": metric_loss_tgt,
                         "metric_loss": metric_loss,
                         # "loss": loss,
                     }

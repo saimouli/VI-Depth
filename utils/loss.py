@@ -147,6 +147,77 @@ def metric_loss(image,
     #TODO: add smoothness and normal loss
     return loss, loss_info
 
+def visualization_of_pixelwise_loss(image,
+                 output_depth, 
+                 ground_truth,
+                 loss_func,
+                 w_smoothness,
+                 loss_smoothness_kernel_size):
+    loss = 0.0
+    loss_supervised = 0.0
+    loss_smoothness = 0.0
+    
+    validity_map_ground_truth = ground_truth > 0
+    
+    if not isinstance(output_depth, list):
+        output_depth = [output_depth]
+    
+    for scale, output in enumerate(output_depth):
+        output_height, output_width = output.shape[-2:]
+        target_height, target_width = ground_truth.shape[-2:]
+        
+        if output_height > target_height and output_width > target_width:
+            output = torch.nn.functional.interpolate(
+                output,
+                size=(target_height, target_width),
+                mode='bicubic',
+                align_corners=False)
+        
+        w_scale = 1.0 / (2 ** (len(output_depth) - scale - 1))
+        
+        if loss_func == 'l1':
+            loss_supervised += w_scale * l1_loss(
+                output[validity_map_ground_truth],
+                ground_truth[validity_map_ground_truth])
+    
+        elif loss_func == 'l2':
+            loss_supervised += w_scale * l2_loss(
+                output[validity_map_ground_truth],
+                ground_truth[validity_map_ground_truth])
+            
+        elif loss_func == 'smoothl1':
+            loss_supervised += w_scale * smooth_l1_loss(
+                output[validity_map_ground_truth],
+                ground_truth[validity_map_ground_truth])
+            
+        else:
+            raise ValueError(f'Unknown loss function: {loss_func}')
+        
+        if w_smoothness > 0.0:
+            if loss_smoothness_kernel_size <= 1:
+                loss_smoothness = loss_smoothness + w_scale * smoothness_loss_func(
+                    image=image,
+                    predict=output)
+                
+        #     else:
+        #         loss_smoothness_kernel_size = \
+        #             [1, 1, loss_smoothness_kernel_size, loss_smoothness_kernel_size]
+
+        #         loss_smoothness = loss_smoothness + w_scale * sobel_smoothness_loss_func(
+        #             image=image,
+        #             predict=output,
+        #             filter_size=loss_smoothness_kernel_size)
+        
+    loss = loss_supervised + w_smoothness * loss_smoothness
+        
+    loss_info = {
+        'loss': loss,
+        'loss_supervised': loss_supervised,
+        'loss_smoothness': loss_smoothness
+    }
+        
+    return loss, loss_info
+
 def compute_loss(image,
                  output_depth, 
                  ground_truth,
