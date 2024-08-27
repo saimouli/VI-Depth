@@ -451,6 +451,10 @@ def train(
         min_pred = min_pred_depth,
         max_pred = max_pred_depth,
     )
+
+    #tarin model
+    ScaleMapLearner.to(device)
+    ScaleMapLearner.train()
     
     '''
     Train model
@@ -486,8 +490,8 @@ def train(
     print("Step size: ", step_size)
     scheduler = torch.optim.lr_scheduler.CyclicLR(
         optimizer, 
-        base_lr=1e-5, 
-        max_lr=1e-2, 
+        base_lr=1e-6, 
+        max_lr=1e-3, 
         step_size_up=step_size, 
         mode='triangular2', 
         cycle_momentum=False
@@ -587,7 +591,7 @@ def train(
             batch_sparse = torch.stack(batch_sparse, 0)
             
             # perform forward pass
-            sml_pred, sml_scales = ScaleMapLearner.forward(x, d)
+            sml_pred, sml_scales = ScaleMapLearner(x, d) #ScaleMapLearner.forward(x, d)
             # inverse depth to depth
             d = 1.0 / d
             sml_pred = 1.0 / sml_pred
@@ -859,7 +863,7 @@ if __name__ == '__main__':
             # train params
             learning_rates = [2e-4,1e-4],
             learning_schedule = [20,80],
-            batch_size = 3,
+            batch_size = 1,
             n_step_summary = 5,
             n_step_per_checkpoint = 100,
             

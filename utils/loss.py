@@ -167,20 +167,20 @@ def compute_loss_paper(output_depth,
         grad_y = torch.abs(tensor[:, :, :-1, :] - tensor[:, :, 1:, :])
         return grad_x, grad_y
     
-    residual = output_depth_valid - ground_truth_valid
-    K = 3 #no. of scales
-    L_grad = 0
-    for scale in range(K):
-        if scale > 0:
-            #downsample by halving the resolution
-            residual = torch.nn.functional.interpolate(residual, scale_factor=0.5, mode='bilinear', align_corners=False)
+    # residual = output_depth_valid - ground_truth_valid
+    # K = 3 #no. of scales
+    # L_grad = 0
+    # for scale in range(K):
+    #     if scale > 0:
+    #         #downsample by halving the resolution
+    #         residual = torch.nn.functional.interpolate(residual, scale_factor=0.5, mode='bilinear', align_corners=False)
 
-            #compute gradients
-            grad_x, grad_y = compute_gradients(residual)
-            L_grad += (torch.mean(torch.abs(grad_x)) + torch.mean(torch.abs(grad_y)))
-    L_grad = L_grad / K
+    #         #compute gradients
+    #         grad_x, grad_y = compute_gradients(residual)
+    #         L_grad += (torch.mean(torch.abs(grad_x)) + torch.mean(torch.abs(grad_y)))
+    # L_grad = L_grad / K
 
-    loss = L_depth + 0.5 * L_grad
+    loss = L_depth #+ 0.5 * L_grad
 
     return loss, {'loss':loss}
     
