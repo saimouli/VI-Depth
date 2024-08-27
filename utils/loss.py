@@ -147,6 +147,43 @@ def metric_loss(image,
     #TODO: add smoothness and normal loss
     return loss, loss_info
 
+def compute_loss_paper(output_depth,
+                       ground_truth):
+    loss = 0.0
+
+    validity_map_ground_truth = ground_truth > 0
+
+    assert output_depth.shape == ground_truth.shape, "Shape mismatch between output depth and ground truth."
+    # Number of pixels with valid ground truth
+    M = ground_truth[validity_map_ground_truth].numel()
+
+    ground_truth_valid = torch.where(validity_map_ground_truth, ground_truth, torch.zeros_like(ground_truth))
+    output_depth_valid = torch.where(validity_map_ground_truth, output_depth, torch.zeros_like(output_depth))
+
+    L_depth = l1_loss(output_depth_valid, ground_truth_valid)
+
+    def compute_gradients(tensor):
+        grad_x = torch.abs(tensor[:-1] - tensor[1:])
+        grad_y = torch.abs(tensor[:, :, :-1, :] - tensor[:, :, 1:, :])
+        return grad_x, grad_y
+    
+    residual = output_depth_valid - ground_truth_valid
+    K = 3 #no. of scales
+    L_grad = 0
+    for scale in range(K):
+        if scale > 0:
+            #downsample by halving the resolution
+            residual = torch.nn.functional.interpolate(residual, scale_factor=0.5, mode='bilinear', align_corners=False)
+
+            #compute gradients
+            grad_x, grad_y = compute_gradients(residual)
+            L_grad += (torch.mean(torch.abs(grad_x)) + torch.mean(torch.abs(grad_y)))
+    L_grad = L_grad / K
+
+    loss = L_depth + 0.5 * L_grad
+
+    return loss, {'loss':loss}
+    
 def compute_loss(image,
                  output_depth, 
                  ground_truth,

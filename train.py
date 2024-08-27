@@ -11,7 +11,7 @@ from modules.interpolator import Interpolator2D
 
 import utils.log_utils as log_utils
 from utils.common_op import resize_and_pad
-from utils.loss import compute_loss, compute_consistency_loss #, compute_metric_loss
+from utils.loss import compute_loss, compute_consistency_loss, compute_loss_paper #, compute_metric_loss
 from utils_eval import compute_ls_solution
 from data.SML_dataset import SML_dataset
 from data.SML_consistent_dataset import SML_consistent_dataset
@@ -479,20 +479,34 @@ def train(
     for g in optimizer.param_groups:
         g['lr'] = learning_rate
     
+    num_cycles = 3
+    num_epochs = 80
+    total_train_step = num_epochs * len(train_dataloader)
+    step_size = total_train_step // (num_cycles * 2)
+    print("Step size: ", step_size)
+    scheduler = torch.optim.lr_scheduler.CyclicLR(
+        optimizer, 
+        base_lr=1e-5, 
+        max_lr=1e-2, 
+        step_size_up=step_size, 
+        mode='triangular2', 
+        cycle_momentum=False
+    )
+
     time_start = time.time()
     
     print('Start training', log_path)
-    for epoch in range(1, learning_schedule[-1] + 1):
+    for epoch in range(1, num_epochs):
         print('Epoch', epoch)
         
-        #set learning rate
-        if epoch > learning_schedule[learning_schedule_pos]:
-            learning_schedule_pos = learning_schedule_pos + 1
-            learning_rate = learning_rates[learning_schedule_pos]
+        # #set learning rate
+        # if epoch > learning_schedule[learning_schedule_pos]:
+        #     learning_schedule_pos = learning_schedule_pos + 1
+        #     learning_rate = learning_rates[learning_schedule_pos]
             
-            #update learning rate of all optimizers
-            for g in optimizer.param_groups:
-                g['lr'] = learning_rate
+        #     #update learning rate of all optimizers
+        #     for g in optimizer.param_groups:
+        #         g['lr'] = learning_rate
         
         # train the mode
         for batch_data in train_dataloader:
@@ -540,6 +554,21 @@ def train(
                     'int_scales': int_scales_i,
                     'int_depth_no_tf': int_depth_i}
                 
+                #visualize the image, gt_depth, sparse depth
+                # plt.subplot(2,2,1)
+                # plt.title('image')
+                # plt.imshow(sample['image']/255.0)
+                # plt.subplot(2,2,2)
+                # plt.title('gt_depth')
+                # plt.imshow(sample['gt_depth'])
+                # plt.subplot(2,2,3)
+                # plt.title('sparse_depth')
+                # plt.imshow(sample['sparse_depth'])
+                # plt.subplot(2,2,4)
+                # plt.title('int_depth')
+                # plt.imshow(1.0/sample['int_depth'])
+                # plt.show()
+                
                 sample = ScaleMapLearner_transform(sample)
                 
                 x = torch.cat((sample['int_depth'], sample['int_scales']), dim=0)
@@ -569,14 +598,16 @@ def train(
                 torch.zeros_like(batch_gt),
                 torch.ones_like(batch_gt))
             
-            loss, loss_info = compute_loss(
-                image=batch_image,
-                output_depth=sml_pred,
-                ground_truth=batch_gt,
-                loss_func=loss_func, #smooth_l1 is less sensitive to error
-                w_smoothness=w_smoothness,
-                loss_smoothness_kernel_size=loss_smoothness_kernel_size
-            )
+            # loss, loss_info = compute_loss(
+            #     image=batch_image,
+            #     output_depth=sml_pred,
+            #     ground_truth=batch_gt,
+            #     loss_func=loss_func, #smooth_l1 is less sensitive to error
+            #     w_smoothness=w_smoothness,
+            #     loss_smoothness_kernel_size=loss_smoothness_kernel_size
+            # )
+
+            loss, loss_info = compute_loss_paper(output_depth=sml_pred, ground_truth=batch_gt)
             
             print('{}/{} epoch:{}: {}'.format(train_step % n_train_step, n_train_step, epoch, loss.item()))
             
@@ -584,6 +615,7 @@ def train(
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            scheduler.step()
             
             if (train_step % n_step_summary) == 0:
                 with torch.no_grad():
@@ -597,7 +629,8 @@ def train(
                         output_depth=sml_pred,
                         ground_truth=batch_gt,
                         scalars=loss_info,
-                        n_display=min(4, batch_size))
+                        lr=optimizer.param_groups[0]['lr'],
+                        n_display=min(1, batch_size))
             
             if (train_step % n_step_per_checkpoint) == 0:
                 time_elapse = (time.time() - time_start) / 3600
@@ -621,178 +654,202 @@ def log_summary(summary_writer,
                 output_depth=None,
                 ground_truth=None,
                 scalars={},
+                lr=None,
                 n_display=4):
 
     with torch.no_grad():
-
-        display_summary_image = []
-        display_summary_depth = []
-
-        display_summary_image_text = tag
-        display_summary_depth_text = tag
-
+        if lr is not None:
+            summary_writer.add_scalar('lr', lr, global_step=step)
+        
+        #add image, gt_depth, int_depth(input_depth) in tensorboard
         if image is not None:
-            image_summary = image[0:n_display, ...]
-
-            display_summary_image_text += '_image'
-            display_summary_depth_text += '_image'
-
-            # Add to list of images to log
-            display_summary_image.append(
-                torch.cat([
-                    image_summary.cpu(),
-                    torch.zeros_like(image_summary, device=torch.device('cpu'))],
-                    dim=-1))
-
-            display_summary_depth.append(display_summary_image[-1])
-
+            image_summary = image[0:n_display, ...]/255.0
+            summary_writer.add_image(tag + '_image', image_summary[0], global_step=step)
+        
+        if input_depth is not None:
+            input_depth_summary = input_depth[0:n_display, ...]
+            summary_writer.add_image(tag + '_GA depth', input_depth_summary[0], global_step=step)
+        
+        if ground_truth is not None:
+            ground_truth_summary = ground_truth[0:n_display, ...]
+            summary_writer.add_image(tag + '_GT depth', ground_truth_summary[0], global_step=step)
+        
         if output_depth is not None:
             output_depth_summary = output_depth[0:n_display, ...]
-
-            display_summary_depth_text += '_output_depth'
-
-            # Add to list of images to log
-            n_batch, _, n_height, n_width = output_depth_summary.shape
-
-            display_summary_depth.append(
-                torch.cat([
-                    log_utils.colorize(
-                        (output_depth_summary / max_predict_depth).cpu(),
-                        colormap='viridis'),
-                    torch.zeros(n_batch, 3, n_height, n_width, device=torch.device('cpu'))],
-                    dim=3))
-
-            # Log distribution of output depth
-            summary_writer.add_histogram(tag + '_output_depth_distro', output_depth, global_step=step)
-
-        if output_depth is not None and input_depth is not None:
-            input_depth_summary = input_depth[0:n_display, ...]
-
-            display_summary_depth_text += '_input_depth-error'
-
-            # Compute output error w.r.t. input depth
-            input_depth_error_summary = \
-                torch.abs(output_depth_summary - input_depth_summary)
-
-            input_depth_error_summary = torch.where(
-                input_depth_summary > 0.0,
-                input_depth_error_summary / (input_depth_summary + 1e-8),
-                input_depth_summary)
-
-            # Add to list of images to log
-            input_depth_summary = log_utils.colorize(
-                (input_depth_summary / max_predict_depth).cpu(),
-                colormap='viridis')
-            input_depth_error_summary = log_utils.colorize(
-                (input_depth_error_summary / 0.05).cpu(),
-                colormap='inferno')
-
-            display_summary_depth.append(
-                torch.cat([
-                    input_depth_summary,
-                    input_depth_error_summary],
-                    dim=3))
-
-            # Log distribution of input depth
-            summary_writer.add_histogram(tag + '_input_depth_distro', input_depth, global_step=step)
-
-
-
-
-        if output_depth is not None and input_response is not None:
-            response_summary = input_response[0:n_display, ...]
-
-            display_summary_depth_text += '_response'
-
-            # Add to list of images to log
-            response_summary = log_utils.colorize(
-                response_summary.cpu(),
-                colormap='inferno')
-
-            display_summary_depth.append(
-                torch.cat([
-                    response_summary,
-                    torch.zeros_like(response_summary)],
-                    dim=3))
-
-            # Log distribution of input depth
-            summary_writer.add_histogram(tag + '_response_distro', input_depth, global_step=step)
-
-
-
-
-        if output_depth is not None and ground_truth is not None:
-            ground_truth = ground_truth[0:n_display, ...]
-            ground_truth = torch.unsqueeze(ground_truth[:, 0, :, :], dim=1)
-
-            ground_truth_summary = ground_truth[0:n_display]
-            validity_map_summary = torch.where(
-                ground_truth > 0,
-                torch.ones_like(ground_truth),
-                torch.zeros_like(ground_truth))
-
-            display_summary_depth_text += '_ground_truth-error'
-
-            # Compute output error w.r.t. ground truth
-            ground_truth_error_summary = \
-                torch.abs(output_depth_summary - ground_truth_summary)
-
-            ground_truth_error_summary = torch.where(
-                validity_map_summary == 1.0,
-                (ground_truth_error_summary + 1e-8) / (ground_truth_summary + 1e-8),
-                validity_map_summary)
-
-            # Add to list of images to log
-            ground_truth_summary = log_utils.colorize(
-                (ground_truth_summary / max_predict_depth).cpu(),
-                colormap='viridis')
-            ground_truth_error_summary = log_utils.colorize(
-                (ground_truth_error_summary / 0.05).cpu(),
-                colormap='inferno')
-
-            display_summary_depth.append(
-                torch.cat([
-                    ground_truth_summary,
-                    ground_truth_error_summary],
-                    dim=3))
-
-            # Log distribution of ground truth
-            summary_writer.add_histogram(tag + '_ground_truth_distro', ground_truth, global_step=step)
+            summary_writer.add_image(tag + '_output depth', output_depth_summary[0], global_step=step)
 
         # Log scalars to tensorboard
         for (name, value) in scalars.items():
             summary_writer.add_scalar(tag + '_' + name, value, global_step=step)
 
-        # Log image summaries to tensorboard
-        if len(display_summary_image) > 1:
-            display_summary_image = torch.cat(display_summary_image, dim=2)
+        # display_summary_image = []
+        # display_summary_depth = []
 
-            summary_writer.add_image(
-                display_summary_image_text,
-                torchvision.utils.make_grid(display_summary_image, nrow=n_display),
-                global_step=step)
+        # display_summary_image_text = tag
+        # display_summary_depth_text = tag
 
-        if len(display_summary_depth) > 1:
-            display_summary_depth = torch.cat(display_summary_depth, dim=2)
+        # if image is not None:
+        #     image_summary = image[0:n_display, ...]
 
-            summary_writer.add_image(
-                display_summary_depth_text,
-                torchvision.utils.make_grid(display_summary_depth, nrow=n_display),
-                global_step=step)
+        #     display_summary_image_text += '_image'
+        #     display_summary_depth_text += '_image'
+
+        #     # Add to list of images to log
+        #     display_summary_image.append(
+        #         torch.cat([
+        #             image_summary.cpu(),
+        #             torch.zeros_like(image_summary, device=torch.device('cpu'))],
+        #             dim=-1))
+
+        #     display_summary_depth.append(display_summary_image[-1])
+
+        # if output_depth is not None:
+        #     output_depth_summary = output_depth[0:n_display, ...]
+
+        #     display_summary_depth_text += '_output_depth'
+
+        #     # Add to list of images to log
+        #     n_batch, _, n_height, n_width = output_depth_summary.shape
+
+        #     display_summary_depth.append(
+        #         torch.cat([
+        #             log_utils.colorize(
+        #                 (output_depth_summary / max_predict_depth).cpu(),
+        #                 colormap='viridis'),
+        #             torch.zeros(n_batch, 3, n_height, n_width, device=torch.device('cpu'))],
+        #             dim=3))
+
+        #     # Log distribution of output depth
+        #     summary_writer.add_histogram(tag + '_output_depth_distro', output_depth, global_step=step)
+
+        # if output_depth is not None and input_depth is not None:
+        #     input_depth_summary = input_depth[0:n_display, ...]
+
+        #     display_summary_depth_text += '_input_depth-error'
+
+        #     # Compute output error w.r.t. input depth
+        #     input_depth_error_summary = \
+        #         torch.abs(output_depth_summary - input_depth_summary)
+
+        #     input_depth_error_summary = torch.where(
+        #         input_depth_summary > 0.0,
+        #         input_depth_error_summary / (input_depth_summary + 1e-8),
+        #         input_depth_summary)
+
+        #     # Add to list of images to log
+        #     input_depth_summary = log_utils.colorize(
+        #         (input_depth_summary / max_predict_depth).cpu(),
+        #         colormap='viridis')
+        #     input_depth_error_summary = log_utils.colorize(
+        #         (input_depth_error_summary / 0.05).cpu(),
+        #         colormap='inferno')
+
+        #     display_summary_depth.append(
+        #         torch.cat([
+        #             input_depth_summary,
+        #             input_depth_error_summary],
+        #             dim=3))
+
+        #     # Log distribution of input depth
+        #     summary_writer.add_histogram(tag + '_input_depth_distro', input_depth, global_step=step)
+
+
+
+
+        # if output_depth is not None and input_response is not None:
+        #     response_summary = input_response[0:n_display, ...]
+
+        #     display_summary_depth_text += '_response'
+
+        #     # Add to list of images to log
+        #     response_summary = log_utils.colorize(
+        #         response_summary.cpu(),
+        #         colormap='inferno')
+
+        #     display_summary_depth.append(
+        #         torch.cat([
+        #             response_summary,
+        #             torch.zeros_like(response_summary)],
+        #             dim=3))
+
+        #     # Log distribution of input depth
+        #     summary_writer.add_histogram(tag + '_response_distro', input_depth, global_step=step)
+
+
+
+
+        # if output_depth is not None and ground_truth is not None:
+        #     ground_truth = ground_truth[0:n_display, ...]
+        #     ground_truth = torch.unsqueeze(ground_truth[:, 0, :, :], dim=1)
+
+        #     ground_truth_summary = ground_truth[0:n_display]
+        #     validity_map_summary = torch.where(
+        #         ground_truth > 0,
+        #         torch.ones_like(ground_truth),
+        #         torch.zeros_like(ground_truth))
+
+        #     display_summary_depth_text += '_ground_truth-error'
+
+        #     # Compute output error w.r.t. ground truth
+        #     ground_truth_error_summary = \
+        #         torch.abs(output_depth_summary - ground_truth_summary)
+
+        #     ground_truth_error_summary = torch.where(
+        #         validity_map_summary == 1.0,
+        #         (ground_truth_error_summary + 1e-8) / (ground_truth_summary + 1e-8),
+        #         validity_map_summary)
+
+        #     # Add to list of images to log
+        #     ground_truth_summary = log_utils.colorize(
+        #         (ground_truth_summary / max_predict_depth).cpu(),
+        #         colormap='viridis')
+        #     ground_truth_error_summary = log_utils.colorize(
+        #         (ground_truth_error_summary / 0.05).cpu(),
+        #         colormap='inferno')
+
+        #     display_summary_depth.append(
+        #         torch.cat([
+        #             ground_truth_summary,
+        #             ground_truth_error_summary],
+        #             dim=3))
+
+        #     # Log distribution of ground truth
+        #     summary_writer.add_histogram(tag + '_ground_truth_distro', ground_truth, global_step=step)
+
+        # # Log scalars to tensorboard
+        # for (name, value) in scalars.items():
+        #     summary_writer.add_scalar(tag + '_' + name, value, global_step=step)
+
+        # # Log image summaries to tensorboard
+        # if len(display_summary_image) > 1:
+        #     display_summary_image = torch.cat(display_summary_image, dim=2)
+
+        #     summary_writer.add_image(
+        #         display_summary_image_text,
+        #         torchvision.utils.make_grid(display_summary_image, nrow=n_display),
+        #         global_step=step)
+
+        # if len(display_summary_depth) > 1:
+        #     display_summary_depth = torch.cat(display_summary_depth, dim=2)
+
+        #     summary_writer.add_image(
+        #         display_summary_depth_text,
+        #         torchvision.utils.make_grid(display_summary_depth, nrow=n_display),
+        #         global_step=step)
             
 if __name__ == '__main__':
-    train_root = '/media/saimouli/Data6T/datasets/VOID_150_test'
+    train_root = '/media/saimouli/Data6T/datasets/VOID_150/training'
     #'/media/saimouli/RPNG_FLASH_4/datasets/VOID_150'
-    result_root = '/media/saimouli/Data6T/datasets/VOID_150_test/results' #'/media/vision/RPNG_FLASH_4/void_150_sample/results'
+    result_root = '/media/saimouli/Data6T/datasets/VOID_150/results' #'/media/vision/RPNG_FLASH_4/void_150_sample/results'
     current_time = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    sml_ckt_path = '/home/saimouli/Documents/github/VI_Depth_sai/weights/sml_model.dpredictor.dpt_hybrid.nsamples.150.ckpt'
+    sml_ckt_path = '' #'/home/saimouli/Documents/github/VI_Depth_sai/weights/sml_model.dpredictor.dpt_hybrid.nsamples.150.ckpt'
     
     image_path = os.path.join(train_root, 'image')
     gt_path = os.path.join(train_root, 'ground_truth')
     sparse_depth_path = os.path.join(train_root, 'sparse_depth')    
     DepthModel = torch.hub.load("intel-isl/MiDaS", "DPT_Hybrid")
 
-    train_consistency = True
+    train_consistency = False
     
     if train_consistency == False:
         train(
@@ -802,12 +859,12 @@ if __name__ == '__main__':
             # train params
             learning_rates = [2e-4,1e-4],
             learning_schedule = [20,80],
-            batch_size = 4,
+            batch_size = 3,
             n_step_summary = 5,
             n_step_per_checkpoint = 100,
             
             # loss settings
-            loss_func = 'smoothl1',
+            loss_func = 'l1', #smoothl1
             w_smoothness = 0.0,
             loss_smoothness_kernel_size = -1,
             
