@@ -89,7 +89,7 @@ class MidasNet_small_videpth(BaseModel):
         if path:
             self.load(path)
         
-        self.to(device)
+        #self.to(device)
 
     def forward(self, x, d):
         """Forward pass.
@@ -131,6 +131,7 @@ class MidasNet_small_videpth(BaseModel):
         if self.min_pred is not None:
             min_pred_inv = 1.0/self.min_pred
             pred[pred > min_pred_inv] = min_pred_inv
+            #pred[pred < self.min_pred] = self.min_pred
         if self.max_pred is not None:
             max_pred_inv = 1.0/self.max_pred
             pred[pred < max_pred_inv] = max_pred_inv
