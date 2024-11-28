@@ -1,4 +1,29 @@
 import numpy as np
+import torch
+
+def compute_scale_and_shift_ls_torch(prediction, target, mask):
+    sum_axes = (1, 2)
+    # system matrix: A = [[a_00, a_01], [a_10, a_11]]
+    a_00 = torch.sum(mask * prediction * prediction, dim=sum_axes)
+    a_01 = torch.sum(mask * prediction, dim=sum_axes)
+    a_11 = torch.sum(mask, dim=sum_axes)
+
+    # right hand side: b = [b_0, b_1]
+    b_0 = torch.sum(mask * prediction * target, dim=sum_axes)
+    b_1 = torch.sum(mask * target, dim=sum_axes)
+
+    # solution: x = A^-1 . b = [[a_11, -a_01], [-a_10, a_00]] / (a_00 * a_11 - a_01 * a_10) . b
+    x_0 = torch.zeros_like(b_0)
+    x_1 = torch.zeros_like(b_1)
+
+    det = a_00 * a_11 - a_01 * a_01
+    # A needs to be a positive definite matrix.
+    valid = det > 0
+
+    x_0[valid] = (a_11[valid] * b_0[valid] - a_01[valid] * b_1[valid]) / det[valid]
+    x_1[valid] = (-a_01[valid] * b_0[valid] + a_00[valid] * b_1[valid]) / det[valid]
+
+    return x_0, x_1
 
 def compute_scale_and_shift_ls(prediction, target, mask):
     # tuple specifying with axes to sum
@@ -41,9 +66,14 @@ class LeastSquaresEstimator(object):
         self.scale, self.shift = compute_scale_and_shift_ls(self.estimate, self.target, self.valid)
 
     def apply_scale_and_shift(self):
+        #self.output = self.estimate * self.scale.view(-1, 1, 1) + self.shift.view(-1, 1, 1)
         self.output = self.estimate * self.scale + self.shift
 
     def clamp_min_max(self, clamp_min=None, clamp_max=None):
+        # if clamp_min is not None:
+        #     self.output = torch.clamp(self.output, max=1.0/clamp_max)
+        # if clamp_max is not None:
+        #     self.output = torch.clamp(self.output, min=1.0/clamp_min)
         if clamp_min is not None:
             if clamp_min > 0:
                 clamp_min_inv = 1.0/clamp_min

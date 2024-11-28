@@ -24,7 +24,7 @@ class midasNet(nn.Module):
 
         model_transforms = transforms.get_transforms("dpt_hybrid", "void", str(nsamples))
         self.depth_model_transform = model_transforms["depth_model"]
-        self.ScaleMapLearner_transform = model_transforms["sml_model"]
+        #self.ScaleMapLearner_transform = model_transforms["sml_model"]
 
         self.ScaleMapLearner = MidasNet_small_videpth(
             path=sml_model_path,
@@ -34,51 +34,59 @@ class midasNet(nn.Module):
         )
         self.ScaleMapLearner.train()
     
-    def forward(self, input_sparse_depth, input_image, depth_pred, validity_map):
-        #input_height, input_width = np.shape(input_image)[0], np.shape(input_image)[1]
-        input_sparse_depth_valid = (input_sparse_depth < self.max_depth) * (input_sparse_depth > self.min_depth)
-        if validity_map is not None:
-            input_sparse_depth_valid *= validity_map.astype(np.bool)
+    def forward(self, input_sparse_depth_inv, input_image, depth_pred_inv, interp_scale, GA_depth_inv, validity_map):
+        ##input_height, input_width = np.shape(input_image)[0], np.shape(input_image)[1]
+        # input_sparse_depth_valid = (input_sparse_depth < self.max_depth) * (input_sparse_depth > self.min_depth)
+        # if validity_map is not None:
+        #     input_sparse_depth_valid *= validity_map.astype(np.bool)
         
-        input_sparse_depth_valid = input_sparse_depth_valid.to(torch.bool)
-        input_sparse_depth[~input_sparse_depth_valid] = np.inf # set invalid depth
-        input_sparse_depth = 1.0 / input_sparse_depth
+        # input_sparse_depth_valid = input_sparse_depth_valid.to(torch.bool)
+        # input_sparse_depth[~input_sparse_depth_valid] = np.inf # set invalid depth
+        # input_sparse_depth = 1.0 / input_sparse_depth
 
-        # global scale and shift alignment
-        GlobalAlignment = LeastSquaresEstimator(
-            estimate=depth_pred,
-            target=input_sparse_depth,
-            valid=input_sparse_depth_valid.requires_grad_(False),
-        )
-        GlobalAlignment.compute_scale_and_shift()
-        GlobalAlignment.apply_scale_and_shift()
-        GlobalAlignment.clamp_min_max(clamp_min=self.min_pred, clamp_max=self.max_pred)
-        int_depth = GlobalAlignment.output.astype(np.float32)
+        # # global scale and shift alignment
+        # GlobalAlignment = LeastSquaresEstimator(
+        #     estimate=depth_pred,
+        #     target=input_sparse_depth,
+        #     valid=input_sparse_depth_valid.requires_grad_(False),
+        # )
+        # GlobalAlignment.compute_scale_and_shift()
+        # GlobalAlignment.apply_scale_and_shift()
+        # #GlobalAlignment.clamp_min_max(clamp_min=self.min_pred, clamp_max=self.max_pred)
+        # int_depth = GlobalAlignment.output.float() #.astype(np.float32)
 
-        # interpolation of scale map
-        assert (np.sum(input_sparse_depth_valid) >= 3), "not enough valid sparse points"
-        ScaleMapInterpolator = Interpolator2D(
-            pred_inv = int_depth,
-            sparse_depth_inv = input_sparse_depth,
-            valid = input_sparse_depth_valid,
-        )
-        ScaleMapInterpolator.generate_interpolated_scale_map(
-            interpolate_method='linear', 
-            fill_corners=False
-        )
-        int_scales = ScaleMapInterpolator.interpolated_scale_map.astype(np.float32)
-        int_scales = utils.normalize_unit_range(int_scales)
+        # # interpolation of scale map
+        # assert (torch.sum(input_sparse_depth_valid) >= 3), "not enough valid sparse points"
+        # ScaleMapInterpolator = Interpolator2D(
+        #     pred_inv = int_depth,
+        #     sparse_depth_inv = input_sparse_depth,
+        #     valid = input_sparse_depth_valid,
+        # )
+        # ScaleMapInterpolator.generate_interpolated_scale_map(
+        #     interpolate_method='linear', 
+        #     fill_corners=False
+        # )
+        # int_scales = ScaleMapInterpolator.interpolated_scale_map.astype(np.float32)
+        # int_scales = utils.normalize_unit_range(int_scales)
 
         sample = {"image" : input_image, 
-                  "int_depth" : int_depth, #LS aligned depth
-                  "int_scales" : int_scales, #interpolated scale
-                  "int_depth_no_tf" : int_depth}
-        sample = self.ScaleMapLearner_transform(sample)
-        x = torch.cat([sample["int_depth"], sample["int_scales"]], 0) #TODO 1 or 0?
-        d = sample["int_depth_no_tf"]
+                  "int_depth" : GA_depth_inv, #LS aligned depth
+                  "int_scales" : interp_scale, #interpolated scale
+                  "int_depth_no_tf" : GA_depth_inv}
+        #sample = self.ScaleMapLearner_transform(sample)
+        x = torch.cat([sample["int_depth"], sample["int_scales"]], 1) #[batch, 2, H, W]
+        d = sample["int_depth_no_tf"] #[batch, 1, H, W]
 
         ## run SML model
-        metric_depth, sml_scales = self.ScaleMapLearner.forward(x.unsqueeze(0), d.unsqueeze(0))
+        metric_depth_inv, sml_scales = self.ScaleMapLearner(x, d)
 
-        mask = torch.logical_and(metric_depth > 0,metric_depth < 8)
-        return metric_depth, int_depth, mask
+        # metric_depth_inv_resize = (
+        #     torch.nn.functional.interpolate(
+        #         metric_depth_inv,
+        #         size=(input_height, input_width),
+        #         mode="bicubic",
+        #         align_corners=False,
+        #     ))
+
+        #mask = torch.logical_and(1.0/metric_depth_inv > 0,1.0/metric_depth_inv < 8)
+        return metric_depth_inv, GA_depth_inv #, mask

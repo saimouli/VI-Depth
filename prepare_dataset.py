@@ -5,7 +5,7 @@ import pipeline
 from utils_eval import compute_ls_solution
 import modules.midas.utils as utils
 from modules.interpolator import Interpolator2D
-import tqdm
+from tqdm import tqdm
 from PIL import Image
 import cv2
 
@@ -86,14 +86,14 @@ def save_priors(data_dir):
         save_folder = os.path.join(save_folder, "depth_infer_dpt")
         print("Save folder: ", save_folder)
         os.makedirs(save_folder, exist_ok=True)
-        # save_folder = os.path.join(data_dir, folder)
-        # save_folder = os.path.join(save_folder, "ga_depth_inv")
-        # os.makedirs(save_folder, exist_ok=True)
-        # save_folder = os.path.join(data_dir, folder)
-        # save_folder = os.path.join(save_folder, "interp_scale")
-        # os.makedirs(save_folder, exist_ok=True)
+        save_folder = os.path.join(data_dir, folder)
+        save_folder = os.path.join(save_folder, "ga_depth_inv")
+        os.makedirs(save_folder, exist_ok=True)
+        save_folder = os.path.join(data_dir, folder)
+        save_folder = os.path.join(save_folder, "interp_scale")
+        os.makedirs(save_folder, exist_ok=True)
 
-        for i in range(len(images)):
+        for i in tqdm(range(len(images))):
             input_image_fp = images_path[i]
             input_sparse_depth_fp = sprase_depth_path[i]
             input_image = utils.read_image(input_image_fp)
@@ -106,29 +106,31 @@ def save_priors(data_dir):
             input_sparse_depth[~input_sparse_depth_valid] = np.inf # set invalid depth
             input_sparse_depth_inv = 1.0 / input_sparse_depth
 
-            #ga_depth_inv, interp_scale = get_ga_and_scale(depth_infer_inv, input_sparse_depth_inv, input_sparse_depth_valid, min_pred, max_pred )
+            ga_depth_inv, interp_scale = get_ga_and_scale(depth_infer_inv, input_sparse_depth_inv, input_sparse_depth_valid, min_pred, max_pred )
 
             # plt.figure(1);plt.imshow(ga_depth_inv)
             # plt.figure(2);plt.imshow(interp_scale)
             # plt.show()
 
-            # save the images in the respective folders
+            ## save the images in the respective folders
             save_image_path = os.path.join(data_dir, folder, "depth_infer_dpt", images[i])
             save_image_path = save_image_path.replace('.png', '.npy')
-            #Image.fromarray(depth_infer_inv).save(save_image_path)
-            save_depth_image_as_npy(depth_infer_inv, save_image_path)
-            #save_image_path = os.path.join(data_dir, folder, "ga_depth_inv", images[i])
-            #Image.fromarray(ga_depth_inv).save(save_image_path)
-            #save_depth_image_as_npy(ga_depth_inv, save_image_path)
-            #save_image_path = os.path.join(data_dir, folder, "interp_scale", images[i])
-            #Image.fromarray(interp_scale).save(save_image_path)
-            #save_depth_image_as_npy(interp_scale, save_image_path)
 
-            depth_infer_load = load_depth_image_from_npy(save_image_path) #os.path.join(data_dir, folder, "depth_infer_dpt", images[i]))
-            if not np.array_equal(depth_infer_load, depth_infer_inv):
-                # throw error
-                print("Depth infer not equal")
-                break
+            #save_depth_image_as_npy(depth_infer_inv, save_image_path)
+            save_image_path = os.path.join(data_dir, folder, "ga_depth_inv", images[i])
+            save_image_path = save_image_path.replace('.png', '.npy')
+            #Image.fromarray(ga_depth_inv).save(save_image_path)
+            save_depth_image_as_npy(ga_depth_inv, save_image_path)
+            save_image_path = os.path.join(data_dir, folder, "interp_scale", images[i])
+            save_image_path = save_image_path.replace('.png', '.npy')
+            #Image.fromarray(interp_scale).save(save_image_path)
+            save_depth_image_as_npy(interp_scale, save_image_path)
+
+            #depth_infer_load = load_depth_image_from_npy(save_image_path) #os.path.join(data_dir, folder, "depth_infer_dpt", images[i]))
+            # if not np.array_equal(depth_infer_load, depth_infer_inv):
+            #     # throw error
+            #     print("Depth infer not equal")
+            #     break
             #test = 0
         # for list in image_folder read the image and sparse depth from respective folders
         
@@ -174,7 +176,7 @@ def create_frame_index(data_dir):
 
 
 if __name__ == "__main__":
-    data_dir = "/media/saimouli/Data6T/datasets/VOID_150/testing" #"/media/saimouli/RPNG_FLASH_4/datasets/VOID_150/training"
+    data_dir = "/media/saimouli/Data6T/datasets/VOID_150/training" #"/media/saimouli/RPNG_FLASH_4/datasets/VOID_150/training"
     save_priors(data_dir)
 
     #create_frame_index(data_dir)

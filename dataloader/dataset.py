@@ -23,11 +23,13 @@ class SMLDataModule(pl.LightningDataModule):
         if stage == "fit":
             self.train_dataset = SML_dataset(
                 self.data_train,
-                mode="train"
+                mode="train",
+                depth_scale=256.0
             )
             self.test_dataset = SML_dataset(
                 self.data_val,
-                mode="val"
+                mode="val",
+                depth_scale=256.0
             )
     def train_dataloader(self):
         return DataLoader(

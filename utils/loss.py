@@ -430,12 +430,12 @@ class SILogLoss(nn.Module):
 
     def forward(self, input, target, mask=None):
 
-        if target.ndim == 3:
-            target = target.unsqueeze(1)
+        # if target.ndim == 3:
+        #     target = target.unsqueeze(1)
 
         if mask is not None:
-            if mask.ndim == 3:
-                mask = mask.unsqueeze(1)
+            # if mask.ndim == 3:
+            #     mask = mask.unsqueeze(1)
 
             input = input[mask]
             target = target[mask]
