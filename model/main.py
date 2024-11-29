@@ -25,6 +25,52 @@ class midasNetModule(pl.LightningModule):
         self.abs_loss = nn.L1Loss()
         self.silog = SILogLoss()
     
+    def compute_loss(self, pred_depth, gt_depth):
+        """
+        Computes the loss for depth prediction based on L1 depth loss and multiscale gradient matching.
+
+        Args:
+        - pred_depth (torch.Tensor): Predicted depth map (B, C, H, W)
+        - gt_depth (torch.Tensor): Ground truth depth map (B, C, H, W)
+        
+        Returns:
+        - loss (torch.Tensor): Total loss (depth loss + 0.5 * gradient loss)
+        - loss_info (dict): Detailed information about individual loss components
+        """
+        # Ensure valid mask for pixels with ground truth
+        valid_mask = (gt_depth > 0).float()
+        M = valid_mask.sum()
+
+        # L1 Depth loss
+        l1_depth_loss = F.l1_loss(pred_depth * valid_mask, gt_depth * valid_mask, reduction='sum') / M
+
+        # Multiscale gradient matching loss
+        def compute_gradient_loss(pred, gt):
+            diff = gt - pred
+            grad_x_pred = torch.abs(diff[:, :, :, :-1] - diff[:, :, :, 1:])
+            grad_y_pred = torch.abs(diff[:, :, :-1, :] - diff[:, :, 1:, :])
+            return (grad_x_pred.mean() + grad_y_pred.mean()) / M
+
+        grad_loss = 0.0
+        for scale in range(3):  # K = 3 levels
+            scaled_pred = F.interpolate(pred_depth, scale_factor=1 / (2 ** scale), mode='bilinear', align_corners=False)
+            scaled_gt = F.interpolate(gt_depth, scale_factor=1 / (2 ** scale), mode='bilinear', align_corners=False)
+            grad_loss += compute_gradient_loss(scaled_pred, scaled_gt)
+        
+        grad_loss /= 3  # Average over K = 3 scales
+
+        # Total loss
+        total_loss = l1_depth_loss + 0.5 * grad_loss
+
+        # Loss info dictionary for logging purposes
+        loss_info = {
+            'l1_depth_loss': l1_depth_loss.item(),
+            'gradient_loss': grad_loss.item(),
+            'total_loss': total_loss.item()
+        }
+
+        return total_loss, loss_info
+    
     def load_from_pth(self, file_path):
         state_dict = torch.load(file_path, map_location=self.device)
         self.load_state_dict(state_dict)
@@ -48,7 +94,7 @@ class midasNetModule(pl.LightningModule):
 
     def _common_step(self, batch, batch_idx, stage="train"):
         #input_sparse_depth, input_image, rel_depth_pred, depth_gt, validity_map = batch
-        input_image, depth_gt_inv, input_sparse_depth, rel_depth_pred, ga_depth_inv, interp_scale, mask = batch
+        input_image, depth_gt_inv, input_sparse_depth, rel_depth_pred, ga_depth_inv, interp_scale, mask,_ = batch
         #metric_depth_pred, GA_depth, mask = self.model(input_sparse_depth, input_image, rel_depth_pred, None)
         metric_depth_inv_pred, GA_depth_inv = self.model(input_sparse_depth, input_image, rel_depth_pred, 
                                                          interp_scale, ga_depth_inv, None)
@@ -68,42 +114,51 @@ class midasNetModule(pl.LightningModule):
         # depth_gt_inv_resized = torch.nn.functional.interpolate(
         #     depth_gt_inv.unsqueeze(1), size=metric_depth_inv_pred.shape[2:], mode="bicubic", align_corners=False
         # )
+        depth_gt = 1.0 / depth_gt_inv
+        depth_gt[depth_gt == float("inf")] = 0
+        metric_depth_pred = 1.0 / metric_depth_inv_pred
+        metric_depth_pred[metric_depth_pred == float("inf")] = 0
 
-        l_grad = self.grad_loss(metric_depth_inv_pred, depth_gt_inv)
-        siloss = self.silog(metric_depth_inv_pred, depth_gt_inv, mask)
+        loss,loss_info = self.compute_loss(metric_depth_pred, depth_gt)
         
-        self.logger.experiment.add_scalar(f"{stage}_grad_loss", l_grad, self.global_step)
-        self.logger.experiment.add_scalar(f"{stage}_siloss", siloss, self.global_step)
+        #resize metric_depth_pred to match depth_gt dimensions
+        #l_grad = self.grad_loss(metric_depth_pred, depth_gt)
+        #siloss = self.silog(metric_depth_pred, depth_gt, mask)
+        
+        #self.logger.experiment.add_scalar(f"{stage}_grad_loss", l_grad, self.global_step)
+        #self.logger.experiment.add_scalar(f"{stage}_siloss", siloss, self.global_step)
 
         # self.log(stage+"_gradloss", l_grad, on_epoch=True, prog_bar=True, sync_dist=True)
         # self.log(stage+"_silossloss", siloss, on_epoch=True, prog_bar=True, sync_dist=True)
 
-        loss = siloss + l_grad * 0.5
+        #loss = siloss + l_grad * 0.5
         #self.log(stage+"_loss", loss, on_epoch=True, prog_bar=True, sync_dist=True)
         self.logger.experiment.add_scalar(f"{stage}_loss", loss, self.global_step)
+        self.logger.experiment.add_scalar(f"{stage}_gradloss", loss_info['gradient_loss'], self.global_step)
+        self.logger.experiment.add_scalar(f"{stage}_l1loss", loss_info['l1_depth_loss'], self.global_step)
 
-        # if batch_idx % 10 == 0:
-        #     self.log_img_tensorboard(input_image, 1.0/depth_gt_inv, 1.0/metric_depth_inv_pred, 1.0/GA_depth_inv, 
-        #                              batch_idx, self.current_epoch, mode=stage)
+        if batch_idx % 10 == 0:
+            depth_gt_vis = depth_gt[0]
+
+            metric_pred_vis = metric_depth_pred[0]
+
+            GA_pred = 1.0 / GA_depth_inv[0]
+            GA_pred[GA_pred == float("inf")] = 0
+
+            t_gt = depth_gt_vis - depth_gt_vis.min()
+            t_gt = t_gt / t_gt.max()
+
+            t_pred = metric_pred_vis - metric_pred_vis.min()
+            t_pred = t_pred / t_pred.max()
+
+            t_ga = GA_pred - GA_pred.min()
+            t_ga = t_ga / t_ga.max()
+
+            t = torch.concat([t_gt, t_pred, t_ga.unsqueeze(0)], dim=0)
+            self.log_img_tensorboard(input_image, t, batch_idx, self.current_epoch, mode=stage)
 
         return loss, input_image, metric_depth_inv_pred, GA_depth_inv, depth_gt_inv
 
-    def normalize_and_colormap(self, depth_map, cmap="jet"):
-        """
-        Normalize and apply a colormap to a single depth map.
-        """
-        depth_map = depth_map.detach().squeeze(0).cpu().numpy()
-        depth_min = np.min(depth_map[depth_map > 0])
-        depth_max = np.max(depth_map)
-        depth = (depth_map - depth_min) / (depth_max - depth_min + 1e-6) 
-        depth =  (depth * 255).astype(np.uint8)
-        depth_vis = cv2.applyColorMap(depth, cv2.COLORMAP_JET)
-        #depth_min, depth_max = depth_map.min(), depth_map.max()
-        #depth_norm = (depth_map - depth_min) / (depth_max - depth_min + 1e-6)
-        #depth_uint8 = (depth_norm * 255).byte().numpy()
-        #depth_colormap = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_JET)
-        depth_colormap_tensor = torch.from_numpy(depth_vis).permute(2, 0, 1) / 255.0
-        return depth_colormap_tensor
     
     def visualize_depth_diff(self, target, pred):
         abs_diff = torch.abs(pred - target)
@@ -115,61 +170,87 @@ class midasNetModule(pl.LightningModule):
         return abs_diff_colormap
 
     @torch.no_grad()
-    def log_img_tensorboard(self, images, depth_gt, metric_depth_pred, GA_depth, batch_idx, epoch, mode="train"):
-        # if mode == "train":
-        #     global_step = epoch * len(self.trainer.train_dataloader) + batch_idx
-        # else:
-        #     global_step = epoch * len(self.trainer.val_dataloaders) + batch_idx
-        
-        #images_grid = torchvision.utils.make_grid(images, nrow=4, normalize=True, scale_each=True)
+    def log_img_tensorboard(self, images, depth_maps, batch_idx, epoch, mode="train"):
+        depth_maps = torch.clip(depth_maps, 0, 1)
+        img_vis = images[0].detach().cpu()
+        img_vis = torch.from_numpy((img_vis.numpy() * 255).astype('uint8')).permute(2, 0, 1) / 255.0  # Convert to CHW
+        processed_maps = []
+        for depth_map in depth_maps:
+            depth_map_np = depth_map.squeeze(0).detach().cpu().numpy()
+            depth_map_np = (depth_map_np - np.min(depth_map_np)) / (
+                np.max(depth_map_np) - np.min(depth_map_np)
+            )
+            colored_map = plt.get_cmap("jet")(depth_map_np)[
+                :, :, :3
+            ]  # Apply colormap and remove alpha channel
+            colored_map_tensor = (
+                torch.from_numpy(colored_map).float().permute(
+                    2, 0, 1).unsqueeze(0)
+            )
+            processed_maps.append(colored_map_tensor)
+        all_maps = torch.cat(processed_maps, dim=0)
+        all_maps = torch.cat([img_vis.unsqueeze(0), all_maps], dim=0)
 
-        # depth_gt_vis = [self.normalize_and_colormap(d.unsqueeze(0)) for d in depth_gt[:3]]  # Adding channel dimension
-        # metric_depth_pred_vis = [self.normalize_and_colormap(d[0]) for d in metric_depth_pred[:3]]
-        # GA_depth_vis = [self.normalize_and_colormap(d[0]) for d in GA_depth[:3]]
+        self.logger.experiment.add_image(
+            mode,
+            torchvision.utils.make_grid(all_maps, nrow=4, padding=4),
+            global_step=self.global_step,
+            dataformats="CHW",
+        )
 
-        # depth_gt_grid = torchvision.utils.make_grid(torch.stack(depth_gt_vis), nrow=4)
-        # metric_depth_pred_grid = torchvision.utils.make_grid(torch.stack(metric_depth_pred_vis), nrow=4)
-        # GA_depth_grid = torchvision.utils.make_grid(torch.stack(GA_depth_vis), nrow=4)
+        # depth_gt[depth_gt == float("inf")] = 0
+        # metric_depth_pred[metric_depth_pred == float("inf")] = 0
+        # GA_depth[GA_depth == float("inf")] = 0
 
-        # plt.imshow(depth_gt[0].squeeze(0).cpu().numpy())
-        # plt.show()
-        # plt.imshow(metric_depth_pred[0].squeeze(0).cpu().numpy())
-        # plt.show()
+        # # Apply valid masks
+        # valid_mask_gt = (depth_gt[0] >= 0.1) & (depth_gt[0] <= 8)
+        # valid_mask_depth = (metric_depth_pred[0] >= 0.1) & (metric_depth_pred[0] <= 8)
+        # valid_mask_GA = (GA_depth[0] >= 0.1) & (GA_depth[0] <= 8)
 
-        depth_gt_vis = depth_gt[0].cpu() #self.normalize_and_colormap(depth_gt[0])
-        metric_depth_pred_vis = metric_depth_pred[0].cpu() #self.normalize_and_colormap(metric_depth_pred[0])
-        GA_depth_vis = GA_depth[0].cpu() #self.normalize_and_colormap(GA_depth[0])
-        img_vis = images[0].permute(1, 2, 0).detach().cpu()
+        # # Mask invalid regions (set them to 0)
+        # depth_gt_vis = depth_gt[0] * valid_mask_gt
+        # metric_depth_pred_vis = metric_depth_pred[0] * valid_mask_depth
+        # GA_depth_vis = GA_depth[0] * valid_mask_GA
 
-        img_vis = torch.from_numpy((img_vis.numpy() * 255).astype('uint8')).permute(2, 0, 1) / 255.0
-        horz_grid = torch.cat((img_vis, depth_gt_vis, metric_depth_pred_vis, GA_depth_vis), dim=2)
-        # Stack rows vertically
-        self.logger.experiment.add_image(f"{mode}_visualization_grid", horz_grid, self.global_step, dataformats="CHW")
+        # # Normalize and colormap the absolute differences
+        # abs_diff_metric_colormap = self.visualize_depth_diff(depth_gt_vis, metric_depth_pred_vis)
+        # abs_diff_GA_colormap = self.visualize_depth_diff(depth_gt_vis, GA_depth_vis)
 
-        # self.logger.experiment.add_image(f"{mode}_input_images", img_vis, self.global_step, dataformats="HWC")
-        # self.logger.experiment.add_image(f"{mode}_depth_gt", depth_gt_vis, self.global_step, dataformats="CHW")
-        # self.logger.experiment.add_image(f"{mode}_metric_depth_pred", metric_depth_pred_vis, self.global_step, dataformats="CHW")
-        # self.logger.experiment.add_image(f"{mode}_GA_depth", GA_depth_vis, self.global_step, dataformats="CHW")
+        # # Prepare input image for visualization
+        # img_vis = images[0].permute(1, 2, 0).detach().cpu()  # Convert to HWC
+        # img_vis = torch.from_numpy((img_vis.numpy() * 255).astype('uint8')).permute(2, 0, 1) / 255.0  # Convert to CHW
 
-        # abs_diff = torch.abs(metric_depth_pred - depth_gt)
-        # abs_diff_vis = (abs_diff - abs_diff.min()) / (abs_diff.max() - abs_diff.min() + 1e-6)
-        # abs_diff_vis = abs_diff_vis[0].squeeze(0).cpu().numpy() 
+        # # Normalize depth maps for consistent visualization
+        # depth_gt_colormap = self.normalize_and_colormap(depth_gt_vis)  # Add batch dim for processing
+        # metric_depth_pred_colormap = self.normalize_and_colormap(metric_depth_pred_vis)
+        # GA_depth_colormap = self.normalize_and_colormap(GA_depth_vis)
 
-        # abs_diff_colormap = cv2.applyColorMap((abs_diff_vis * 255).astype(np.uint8), cv2.COLORMAP_JET)
-        abs_diff_metric_colormap = self.visualize_depth_diff(depth_gt[0], metric_depth_pred[0])
-        abs_diff_GA_colormap = self.visualize_depth_diff(depth_gt[0], GA_depth[0])
+        # # Convert absolute difference colormaps to tensors
+        # abs_diff_metric_tensor = torch.from_numpy(abs_diff_metric_colormap).permute(2, 0, 1) / 255.0
+        # abs_diff_GA_tensor = torch.from_numpy(abs_diff_GA_colormap).permute(2, 0, 1) / 255.0
 
+        # # Concatenate horizontally for TensorBoard visualization
+        # horz_grid = torch.cat(
+        #     (
+        #         img_vis.cpu(),  # Input image
+        #         depth_gt_colormap.cpu(),  # Ground truth depth
+        #         metric_depth_pred_colormap.cpu(),  # Predicted depth
+        #         GA_depth_colormap.cpu(),  # GA depth
+        #     ),
+        #     dim=2,  # Concatenate along width
+        # )
 
-        self.logger.experiment.add_image(f"{mode}_absolute_difference", abs_diff_metric_colormap, self.global_step, dataformats="HWC")
-        self.logger.experiment.add_image(f"{mode}_absolute_difference", abs_diff_GA_colormap, self.global_step, dataformats="HWC")
+        # horz_abs_grid = torch.cat(
+        #     (
+        #         abs_diff_metric_tensor.cpu(),  # Absolute difference with metric depth
+        #         abs_diff_GA_tensor.cpu(),  # Absolute difference with GA depth
+        #     ),
+        #     dim=2,  # Concatenate along width
+        # )
 
-        # self.log(f"{mode}_RMSE", torch.sqrt(torch.mean((metric_depth_pred - depth_gt) ** 2)), 
-        #          on_epoch=True, prog_bar=True, sync_dist=True)
-
-        # self.logger.experiment.add_images(f'{mode}_images', images.detach().cpu().numpy(), global_step)
-        # self.logger.experiment.add_images(f'{mode}_depth_gt', depth_gt.detach().cpu().numpy(), global_step)
-        # self.logger.experiment.add_images(f'{mode}_metric_depth_pred', metric_depth_pred.detach().cpu().numpy(), global_step)
-        # self.logger.experiment.add_images(f'{mode}_GA_depth', GA_depth.detach().cpu().numpy(), global_step)
+        # # Log the horizontal grid to TensorBoard
+        # self.logger.experiment.add_image(f"{mode}_visualization_grid", horz_grid, self.global_step, dataformats="CHW")
+        # self.logger.experiment.add_image(f"{mode}_abs_diff_grid", horz_abs_grid, self.global_step, dataformats="CHW")
         
         
     def configure_optimizers(self):

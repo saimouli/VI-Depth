@@ -24,7 +24,7 @@ class midasNet(nn.Module):
 
         model_transforms = transforms.get_transforms("dpt_hybrid", "void", str(nsamples))
         self.depth_model_transform = model_transforms["depth_model"]
-        #self.ScaleMapLearner_transform = model_transforms["sml_model"]
+        self.ScaleMapLearner_transform = model_transforms["sml_model"]
 
         self.ScaleMapLearner = MidasNet_small_videpth(
             path=sml_model_path,
@@ -35,7 +35,7 @@ class midasNet(nn.Module):
         self.ScaleMapLearner.train()
     
     def forward(self, input_sparse_depth_inv, input_image, depth_pred_inv, interp_scale, GA_depth_inv, validity_map):
-        ##input_height, input_width = np.shape(input_image)[0], np.shape(input_image)[1]
+        input_height, input_width = np.shape(input_image)[1], np.shape(input_image)[2]
         # input_sparse_depth_valid = (input_sparse_depth < self.max_depth) * (input_sparse_depth > self.min_depth)
         # if validity_map is not None:
         #     input_sparse_depth_valid *= validity_map.astype(np.bool)
@@ -69,24 +69,41 @@ class midasNet(nn.Module):
         # int_scales = ScaleMapInterpolator.interpolated_scale_map.astype(np.float32)
         # int_scales = utils.normalize_unit_range(int_scales)
 
-        sample = {"image" : input_image, 
-                  "int_depth" : GA_depth_inv, #LS aligned depth
-                  "int_scales" : interp_scale, #interpolated scale
-                  "int_depth_no_tf" : GA_depth_inv}
-        #sample = self.ScaleMapLearner_transform(sample)
-        x = torch.cat([sample["int_depth"], sample["int_scales"]], 1) #[batch, 2, H, W]
-        d = sample["int_depth_no_tf"] #[batch, 1, H, W]
+        batch_size = input_image.shape[0]
+        batch_x = []
+        batch_d = []
+        #batch_image = []
+        #batch_gt = []
+        device = input_image.device
 
+        for i in range(batch_size):
+            sample = {"image" : input_image[i].squeeze().cpu().numpy(), 
+                    "int_depth" : GA_depth_inv[i].squeeze().cpu().numpy(), #LS aligned depth
+                    "int_scales" : interp_scale[i].squeeze().cpu().numpy(), #interpolated scale
+                    "int_depth_no_tf" : GA_depth_inv[i].squeeze().cpu().numpy()}
+            sample = self.ScaleMapLearner_transform(sample)
+            x = torch.cat([sample["int_depth"], sample["int_scales"]], 0) #[batch, 2, H, W]
+            x = x.to(device)
+            d = sample['int_depth_no_tf'].to(device)
+            batch_x.append(x)
+            batch_d.append(d)
+            #batch_image.append(sample['image'].to(device))
+            #batch_gt.append(sample['gt'].to(device))
+
+        x = torch.stack(batch_x, dim=0)
+        d = torch.stack(batch_d, dim=0)
+        #batch_image = torch.stack(batch_image, dim=0)
+        #batch_gt = torch.stack(batch_gt, dim=0)
         ## run SML model
         metric_depth_inv, sml_scales = self.ScaleMapLearner(x, d)
 
-        # metric_depth_inv_resize = (
-        #     torch.nn.functional.interpolate(
-        #         metric_depth_inv,
-        #         size=(input_height, input_width),
-        #         mode="bicubic",
-        #         align_corners=False,
-        #     ))
+        metric_depth_inv_resize = (
+            torch.nn.functional.interpolate(
+                metric_depth_inv,
+                size=(input_height, input_width),
+                mode="bicubic",
+                align_corners=False,
+            ))
 
         #mask = torch.logical_and(1.0/metric_depth_inv > 0,1.0/metric_depth_inv < 8)
-        return metric_depth_inv, GA_depth_inv #, mask
+        return metric_depth_inv_resize, GA_depth_inv #, mask
