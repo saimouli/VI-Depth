@@ -59,10 +59,10 @@ model:
   img_w: 640
 
 data:
-  class_path: dataloader.dataset.SMLDataModule
+  class_path: dataloader.dataset.SMLDataConsistentModule #dataloader.dataset.SMLDataModule
   init_args:
     data_root: '/media/saimouli/Data6T/datasets/VOID_150'
     img_size: [480, 640]
-    batch_size: 8
+    batch_size: 3 #8
     num_workers: 1
 ckpt_path: null # checkpoints to continue the training.

@@ -7,10 +7,12 @@ import torch
 import pytorch_lightning as pl
 from pytorch_lightning.cli import LightningCLI
 from model.main import midasNetModule
+from model.main_consistent import midasNetConsistentModule
 
 
 def cli_main():
-    cli = LightningCLI(midasNetModule, datamodule_class=None)
+    #cli = LightningCLI(midasNetModule, datamodule_class=None)
+    cli = LightningCLI(midasNetConsistentModule, datamodule_class=None)
 
 if __name__ == "__main__":
     cli_main()

@@ -39,13 +39,21 @@ def generate_sample_index(num_frames, skip_frames, sequence_length):
 class SML_consistent_dataset(torch.utils.data.Dataset):
     def __init__(self,
                  root,
+                 mode="train",
                  depth_scale=256.0,
                  sequence_length=3,
                 ):
-        self.root = Path(root)/'training'
-        scene_list_path = self.root/'train.txt'
-        self.scenes = [self.root/folder[:-1]
-                       for folder in open(scene_list_path)]
+        #self.root = Path(root)/'training'
+        self.root = Path(root)
+        self.depth_scale = depth_scale
+        if mode == "train":
+            scene_list_path = self.root/'train_image.txt'
+            self.scenes = [self.root/folder[:-1]
+                        for folder in open(scene_list_path)]
+        if mode == "val":
+            scene_list_path = self.root/'test_image.txt'
+            self.scenes = [self.root/folder[:-1]
+                        for folder in open(scene_list_path)]
         
         self.crawl_folders(sequence_length)
 
@@ -117,7 +125,7 @@ class SML_consistent_dataset(torch.utils.data.Dataset):
     def __getitem__(self, index):
         sample = self.samples[index]
         tgt_img = load_input_image(str(sample['tgt_img']))
-        tgt_gt_depth = load_sparse_depth(str(sample['tgt_gt_depth']), depth_scale=256.0)
+        tgt_gt_depth = load_sparse_depth(str(sample['tgt_gt_depth']), depth_scale=self.depth_scale)
         tgt_ga_depth = load_depth_image_from_npy(str(sample['tgt_ga_depth']))
         tgt_interp = load_depth_image_from_npy(str(sample['tgt_interp']))
         tgt_pose = np.loadtxt(str(sample['tgt_pose']))
@@ -125,11 +133,24 @@ class SML_consistent_dataset(torch.utils.data.Dataset):
         ref_img = [load_input_image(str(ref_img)) for ref_img in sample['ref_imgs']]
         ref_ga_depth = [load_depth_image_from_npy(str(ref_ga_depth)) for ref_ga_depth in sample['ref_ga_depth']]
         ref_interp = [load_depth_image_from_npy(str(ref_interp)) for ref_interp in sample['ref_interp']]
-        ref_gt_depth = [load_sparse_depth(str(ref_gt_depth), depth_scale=256.0) for ref_gt_depth in sample['ref_gt_depth']]
+        ref_gt_depth = [load_sparse_depth(str(ref_gt_depth), depth_scale=self.depth_scale) for ref_gt_depth in sample['ref_gt_depth']]
         ref_pose = [np.loadtxt(pose) for pose in sample['ref_pose']]
         intrinsics = np.copy(sample['intrinsics'])
+
+        mask = (tgt_gt_depth < 8.0)
+        mask *= (tgt_gt_depth > 0.2)
+        tgt_gt_depth[~mask] = np.inf
+        tgt_gt_depth_inv = 1.0 / tgt_gt_depth
+        tgt_gt_depth_inv[tgt_gt_depth_inv == float("inf")] = 0
+        tgt_gt_depth_inv = torch.from_numpy(tgt_gt_depth_inv).unsqueeze(0)
         
-        return tgt_img, tgt_gt_depth, tgt_ga_depth, tgt_interp, ref_img, \
+        tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, tgt_pose = [
+            T.astype(np.float32) if isinstance(T, np.ndarray) else T for T in [
+                tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, tgt_pose
+            ]
+        ]
+        
+        return tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, ref_img, \
             ref_ga_depth, ref_interp, ref_gt_depth, tgt_pose, ref_pose, intrinsics
     
     def __len__(self):
