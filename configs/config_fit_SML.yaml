@@ -1,9 +1,9 @@
 # pytorch_lightning==1.9.0
 seed_everything: true
 trainer:
-  accelerator: auto
-  #strategy: 'ddp_find_unused_parameters_true'
-  devices: auto
+  accelerator: "gpu"
+  strategy: 'ddp_find_unused_parameters_true'
+  devices: '0,1'
   num_nodes: 1
   callbacks:
     - class_path: pytorch_lightning.callbacks.ModelCheckpoint
@@ -16,7 +16,7 @@ trainer:
         dirpath: 'checkpoints_best/'
         filename: '{epoch}-{val/total_loss:.3f}'
   fast_dev_run: false
-  max_epochs: null
+  max_epochs: 40
   min_epochs: null
   max_steps: 60000
   min_steps: null
@@ -47,22 +47,23 @@ trainer:
   default_root_dir: null
 model:
   # learning rate
-  lr: 3e-4
+  lr: 3e-5
   # weight decay
   wd: 0.001
   min_pred: 0.1
   max_pred: 8.0
   min_depth: 0.2
-  max_depth: 8.0
+  max_depth: 5.0
   nsamples: 150
   img_h: 480
   img_w: 640
+  #sml_model_path: '/home/sai/Downloads/sml_model.dpredictor.dpt_hybrid.nsamples.150.ckpt'
 
 data:
   class_path: dataloader.dataset.SMLDataModule
   init_args:
-    data_root: '/media/saimouli/Data6T/datasets/VOID_150'
+    data_root: '/home/sai/Documents/data/void_150' #'/media/sai/External HDD/sai/datasets/void_release/void_150'
     img_size: [480, 640]
-    batch_size: 8
-    num_workers: 1
+    batch_size: 35
+    num_workers: 12
 ckpt_path: null # checkpoints to continue the training.
