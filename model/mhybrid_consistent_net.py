@@ -335,16 +335,6 @@ class midasConsNet(nn.Module):
             hidden_d, up_mask_seqs, inv_depth_seqs = self.update_block_depth(hidden_d, depth_cost_map_func,
                                                                              metric_depth_inv_tgt, inp_d,
                                                                              seq_len=4)
-            ##upsample depth predictions
-            # for up_mask_i, inv_depth_i in zip(up_mask_seqs, inv_depth_seqs):
-            #     refined_depth_inv = torch.nn.functional.interpolate(
-            #             inv_depth_i,
-            #             size=(tgt_img.shape[2], tgt_img.shape[3]),
-            #             mode="bicubic",
-            #             align_corners=False,
-            #         )
-            #     inv_depth_predictions.append(refined_depth_inv)
-            #TODO: I need [1, 1, 480, 640] from [1, 1, 144, 192]
             
             #we won't supervise the intermediate predictions
             up_mask_seqs, inv_depth_seqs = [up_mask_seqs[-1]], [inv_depth_seqs[-1]]

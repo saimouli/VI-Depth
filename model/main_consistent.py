@@ -132,32 +132,34 @@ class midasNetConsistentModule(pl.LightningModule):
         
         gt_depth = utils.inv2depth(tgt_gt_depth_inv)
         metric_depth_pred = utils.inv2depth(metric_depth_inv_pred)
-        loss = self.compute_exp_weighted_l1loss(metric_depth_pred, 
+        total_loss = self.compute_exp_weighted_l1loss(metric_depth_pred, 
                                                 gt_depth)
         
-        self.logger.experiment.add_scalar(f"{stage}_loss", loss, self.global_step)
+        #self.logger.experiment.add_scalar(f"{stage}_loss", loss, self.global_step)
+        self.log(f"{stage}/total_loss", total_loss, on_step=True, on_epoch=True)
         
-        if batch_idx % 10 == 0:
-            depth_gt_vis = gt_depth[0]
+        with torch.no_grad():
+            if batch_idx % 10 == 0:
+                depth_gt_vis = gt_depth[0]
 
-            metric_pred_vis = metric_depth_pred[-1][0]
+                metric_pred_vis = metric_depth_pred[-1][0]
 
-            GA_pred = 1.0 / tgt_ga_depth[0]
-            GA_pred[GA_pred == float("inf")] = 0
+                GA_pred = 1.0 / tgt_ga_depth[0]
+                GA_pred[GA_pred == float("inf")] = 0
 
-            t_gt = depth_gt_vis - depth_gt_vis.min()
-            t_gt = t_gt / t_gt.max()
+                t_gt = depth_gt_vis - depth_gt_vis.min()
+                t_gt = t_gt / t_gt.max()
 
-            t_pred = metric_pred_vis - metric_pred_vis.min()
-            t_pred = t_pred / t_pred.max()
+                t_pred = metric_pred_vis - metric_pred_vis.min()
+                t_pred = t_pred / t_pred.max()
 
-            t_ga = GA_pred - GA_pred.min()
-            t_ga = t_ga / t_ga.max()
+                t_ga = GA_pred - GA_pred.min()
+                t_ga = t_ga / t_ga.max()
 
-            t = torch.concat([t_gt, t_pred, t_ga.unsqueeze(0)], dim=0)
-            self.log_img_tensorboard(tgt_img, t, batch_idx, self.current_epoch, mode=stage)
+                t = torch.concat([t_gt, t_pred, t_ga.unsqueeze(0)], dim=0)
+                self.log_img_tensorboard(tgt_img, t, batch_idx, self.current_epoch, mode=stage)
             
-        return loss
+        return total_loss
         #TODO: compute loss for the pose as well
         
 

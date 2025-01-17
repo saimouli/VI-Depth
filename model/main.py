@@ -5,9 +5,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 from typing import Any
-from utils.loss import MSGradientLoss, SILogLoss
+#from utils.loss import MSGradientLoss, SILogLoss
 import matplotlib.pyplot as plt
 import torchvision
+import time
 import cv2
 
 class midasNetModule(pl.LightningModule):
@@ -21,9 +22,9 @@ class midasNetModule(pl.LightningModule):
         self.wd = wd
         self.orig_h = img_h
         self.orig_w = img_w
-        self.grad_loss = MSGradientLoss(num_scales=4)
-        self.abs_loss = nn.L1Loss()
-        self.silog = SILogLoss()
+        #self.grad_loss = MSGradientLoss(num_scales=4)
+        #self.abs_loss = nn.L1Loss()
+        #self.silog = SILogLoss()
     
     def compute_loss(self, pred_depth, gt_depth):
         """
@@ -38,11 +39,18 @@ class midasNetModule(pl.LightningModule):
         - loss_info (dict): Detailed information about individual loss components
         """
         # Ensure valid mask for pixels with ground truth
-        valid_mask = (gt_depth > 0).float()
+        valid_mask = ((gt_depth > 0) & (gt_depth <= 5)).float()
         M = valid_mask.sum()
 
-        # L1 Depth loss
+        ## L1 Depth loss
         l1_depth_loss = F.l1_loss(pred_depth * valid_mask, gt_depth * valid_mask, reduction='sum') / M
+        # alpha = 1e-7
+        # beta = 0.15
+        # g = torch.log(pred_depth + alpha) - torch.log(gt_depth + alpha)
+        # var_g = torch.var(g[valid_mask > 0])
+        # mean_g = torch.mean(g[valid_mask > 0])
+        # scale_invariant_loss = 10 * torch.sqrt(var_g + beta * mean_g**2)
+        
 
         # Multiscale gradient matching loss
         def compute_gradient_loss(pred, gt):
@@ -59,14 +67,42 @@ class midasNetModule(pl.LightningModule):
         
         grad_loss /= 3  # Average over K = 3 scales
 
+        # Compute ground truth normals
+        gt_grad_x = gt_depth[:, :, :, :-1] - gt_depth[:, :, :, 1:]
+        gt_grad_y = gt_depth[:, :, :-1, :] - gt_depth[:, :, 1:, :]
+        
+        min_height = min(gt_grad_x.size(2), gt_grad_y.size(2))
+        min_width = min(gt_grad_x.size(3), gt_grad_y.size(3))
+        gt_grad_x = gt_grad_x[:, :, :min_height, :min_width]
+        gt_grad_y = gt_grad_y[:, :, :min_height, :min_width]
+        gt_normal_z = torch.ones_like(gt_grad_x)
+        
+    
+        gt_normal = torch.cat([gt_grad_x, gt_grad_y, gt_normal_z], dim=1)
+        gt_normal = F.normalize(gt_normal, dim=1)  # Normalize ground truth normals
+
+        # Compute predicted normals
+        pred_grad_x = pred_depth[:, :, :, :-1] - pred_depth[:, :, :, 1:]
+        pred_grad_y = pred_depth[:, :, :-1, :] - pred_depth[:, :, 1:, :]
+        
+        pred_grad_x = pred_grad_x[:, :, :min_height, :min_width]
+        pred_grad_y = pred_grad_y[:, :, :min_height, :min_width]
+        pred_normal_z = torch.ones_like(pred_grad_x)
+        
+        pred_normal = torch.cat([pred_grad_x, pred_grad_y, pred_normal_z], dim=1)
+        pred_normal = F.normalize(pred_normal, dim=1)  # Normalize predicted normals
+        valid_mask_cropped = valid_mask[:, :, :min_height, :min_width]
+        normal_loss = F.l1_loss(pred_normal * valid_mask_cropped, gt_normal * valid_mask_cropped, reduction='sum') / M
+    
         # Total loss
-        total_loss = l1_depth_loss + 0.5 * grad_loss
+        total_loss = l1_depth_loss + 0.5 * grad_loss + 0.7 * normal_loss
 
         # Loss info dictionary for logging purposes
         loss_info = {
             'l1_depth_loss': l1_depth_loss.item(),
             'gradient_loss': grad_loss.item(),
-            'total_loss': total_loss.item()
+            'total_loss': total_loss.item(),
+            'normal_loss': normal_loss.item()
         }
 
         return total_loss, loss_info
@@ -75,8 +111,9 @@ class midasNetModule(pl.LightningModule):
         state_dict = torch.load(file_path, map_location=self.device)
         self.load_state_dict(state_dict)
     
-    def forward(self, input_sparse_depth, input_image, depth_pred, validity_map):
-        return self.model(input_sparse_depth, input_image, depth_pred, validity_map)
+    def forward(self, input_sparse_depth, input_image, rel_depth_pred, interp_scale, ga_depth_inv):
+        metric_depth_inv_pred, GA_depth_inv =  self.model(input_sparse_depth, input_image, rel_depth_pred, interp_scale, ga_depth_inv, None)
+        return metric_depth_inv_pred, GA_depth_inv
     
     def training_step(self, batch, batch_idx):
         loss, _, _, _, _= self._common_step(batch, batch_idx)
@@ -94,10 +131,14 @@ class midasNetModule(pl.LightningModule):
 
     def _common_step(self, batch, batch_idx, stage="train"):
         #input_sparse_depth, input_image, rel_depth_pred, depth_gt, validity_map = batch
+        #t1 = time.time()
         input_image, depth_gt_inv, input_sparse_depth, rel_depth_pred, ga_depth_inv, interp_scale, mask,_ = batch
+        #print("Time taken to load batch: ", time.time() - t1)
         #metric_depth_pred, GA_depth, mask = self.model(input_sparse_depth, input_image, rel_depth_pred, None)
+        #t1 = time.time()
         metric_depth_inv_pred, GA_depth_inv = self.model(input_sparse_depth, input_image, rel_depth_pred, 
                                                          interp_scale, ga_depth_inv, None)
+        #print("Time taken to forward pass: ", time.time() - t1)
 
         # metric_depth_pred = torch.nn.functional.interpolate(
         #     metric_depth_pred,
@@ -114,12 +155,14 @@ class midasNetModule(pl.LightningModule):
         # depth_gt_inv_resized = torch.nn.functional.interpolate(
         #     depth_gt_inv.unsqueeze(1), size=metric_depth_inv_pred.shape[2:], mode="bicubic", align_corners=False
         # )
+        #t1 = time.time()
         depth_gt = 1.0 / depth_gt_inv
         depth_gt[depth_gt == float("inf")] = 0
         metric_depth_pred = 1.0 / metric_depth_inv_pred
         metric_depth_pred[metric_depth_pred == float("inf")] = 0
 
         loss,loss_info = self.compute_loss(metric_depth_pred, depth_gt)
+        #print("Time taken to compute loss: ", time.time() - t1)
         
         #resize metric_depth_pred to match depth_gt dimensions
         #l_grad = self.grad_loss(metric_depth_pred, depth_gt)
@@ -133,11 +176,13 @@ class midasNetModule(pl.LightningModule):
 
         #loss = siloss + l_grad * 0.5
         #self.log(stage+"_loss", loss, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.logger.experiment.add_scalar(f"{stage}_loss", loss, self.global_step)
-        self.logger.experiment.add_scalar(f"{stage}_gradloss", loss_info['gradient_loss'], self.global_step)
-        self.logger.experiment.add_scalar(f"{stage}_l1loss", loss_info['l1_depth_loss'], self.global_step)
+        self.log(f"{stage}/total_loss", loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log(f"{stage}/gradloss", loss_info['gradient_loss'], prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log(f"{stage}/l1loss", loss_info['l1_depth_loss'], prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log(f"{stage}/normal_loss", loss_info['normal_loss'], prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
 
-        if batch_idx % 10 == 0:
+        if batch_idx % 40 == 0:
+            #t1 = time.time()
             depth_gt_vis = depth_gt[0]
 
             metric_pred_vis = metric_depth_pred[0]
@@ -156,6 +201,7 @@ class midasNetModule(pl.LightningModule):
 
             t = torch.concat([t_gt, t_pred, t_ga.unsqueeze(0)], dim=0)
             self.log_img_tensorboard(input_image, t, batch_idx, self.current_epoch, mode=stage)
+            #print("Time taken to log to tensorboard: ", time.time() - t1)
 
         return loss, input_image, metric_depth_inv_pred, GA_depth_inv, depth_gt_inv
 
@@ -259,5 +305,16 @@ class midasNetModule(pl.LightningModule):
                                       weight_decay=self.wd,
                                       betas=(0.9, 0.999)
                                       )
-
-        return optimizer
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 
+                                                            mode='min', 
+                                                            factor=0.5, 
+                                                            patience=1, 
+                                                            min_lr=1e-6,
+                                                            verbose=True)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "train/total_loss",  # Replace with your actual validation loss metric key
+            },
+        }
