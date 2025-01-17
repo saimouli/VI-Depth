@@ -131,7 +131,7 @@ class Resize(object):
             interpolation_method = self.__image_interpolation_method
             sample[item] = cv2.resize(
                 sample[item],
-                (width, height),
+                (int(width), int(height)),
                 interpolation=interpolation_method,
             )
 

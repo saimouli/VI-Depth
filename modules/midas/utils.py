@@ -55,6 +55,61 @@ def read_pfm(path):
 
         return data, scale
 
+def is_tuple(data):
+    """Checks if data is a tuple."""
+    return isinstance(data, tuple)
+
+def is_list(data):
+    """Checks if data is a list."""
+    return isinstance(data, list)
+
+def is_seq(data):
+    """Checks if data is a list or tuple."""
+    return is_tuple(data) or is_list(data)
+
+def inv2depth(inv_depth):
+    """
+    Invert an inverse depth map to produce a depth map
+
+    Parameters
+    ----------
+    inv_depth : torch.Tensor or list of torch.Tensor [B,1,H,W]
+        Inverse depth map
+
+    Returns
+    -------
+    depth : torch.Tensor or list of torch.Tensor [B,1,H,W]
+        Depth map
+    """
+    if is_seq(inv_depth):
+        return [inv2depth(item) for item in inv_depth]
+    else:
+        depth = 1. / inv_depth.clamp(min=1e-6)
+        depth[inv_depth <= 0.] = 0.
+        return depth 
+
+
+def depth2inv(depth):
+    """
+    Invert a depth map to produce an inverse depth map
+
+    Parameters
+    ----------
+    depth : torch.Tensor or list of torch.Tensor [B,1,H,W]
+        Depth map
+
+    Returns
+    -------
+    inv_depth : torch.Tensor or list of torch.Tensor [B,1,H,W]
+        Inverse depth map
+
+    """
+    if is_seq(depth):
+        return [depth2inv(item) for item in depth]
+    else:
+        inv_depth = 1. / depth.clamp(min=1e-6)
+        inv_depth[depth <= 0.] = 0.
+        return inv_depth
 
 def write_pfm(path, image, scale=1):
     """Write pfm file.

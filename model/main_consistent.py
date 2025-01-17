@@ -1,4 +1,4 @@
-from model.mhybrid_net import midasNet
+from model.mhybrid_consistent_net import midasConsNet
 import torch.nn.functional as F
 import pytorch_lightning as pl
 import numpy as np
@@ -8,6 +8,7 @@ from typing import Any
 import matplotlib.pyplot as plt
 import torchvision
 import cv2
+import modules.midas.utils as utils
 
 class midasNetConsistentModule(pl.LightningModule):
     def __init__(self, lr: float = 0.1, wd: float = 0.1, min_pred: float = 0.1, 
@@ -15,7 +16,7 @@ class midasNetConsistentModule(pl.LightningModule):
                  max_depth: float = 5.0, nsamples: int = 150, img_h=480, img_w=640, sml_model_path: str = None,
                  *args: Any, **kwargs: Any) -> None:
         super(midasNetConsistentModule, self).__init__(*args, **kwargs)
-        self.model = midasNet(min_pred, max_pred, min_depth, max_depth, nsamples, sml_model_path)
+        self.model = midasConsNet(min_pred, max_pred, min_depth, max_depth, nsamples, sml_model_path)
         self.lr = lr
         self.wd = wd
         self.orig_h = img_h
@@ -26,26 +27,138 @@ class midasNetConsistentModule(pl.LightningModule):
         state_dict = torch.load(file_path, map_location=self.device)
         self.load_state_dict(state_dict)
     
-    def forward(self, input_sparse_depth, input_image, depth_pred, validity_map):
-        return self.model(input_sparse_depth, input_image, depth_pred, validity_map)
+    def forward(self, tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, ref_imgs,
+                ref_ga_depth, ref_interp, ref_gt_depth, tgt_pose, ref_pose, intrinsics):
+        return self.model(tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, ref_imgs,
+                          ref_ga_depth, ref_interp, ref_gt_depth, tgt_pose, ref_pose, intrinsics)
     
     def training_step(self, batch, batch_idx):
-        loss, _, _, _, _= self._common_step(batch, batch_idx)
+        loss = self._common_step(batch, batch_idx)
         
         current_lr = self.trainer.optimizers[0].param_groups[0]['lr'] 
         self.log("learning_rate", current_lr, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
         return loss
     
     def validation_step(self, batch, batch_idx):
-        loss, input_img, metric_depth_pred, GA_depth, depth_gt = self._common_step(batch, batch_idx, stage="val")
+        loss = self._common_step(batch, batch_idx, stage="val")
         return loss
+    
+    def compute_exp_weighted_l1loss(self, metric_depth_pred, tgt_gt_depth, gamma=0.85):
+        total_loss = 0.0
+        total_weight = 0.0
+        num_levels = len(metric_depth_pred)
+        
+        valid_mask = (tgt_gt_depth > 0).float().detach()
+        
+        for i, pred_depth in enumerate(metric_depth_pred):
+            weight = gamma ** (num_levels - i - 1)
+            total_weight += weight
+            
+            l1_loss = torch.mean(torch.abs(tgt_gt_depth - pred_depth) * valid_mask)
+            loss_i = l1_loss
+            total_loss += weight * loss_i
+        
+        return total_loss / total_weight
+
+    def compute_loss(self, pred_depth, gt_depth, log_variance=None):
+        """
+        Computes the loss for depth prediction based on L1 depth loss and multiscale gradient matching.
+
+        Args:
+        - pred_depth (torch.Tensor): Predicted depth map (B, C, H, W)
+        - gt_depth (torch.Tensor): Ground truth depth map (B, C, H, W)
+        - log_variance (torch.Tensor, optional): Log variance (uncertainty) map (B, 1, H, W)
+        
+        Returns:
+        - loss (torch.Tensor): Total loss (depth loss + 0.5 * gradient loss)
+        - loss_info (dict): Detailed information about individual loss components
+        """
+        # Ensure valid mask for pixels with ground truth
+        valid_mask = (gt_depth > 0).float()
+        M = valid_mask.sum()
+
+        if log_variance is not None:
+            depth_diff = (pred_depth * valid_mask) - (gt_depth * valid_mask)
+            weighted_l1_loss = 0.5 * torch.exp(-log_variance) * (depth_diff ** 2) + 0.5 * log_variance
+            l1_depth_loss = (weighted_l1_loss * valid_mask).sum() / M
+        else:
+            # L1 Depth loss
+            l1_depth_loss = F.l1_loss(pred_depth * valid_mask, gt_depth * valid_mask, reduction='sum') / M
+
+        # Multiscale gradient matching loss
+        def compute_gradient_loss(pred, gt):
+            diff = gt - pred
+            grad_x_pred = torch.abs(diff[:, :, :, :-1] - diff[:, :, :, 1:])
+            grad_y_pred = torch.abs(diff[:, :, :-1, :] - diff[:, :, 1:, :])
+            return (grad_x_pred.mean() + grad_y_pred.mean()) / M
+
+        grad_loss = 0.0
+        for scale in range(3):  # K = 3 levels
+            scaled_pred = F.interpolate(pred_depth, scale_factor=1 / (2 ** scale), mode='bilinear', align_corners=False)
+            scaled_gt = F.interpolate(gt_depth, scale_factor=1 / (2 ** scale), mode='bilinear', align_corners=False)
+            grad_loss += compute_gradient_loss(scaled_pred, scaled_gt)
+        
+        grad_loss /= 3  # Average over K = 3 scales
+
+        # Total loss
+        total_loss = l1_depth_loss + 0.5 * grad_loss
+
+        # Loss info dictionary for logging purposes
+        loss_info = {
+            'l1_depth_loss': l1_depth_loss.item(),
+            'gradient_loss': grad_loss.item(),
+            'total_loss': total_loss.item()
+        }
+
+        if log_variance is not None:
+            loss_info['uncertainty_loss'] = 0.5 * log_variance.mean().item()
+
+        return total_loss, loss_info
     
     def _common_step(self, batch, batch_idx, stage="train"):
         #input_sparse_depth, input_image, rel_depth_pred, depth_gt, validity_map = batch
-        tgt_img, tgt_gt_depth, tgt_ga_depth, tgt_interp, \
-                ref_img, ref_ga_depth, ref_interp, ref_gt_depth,\
-                tgt_pose, ref_pose, intrinsics = batch
-        test = 0
+        tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, ref_imgs, \
+        ref_ga_depth, ref_interp, ref_gt_depth, tgt_pose, ref_pose, intrinsics = batch
+
+
+        metric_depth_inv_pred = self.model(tgt_img, ref_imgs, tgt_ga_depth, ref_ga_depth, 
+                                           tgt_interp, ref_interp,
+                                           tgt_pose, ref_pose, intrinsics)
+        
+        # Compute depth loss with depth uncertainty
+        # loss, loss_info = self.compute_loss(utils.inv2depth(metric_depth_inv_pred), 
+        #                                    utils.inv2depth(tgt_gt_depth_inv),
+        #                                    log_variance=None)
+        
+        gt_depth = utils.inv2depth(tgt_gt_depth_inv)
+        metric_depth_pred = utils.inv2depth(metric_depth_inv_pred)
+        loss = self.compute_exp_weighted_l1loss(metric_depth_pred, 
+                                                gt_depth)
+        
+        self.logger.experiment.add_scalar(f"{stage}_loss", loss, self.global_step)
+        
+        if batch_idx % 10 == 0:
+            depth_gt_vis = gt_depth[0]
+
+            metric_pred_vis = metric_depth_pred[-1][0]
+
+            GA_pred = 1.0 / tgt_ga_depth[0]
+            GA_pred[GA_pred == float("inf")] = 0
+
+            t_gt = depth_gt_vis - depth_gt_vis.min()
+            t_gt = t_gt / t_gt.max()
+
+            t_pred = metric_pred_vis - metric_pred_vis.min()
+            t_pred = t_pred / t_pred.max()
+
+            t_ga = GA_pred - GA_pred.min()
+            t_ga = t_ga / t_ga.max()
+
+            t = torch.concat([t_gt, t_pred, t_ga.unsqueeze(0)], dim=0)
+            self.log_img_tensorboard(tgt_img, t, batch_idx, self.current_epoch, mode=stage)
+            
+        return loss
+        #TODO: compute loss for the pose as well
         
 
     @torch.no_grad()

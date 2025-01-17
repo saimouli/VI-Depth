@@ -163,9 +163,9 @@ def create_frame_index(data_dir):
             pose2 = np.loadtxt(pose_path[idx])
 
             #if pose movement is > 0.1cm
-            pose_diff = np.linalg.norm(pose1[:3, 3] - pose2[:3, 3])
-            if pose_diff < 0.1:
-                continue
+            # pose_diff = np.linalg.norm(pose1[:3, 3] - pose2[:3, 3])
+            # if pose_diff < 0.1:
+            #     continue
             index.append(idx)
             frame_names.append(images[idx])
 
@@ -176,8 +176,8 @@ def create_frame_index(data_dir):
 
 
 if __name__ == "__main__":
-    data_dir = "/media/saimouli/Data6T/datasets/VOID_150/training" #"/media/saimouli/RPNG_FLASH_4/datasets/VOID_150/training"
-    save_priors(data_dir)
+    data_dir = "/media/saimouli/Data6T/datasets/VOID_150/testing" #"/media/saimouli/RPNG_FLASH_4/datasets/VOID_150/training"
+    # save_priors(data_dir)
 
-    #create_frame_index(data_dir)
+    create_frame_index(data_dir)
 

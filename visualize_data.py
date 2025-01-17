@@ -85,12 +85,12 @@ def evaluate(dataset_path, depth_predictor, nsamples, sml_model_path):
     #model = midasNet(min_pred, max_pred, min_depth, max_depth, nsamples, sml_model_path)
     
     # get inputs
-    # with open(f"{dataset_path}/test_image.txt") as f: 
-    #     test_image_list = [line.rstrip() for line in f]
+    with open(f"{dataset_path}/test_image.txt") as f: 
+        test_image_list = [line.rstrip() for line in f]
     
     #read all the list of images in folder
-    dataset_path_fld = os.path.join(dataset_path, "image")
-    test_image_list = sorted([os.path.basename(f) for f in glob.glob(os.path.join(dataset_path_fld, "*.png"))])
+    #dataset_path_fld = os.path.join(dataset_path, "image")
+    #test_image_list = sorted([os.path.basename(f) for f in glob.glob(os.path.join(dataset_path_fld, "*.png"))])
     
     if ROS_VIZ:
         visualizer = PointCloudVisualizer()
@@ -108,7 +108,7 @@ def evaluate(dataset_path, depth_predictor, nsamples, sml_model_path):
     for i in tqdm(range(len(test_image_list))):
         
         #image
-        input_image_fp = os.path.join(dataset_path_fld, test_image_list[i])
+        input_image_fp = os.path.join(dataset_path, test_image_list[i])
         input_image = utils.read_image(input_image_fp)
         
         #poses list
@@ -125,84 +125,99 @@ def evaluate(dataset_path, depth_predictor, nsamples, sml_model_path):
             z=p_CinG[2]
         )))
         
-        #cam_K = np.loadtxt(dataset_path + "/K.txt")
         # sparse depth
-        input_sparse_depth_fp = input_image_fp.replace("image", "sparse_depth")
-        input_sparse_depth = np.array(Image.open(input_sparse_depth_fp), dtype=np.float32) / 256.0
-        input_sparse_depth[input_sparse_depth <= 0] = 0.0
+        # input_sparse_depth_fp = input_image_fp.replace("image", "sparse_depth")
+        # input_sparse_depth = np.array(Image.open(input_sparse_depth_fp), dtype=np.float32) / 256.0
+        # input_sparse_depth[input_sparse_depth <= 0] = 0.0
         
         validity_map = None
 
         target_depth_fp = input_image_fp.replace("image", "ground_truth")
         target_depth = np.array(Image.open(target_depth_fp), dtype=np.float32) / 256.0
         target_depth[target_depth <= 0] = 0.0
-        
-        # target depth valid/mask
-        mask = (target_depth < max_depth)
-        if min_depth is not None:
-            mask *= (target_depth > min_depth)
-        target_depth[~mask] = np.inf  # set invalid depth
-        target_depth = 1.0 / target_depth
-        
-        output = method.run(input_image, input_sparse_depth, validity_map, device)
-        ga_depth = output["ga_depth"]
-        sml_depth = output["sml_depth"]
-        #ga_depth, sml_depth = model.forward(input_sparse_depth_inv, input_image, depth_pred_inv, interp_scale, GA_depth_inv, None)
 
-        # compute error metrics using intermediate (globally aligned) depth
-        error_w_int_depth = metrics.ErrorMetrics()
-        error_w_int_depth.compute(
-            estimate = ga_depth, 
-            target = target_depth, 
-            valid = mask.astype(bool),
-        )
+        #Load the consistent scale depth
+        refine_depth_fp = input_image_fp.replace("image", "output/model_v3/depth")
+        refine_depth_fp = refine_depth_fp.replace(".png", ".npy")
+        refine_depth_test = np.array(np.load(refine_depth_fp))
+        #resize to  480, 640
+        refine_depth_test = cv2.resize(refine_depth_test, (640, 480), interpolation=cv2.INTER_NEAREST)
+        refine_depth_test[refine_depth_test <= 0] = 0.0
+        valid_mask = (target_depth > 0) & (refine_depth_test > 0)
+        scaling_factor = 0.0526 #np.median(target_depth[valid_mask] / refine_depth_test[valid_mask])
+        print(scaling_factor)
+        scaled_refine_depth_test = refine_depth_test * scaling_factor
+        scaled_refine_depth_test[~valid_mask] = 0.0
 
-        # compute error metrics using SML output depth
-        error_w_pred = metrics.ErrorMetrics()
-        error_w_pred.compute(
-            estimate = sml_depth, 
-            target = target_depth, 
-            valid = mask.astype(bool),
-        )
         
-        # accumulate error metric
-        avg_error_w_int_depth.accumulate(error_w_int_depth)
-        avg_error_w_pred.accumulate(error_w_pred)
+        # # target depth valid/mask
+        # mask = (target_depth < max_depth)
+        # if min_depth is not None:
+        #     mask *= (target_depth > min_depth)
+        # target_depth[~mask] = np.inf  # set invalid depth
+        # target_depth = 1.0 / target_depth
         
-        if ROS_VIZ and i % 4 ==0:
-            points_refine, colors_refine, _ = project_depth_vectorize(1.0/sml_depth, input_image, p_CinG, R_CtoG, cam_K)
+        # output = method.run(input_image, input_sparse_depth, validity_map, device)
+        # ga_depth = output["ga_depth"]
+        # sml_depth = output["sml_depth"]
+        # #ga_depth, sml_depth = model.forward(input_sparse_depth_inv, input_image, depth_pred_inv, interp_scale, GA_depth_inv, None)
+
+        # # compute error metrics using intermediate (globally aligned) depth
+        # error_w_int_depth = metrics.ErrorMetrics()
+        # error_w_int_depth.compute(
+        #     estimate = ga_depth, 
+        #     target = target_depth, 
+        #     valid = mask.astype(bool),
+        # )
+
+        # # compute error metrics using SML output depth
+        # error_w_pred = metrics.ErrorMetrics()
+        # error_w_pred.compute(
+        #     estimate = sml_depth, 
+        #     target = target_depth, 
+        #     valid = mask.astype(bool),
+        # )
+        
+        # # accumulate error metric
+        # avg_error_w_int_depth.accumulate(error_w_int_depth)
+        # avg_error_w_pred.accumulate(error_w_pred)
+        
+        if ROS_VIZ and i % 2 ==0:
+            #points_refine, colors_refine, _ = project_depth_vectorize(1.0/sml_depth, input_image, p_CinG, R_CtoG, cam_K)
             #points_ga, colors_ga, _ = project_depth_vectorize(1.0/ga_depth, input_image, p_CinG, R_CtoG, cam_K)
-            #points_gt, colors_gt, _ = project_depth_vectorize(1.0/target_depth, input_image, p_CinG, R_CtoG, cam_K)
+            points_gt, colors_gt, _ = project_depth_vectorize(target_depth, input_image, p_CinG, R_CtoG, cam_K)
+            point_consis, colors_consis, _ = project_depth_vectorize(scaled_refine_depth_test, input_image, p_CinG, R_CtoG, cam_K)
             
             visualizer.publish_path(poses)
             visualizer.pose_callback(p_CinG, R_CtoG)
-            visualizer.publish_point_cloud_refine(points_refine, colors_refine)
-            #visualizer.publish_point_cloud_gt(points_gt, colors_gt)
+            #visualizer.publish_point_cloud_refine(points_refine, colors_refine)
+            visualizer.publish_point_cloud_gt(points_gt, colors_gt)
+            visualizer.publish_point_cloud_refine(point_consis, colors_consis)
             rate.sleep()
     
-    # compute average error metrics
-    print("Averaging metrics for globally-aligned depth over {} samples".format(
-        avg_error_w_int_depth.total_count
-    ))
-    avg_error_w_int_depth.average()
+    # # compute average error metrics
+    # print("Averaging metrics for globally-aligned depth over {} samples".format(
+    #     avg_error_w_int_depth.total_count
+    # ))
+    # avg_error_w_int_depth.average()
 
-    print("Averaging metrics for SML-aligned depth over {} samples".format(
-        avg_error_w_pred.total_count
-    ))
-    avg_error_w_pred.average()
+    # print("Averaging metrics for SML-aligned depth over {} samples".format(
+    #     avg_error_w_pred.total_count
+    # ))
+    # avg_error_w_pred.average()
     
-    from prettytable import PrettyTable
-    summary_tb = PrettyTable()
-    summary_tb.field_names = ["Metric", "GA Only", "GA+SML"]
+    # from prettytable import PrettyTable
+    # summary_tb = PrettyTable()
+    # summary_tb.field_names = ["Metric", "GA Only", "GA+SML"]
 
-    summary_tb.add_row(["RMSE", f"{avg_error_w_int_depth.rmse_avg:7.2f}", f"{avg_error_w_pred.rmse_avg:7.2f}"])
-    summary_tb.add_row(["MAE", f"{avg_error_w_int_depth.mae_avg:7.2f}", f"{avg_error_w_pred.mae_avg:7.2f}"])
-    summary_tb.add_row(["AbsRel", f"{avg_error_w_int_depth.absrel_avg:8.3f}", f"{avg_error_w_pred.absrel_avg:8.3f}"])
-    summary_tb.add_row(["iRMSE", f"{avg_error_w_int_depth.inv_rmse_avg:7.2f}", f"{avg_error_w_pred.inv_rmse_avg:7.2f}"])
-    summary_tb.add_row(["iMAE", f"{avg_error_w_int_depth.inv_mae_avg:7.2f}", f"{avg_error_w_pred.inv_mae_avg:7.2f}"])
-    summary_tb.add_row(["iAbsRel", f"{avg_error_w_int_depth.inv_absrel_avg:8.3f}", f"{avg_error_w_pred.inv_absrel_avg:8.3f}"])
+    # summary_tb.add_row(["RMSE", f"{avg_error_w_int_depth.rmse_avg:7.2f}", f"{avg_error_w_pred.rmse_avg:7.2f}"])
+    # summary_tb.add_row(["MAE", f"{avg_error_w_int_depth.mae_avg:7.2f}", f"{avg_error_w_pred.mae_avg:7.2f}"])
+    # summary_tb.add_row(["AbsRel", f"{avg_error_w_int_depth.absrel_avg:8.3f}", f"{avg_error_w_pred.absrel_avg:8.3f}"])
+    # summary_tb.add_row(["iRMSE", f"{avg_error_w_int_depth.inv_rmse_avg:7.2f}", f"{avg_error_w_pred.inv_rmse_avg:7.2f}"])
+    # summary_tb.add_row(["iMAE", f"{avg_error_w_int_depth.inv_mae_avg:7.2f}", f"{avg_error_w_pred.inv_mae_avg:7.2f}"])
+    # summary_tb.add_row(["iAbsRel", f"{avg_error_w_int_depth.inv_absrel_avg:8.3f}", f"{avg_error_w_pred.inv_absrel_avg:8.3f}"])
     
-    print(summary_tb)
+    # print(summary_tb)
 
 def resize_with_aspect_ratio(image, target_width, ensure_multiple_of, interpolation=cv2.INTER_CUBIC):
     original_height, original_width = image.shape[:2]
@@ -387,7 +402,7 @@ def evaluate_light(dataset_path, depth_predictor, nsamples, sml_model_path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     
-    parser.add_argument("--dataset_path", type=str, default="/media/saimouli/Data6T/datasets/VOID_150/testing/office3")
+    parser.add_argument("--dataset_path", type=str, default="/media/saimouli/Data6T/sc_depth/void/office3")
     
     parser.add_argument("--depth_predictor", type=str, default='dpt_hybrid')
     

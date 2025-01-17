@@ -1,9 +1,18 @@
 import numpy as np
 import torch.utils.data
+import os
+import sys
+module_path = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if module_path not in sys.path:
+    sys.path.append(module_path)
 import modules.midas.utils as utils
 from PIL import Image
 #from path import Path
 from pathlib import Path
+import matplotlib.pyplot as plt
+from utils.camera import Camera
+import torch.nn.functional as F
+from torch.utils.data import Dataset
 
 def load_input_image(input_image_fp):
     return utils.read_image(input_image_fp)
@@ -36,24 +45,28 @@ def generate_sample_index(num_frames, skip_frames, sequence_length):
 
     return sample_index_list
 
-class SML_consistent_dataset(torch.utils.data.Dataset):
+
+class SML_consistent_dataset(Dataset):
     def __init__(self,
-                 root,
+                 data_root,
                  mode="train",
-                 depth_scale=256.0,
                  sequence_length=3,
+                 depth_scale=256.0,
                 ):
         #self.root = Path(root)/'training'
-        self.root = Path(root)
+        self.root = Path(data_root)
+        print("Root: ", self.root)
         self.depth_scale = depth_scale
         if mode == "train":
-            scene_list_path = self.root/'train_image.txt'
-            self.scenes = [self.root/folder[:-1]
-                        for folder in open(scene_list_path)]
+            self.scenes = [subfolder for subfolder in (self.root / 'training').iterdir() if subfolder.is_dir()]
+            # scene_list_path = self.root/'train_image.txt'
+            # self.scenes = [self.root/folder[:-1]
+            #             for folder in open(scene_list_path)]
         if mode == "val":
-            scene_list_path = self.root/'test_image.txt'
-            self.scenes = [self.root/folder[:-1]
-                        for folder in open(scene_list_path)]
+            self.scenes = [subfolder for subfolder in (self.root / 'testing').iterdir() if subfolder.is_dir()]
+            # scene_list_path = self.root/'test_image.txt'
+            # self.scenes = [self.root/folder[:-1]
+            #             for folder in open(scene_list_path)]
         
         self.crawl_folders(sequence_length)
 
@@ -150,8 +163,156 @@ class SML_consistent_dataset(torch.utils.data.Dataset):
             ]
         ]
         
+        #conver ref_img, ref_pose, ref_interp, intrinsics tensor to float 32
+        ref_img, ref_ga_depth, ref_interp, ref_gt_depth, ref_pose, intrinsics = [
+            [torch.from_numpy(item).float() if isinstance(item, np.ndarray) else item for item in T]
+            if isinstance(T, list) else torch.from_numpy(T).float() if isinstance(T, np.ndarray) else T
+            for T in [ref_img, ref_ga_depth, ref_interp, ref_gt_depth, ref_pose, intrinsics]
+        ]
+        
+        #img, gt_depth, ga_depth, interp_scale
         return tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, ref_img, \
             ref_ga_depth, ref_interp, ref_gt_depth, tgt_pose, ref_pose, intrinsics
     
     def __len__(self):
         return len(self.samples)
+
+
+# if __name__ == "__main__":
+#     #dataset = SML_consistent_dataset(data_root='/media/saimouli/Data6T/datasets/VOID_150_test', mode='val', sequence_length=3)
+#     dataset = torch.utils.data.DataLoader(SML_consistent_dataset(data_root='/media/saimouli/Data6T/datasets/VOID_150_test', mode='val'))
+#     # rr.init("3d_points_visualization", spawn=True)
+
+#     #for idx in range(len(dataset)):
+#     for batch_data in dataset:
+#         tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, ref_imgs, \
+#         ref_ga_depth, ref_interp, ref_gt_depth, tgt_pose, ref_pose, intrinsics = batch_data #dataset[idx] #Cam2Wld poses (R_ctoG, p_CinG)
+
+#         B, H, W,_ = tgt_img.shape
+#         _, _, DH, DW = tgt_gt_depth_inv.shape
+#         scale_factor = DW / float(W)
+        
+#         perturbed_pose = ref_pose[0].clone().detach().requires_grad_(True)
+#         optimizer = torch.optim.Adam([perturbed_pose], lr=1e-3)
+#         cam = Camera(K=intrinsics.float(), Twc=tgt_pose).scaled(scale_factor)
+#         ref_cam1 = Camera(K=intrinsics.float(), Twc=ref_pose[0]).scaled(scale_factor)
+#         ref_cam2 = Camera(K=intrinsics.float(), Twc=ref_pose[1]).scaled(scale_factor)
+
+#         gt_depth = utils.inv2depth(tgt_gt_depth_inv)
+#         world_points = cam.reconstruct(gt_depth, frame='w')
+        
+#         # for i in range(100):
+#         #     optimizer.zero_grad()
+
+#         #     ref_cam1_perturbed = Camera(K=intrinsics.float(), Twc=perturbed_pose).scaled(scale_factor)
+#         #     ref_coords1 = ref_cam1_perturbed.project(world_points, frame='w', normalize=True)  # (b, h, w, 2)
+#         #     warped_ref1 = F.grid_sample(
+#         #         ref_imgs[0].permute(0, 3, 1, 2), ref_coords1, mode='bilinear', padding_mode='zeros', align_corners=True
+#         #     )
+
+#         #     loss = F.l1_loss(warped_ref1, tgt_img.permute(0, 3, 1, 2))
+#         #     loss.backward()
+#         #     optimizer.step()
+
+#         #     print(f"Iteration {i}/{10}, Loss: {loss.item()}")
+
+#         #     with torch.no_grad():
+#         #         ref_coords1_optimized = ref_cam1_perturbed.project(world_points, frame='w', normalize=True)
+#         #         warped_ref1_optimized = F.grid_sample(
+#         #             ref_imgs[0].permute(0, 3, 1, 2), ref_coords1_optimized, mode='bilinear', padding_mode='zeros', align_corners=True
+#         #         )
+
+#         #         # Convert tensors to numpy for visualization
+#         #         tgt_img_np = tgt_img[0].cpu().numpy()  # (C, H, W) -> (H, W, C)
+#         #         warped_ref1_np = warped_ref1_optimized.squeeze(0).permute(1, 2, 0).cpu().numpy()  # (C, H, W) -> (H, W, C)
+
+#         #         tgt_img_cv2 = (tgt_img_np * 255).astype(np.uint8)  # Convert target image to uint8
+#         #         warped_ref1_cv2 = (warped_ref1_np * 255).astype(np.uint8)  # Convert warped image to uint8
+
+#         #         # Convert RGB to BGR for OpenCV
+#         #         tgt_img_cv2 = cv2.cvtColor(tgt_img_cv2, cv2.COLOR_RGB2BGR)
+#         #         warped_ref1_cv2 = cv2.cvtColor(warped_ref1_cv2, cv2.COLOR_RGB2BGR)
+
+#         #         # Create a side-by-side visualization
+#         #         combined = np.hstack((tgt_img_cv2, warped_ref1_cv2))
+
+#         #         # Add text labels to each image
+#         #         font = cv2.FONT_HERSHEY_SIMPLEX
+#         #         cv2.putText(combined, "Target Image", (50, 50), font, 1, (0, 255, 0), 2, cv2.LINE_AA)
+#         #         cv2.putText(combined, "Optimized Warped Ref Image", (tgt_img_cv2.shape[1] + 50, 50), font, 1, (0, 255, 0), 2, cv2.LINE_AA)
+
+#         #         # Show the images using OpenCV
+#         #         cv2.imshow("Comparison", combined)
+#         #         cv2.waitKey(10)  # Wait for a key press to close the window
+#         #         #cv2.destroyAllWindows()
+#         # #rr.log("3d_points", rr.Points3D(world_points[0].permute(1,2,0).view(-1,3).cpu().numpy()))
+
+#         # Project world points into reference cameras
+#         ref_coords1 = ref_cam1.project(world_points, frame='w', normalize=True)  # (b, h, w, 2)
+#         ref_coords2 = ref_cam2.project(world_points, frame='w', normalize=True)  # (b, h, w, 2)
+
+#         # Warp reference images into the target view
+#         warped_ref1 = F.grid_sample(ref_imgs[0].permute(0, 3, 1, 2), ref_coords1, mode='bilinear', padding_mode='zeros', align_corners=True)
+#         warped_ref2 = F.grid_sample(ref_imgs[1].permute(0, 3, 1, 2), ref_coords2, mode='bilinear', padding_mode='zeros', align_corners=True)
+
+#         # Convert tensors to numpy for visualization
+#         tgt_img_np = (tgt_img[0].cpu().numpy() * 255).astype(np.uint8)  # Target image
+#         warped_ref1_np = (warped_ref1.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)  # Warped Ref 1
+#         warped_ref2_np = (warped_ref2.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)  # Warped Ref 2
+
+#         # Convert images to BGR for OpenCV visualization
+#         tgt_img_bgr = cv2.cvtColor(tgt_img_np, cv2.COLOR_RGB2BGR)
+#         warped_ref1_bgr = cv2.cvtColor(warped_ref1_np, cv2.COLOR_RGB2BGR)
+#         warped_ref2_bgr = cv2.cvtColor(warped_ref2_np, cv2.COLOR_RGB2BGR)
+
+#         # Create overlays of the target image and the warped reference images
+#         overlay_ref1 = cv2.addWeighted(tgt_img_bgr, 0.5, warped_ref1_bgr, 0.5, 0)
+#         overlay_ref2 = cv2.addWeighted(tgt_img_bgr, 0.5, warped_ref2_bgr, 0.5, 0)
+
+#         # Plot the aligned images
+#         fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+#         # Target image
+#         axes[0].imshow(cv2.cvtColor(tgt_img_bgr, cv2.COLOR_BGR2RGB))
+#         axes[0].set_title("Target Image")
+#         axes[0].axis("off")
+
+#         # Target + Warped Ref Image 1
+#         axes[1].imshow(cv2.cvtColor(overlay_ref1, cv2.COLOR_BGR2RGB))
+#         axes[1].set_title("Overlay: Target + Warped Ref Image 1")
+#         axes[1].axis("off")
+
+#         # Target + Warped Ref Image 2
+#         axes[2].imshow(cv2.cvtColor(overlay_ref2, cv2.COLOR_BGR2RGB))
+#         axes[2].set_title("Overlay: Target + Warped Ref Image 2")
+#         axes[2].axis("off")
+
+#         plt.tight_layout()
+#         plt.show()
+                
+
+
+        # #tgt_img_np = tgt_img.transpose(1, 2, 0)
+        # #tgt_img_np = tgt_img_np.astype(np.uint8) 
+
+        # #ref_imgs_np = [ref_img.transpose(1, 2, 0).astype(np.uint8) for ref_img in ref_imgs]
+        # fig, axes = plt.subplots(1, len(ref_imgs) + 1, figsize=(15, 5))
+        # mid_idx = len(ref_imgs) // 2
+        # for i, ref_img_np in enumerate(ref_imgs[:mid_idx]):
+        #     axes[i].imshow(ref_img_np)
+        #     axes[i].set_title(f"Ref Image {i + 1}")
+        #     axes[i].axis("off")
+
+        # # Plot the target image in the center
+        # axes[mid_idx].imshow(tgt_img)
+        # axes[mid_idx].set_title("Target Image")
+        # axes[mid_idx].axis("off")
+
+        # for i, ref_img_np in enumerate(ref_imgs[mid_idx:], start=mid_idx + 1):
+        #     axes[i].imshow(ref_img_np)
+        #     axes[i].set_title(f"Ref Image {i + 1}")
+        #     axes[i].axis("off")
+        
+        # plt.tight_layout()
+        # plt.show()
+

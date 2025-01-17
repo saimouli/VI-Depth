@@ -9,6 +9,7 @@ class SMLDataConsistentModule(pl.LightningDataModule):
     def __init__(
             self,
             data_root: str = "",
+            sequence_length: int = 3,
             img_size: Tuple = (480, 640),
             batch_size: int = 12,
             num_workers: int = 3,
@@ -17,18 +18,22 @@ class SMLDataConsistentModule(pl.LightningDataModule):
         self.img_size = img_size
         self.batch_size = batch_size
         self.num_workers = num_workers
-        self.data_train = os.path.join(data_root, 'training')
-        self.data_val = os.path.join(data_root, 'testing')
+        self.sequence_length = sequence_length
+        self.data_root = data_root
+        #self.data_train = os.path.join(data_root, 'training')
+        #self.data_val = os.path.join(data_root, 'testing')
 
     def setup(self, stage: str):
         if stage == "fit":
             self.train_dataset = SML_consistent_dataset(
-                self.data_train,
-                mode="train"
+                self.data_root,
+                mode="train",
+                sequence_length=self.sequence_length
             )
             self.test_dataset = SML_consistent_dataset(
-                self.data_val,
-                mode="val"
+                self.data_root,
+                mode="val",
+                sequence_length=self.sequence_length
             )
     def train_dataloader(self):
         return DataLoader(
