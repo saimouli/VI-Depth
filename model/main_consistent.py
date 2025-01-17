@@ -145,16 +145,29 @@ class midasNetConsistentModule(pl.LightningModule):
             GA_pred = 1.0 / tgt_ga_depth[0]
             GA_pred[GA_pred == float("inf")] = 0
 
-            t_gt = depth_gt_vis - depth_gt_vis.min()
-            t_gt = t_gt / t_gt.max()
+            def safe_normalize(tensor):
+                t_min = tensor.min()
+                t_range = tensor.max() - t_min
+                return (tensor - t_min) / t_range if t_range > 0 else tensor - t_min
+    
+            t_gt = safe_normalize(depth_gt_vis)
+            t_pred = safe_normalize(metric_pred_vis)
+            t_ga = safe_normalize(GA_pred)
+            
+            # t_gt = depth_gt_vis - depth_gt_vis.min()
+            # t_gt = t_gt / t_gt.max()
 
-            t_pred = metric_pred_vis - metric_pred_vis.min()
-            t_pred = t_pred / t_pred.max()
+            # t_pred = metric_pred_vis - metric_pred_vis.min()
+            # t_pred = t_pred / t_pred.max()
 
-            t_ga = GA_pred - GA_pred.min()
-            t_ga = t_ga / t_ga.max()
+            # t_ga = GA_pred - GA_pred.min()
+            # t_ga = t_ga / t_ga.max()
 
-            t = torch.concat([t_gt, t_pred, t_ga.unsqueeze(0)], dim=0)
+            # Compute the error map (absolute difference)
+            error_map = torch.abs(metric_pred_vis - depth_gt_vis)
+            t_error = safe_normalize(error_map)
+            
+            t = torch.concat([t_gt, t_ga.unsqueeze(0), t_pred, t_error.unsqueeze(0)], dim=0)
             self.log_img_tensorboard(tgt_img, t, batch_idx, self.current_epoch, mode=stage)
             
         return loss
@@ -172,7 +185,7 @@ class midasNetConsistentModule(pl.LightningModule):
             depth_map_np = (depth_map_np - np.min(depth_map_np)) / (
                 np.max(depth_map_np) - np.min(depth_map_np)
             )
-            colored_map = plt.get_cmap("jet")(depth_map_np)[
+            colored_map = plt.get_cmap("jet")(depth_map_np)[ #blue low error, green to yellow medium error, red high error
                 :, :, :3
             ]  # Apply colormap and remove alpha channel
             colored_map_tensor = (
