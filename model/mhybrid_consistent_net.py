@@ -128,14 +128,17 @@ class BasicUpdateBlockDepth(nn.Module):
         inv_depth_list = [] 
         mask_list = []
         for i in range(seq_len):
-            input_features = self.encoder(inv_depth, cost_func(inv_depth))
+            cost = cost_func(inv_depth)
+            print("cost {}: mean{}".format(i, cost.mean()))
+            input_features = self.encoder(inv_depth, cost)
             inp_i = torch.cat([context, input_features], dim=1)
 
             hidden = self.depth_gru(hidden, inp_i)
             
             delta_scales = self.depth_head(hidden)
             delta_scales = F.relu(1.0 + delta_scales + 1e-5) #ensure positive scale
-            
+            print(f"inv_depth mean step {i}: {inv_depth.mean().item()}")
+            print("delta_scales mean step", i, delta_scales.mean().item())
             inv_depth_pred = inv_depth * delta_scales
 
             # clamp pred to min and max
@@ -153,6 +156,8 @@ class BasicUpdateBlockDepth(nn.Module):
             #     max_pred_inv = 1.0/self.max_pred
             #     inv_depth_pred[inv_depth_pred < max_pred_inv] = max_pred_inv
             
+             # *** Update for next iteration ***
+            inv_depth = inv_depth_pred
             # scale mask to balence gradients
             mask = .25 * self.mask(hidden) #helps numerical stability how?
             
@@ -218,14 +223,14 @@ class midasConsNet(nn.Module):
         up_flow = up_flow.permute(0, 1, 4, 2, 5, 3)
         return up_flow.reshape(N, 1, ratio*H, ratio*W)
     
-    def get_cost_each(self, pose, fmap, fmap_ref, depth, K, scale_factor):
+    def get_cost_each(self, tgt_pose, pose, fmap, fmap_ref, depth, K, scale_factor):
         """
             ga_depth: (b, 1, h, w)
             fmap, fmap_ref: (b, c, h, w)
         """
         device = depth.device
         ref_cam = Camera(K=K.float(), Twc=pose).scaled(scale_factor).to(device)
-        cam = Camera(K=K.float()).scaled(scale_factor).to(device) # tcw = Identity
+        cam = Camera(K=K.float(), Twc=tgt_pose).scaled(scale_factor).to(device) # tcw = Identity
         
         # Reconstruct world points from target_camera
         world_points = cam.reconstruct(depth, frame='w')
@@ -236,16 +241,19 @@ class midasConsNet(nn.Module):
                                     mode='bilinear', padding_mode='zeros', align_corners=True) # (b, c, h, w)
         
         cost = (fmap - fmap_warped)**2
+        #print("cost each: mean", cost.mean())
         
         return cost
     
-    def depth_cost_calc(self, inv_depth, fmap, fmaps_ref, pose_list, K, scale_factor):
+    def depth_cost_calc(self, inv_depth, fmap, fmaps_ref, pose_list, tgt_pose, K, scale_factor):
         cost_list = []
         for pose, fmap_r in zip(pose_list, fmaps_ref):
-            cost = self.get_cost_each(pose, fmap, fmap_r, utils.inv2depth(inv_depth), K, scale_factor)
-            cost_list.append(cost)  # (b, c,h, w)
+            cost = self.get_cost_each(tgt_pose, pose, fmap, fmap_r, utils.inv2depth(inv_depth), K, scale_factor)
+            cost_list.append(cost)  # (b, c,h, w) (1,64,144,192)
         # cost = torch.stack(cost_list, dim=1).min(dim=1)[0]
+        print(f"Cost each view : {[cost.mean().item() for cost in cost_list]}")
         cost = torch.stack(cost_list, dim=1).mean(dim=1)
+        #print("cost mean", cost.mean())
         return cost
 
     def preprocess_batch(self, *args, keys, device=None):
@@ -303,7 +311,7 @@ class midasConsNet(nn.Module):
         #pose_list_init = []
         
         # intialize depth and poses
-        #metric_depth_inv_tgt = tgt_ga_depth #[1, 480, 640]
+        #metric_depth_inv_tgt = tgt_ga_depth #[1, 480, 640] to [1,1,144,192]
         metric_depth_inv_tgt = F.interpolate(
             tgt_ga_depth.unsqueeze(1), size=(tgt_feats.shape[2], tgt_feats.shape[3]), mode='nearest'
         )
@@ -320,6 +328,7 @@ class midasConsNet(nn.Module):
         
         # step2 compute cost map and optimize depth scale iteratively
         for itr in range(self.iter_steps):
+            print("Iteration: {}".format(itr))
             metric_depth_inv_tgt = metric_depth_inv_tgt.detach()
             tgt_pose = tgt_pose.detach()
             ref_pose = [pose.detach() for pose in ref_pose]
@@ -328,13 +337,14 @@ class midasConsNet(nn.Module):
                                         fmap=tgt_feats,
                                         fmaps_ref=ref_feats,
                                         pose_list=ref_pose,
+                                        tgt_pose=tgt_pose,
                                         K=intrinsics,
                                         scale_factor=1.0/scale_factor)
             
             #update depth
             hidden_d, up_mask_seqs, inv_depth_seqs = self.update_block_depth(hidden_d, depth_cost_map_func,
                                                                              metric_depth_inv_tgt, inp_d,
-                                                                             seq_len=4)
+                                                                             seq_len=5)
             
             #we won't supervise the intermediate predictions
             up_mask_seqs, inv_depth_seqs = [up_mask_seqs[-1]], [inv_depth_seqs[-1]]

@@ -137,17 +137,17 @@ def evaluate(dataset_path, depth_predictor, nsamples, sml_model_path):
         target_depth[target_depth <= 0] = 0.0
 
         #Load the consistent scale depth
-        refine_depth_fp = input_image_fp.replace("image", "output/model_v3/depth")
-        refine_depth_fp = refine_depth_fp.replace(".png", ".npy")
-        refine_depth_test = np.array(np.load(refine_depth_fp))
-        #resize to  480, 640
-        refine_depth_test = cv2.resize(refine_depth_test, (640, 480), interpolation=cv2.INTER_NEAREST)
-        refine_depth_test[refine_depth_test <= 0] = 0.0
-        valid_mask = (target_depth > 0) & (refine_depth_test > 0)
-        scaling_factor = 0.0526 #np.median(target_depth[valid_mask] / refine_depth_test[valid_mask])
-        print(scaling_factor)
-        scaled_refine_depth_test = refine_depth_test * scaling_factor
-        scaled_refine_depth_test[~valid_mask] = 0.0
+        # refine_depth_fp = input_image_fp.replace("image", "output/model_v3/depth")
+        # refine_depth_fp = refine_depth_fp.replace(".png", ".npy")
+        # refine_depth_test = np.array(np.load(refine_depth_fp))
+        # #resize to  480, 640
+        # refine_depth_test = cv2.resize(refine_depth_test, (640, 480), interpolation=cv2.INTER_NEAREST)
+        # refine_depth_test[refine_depth_test <= 0] = 0.0
+        # valid_mask = (target_depth > 0) & (refine_depth_test > 0)
+        # scaling_factor = 0.0526 #np.median(target_depth[valid_mask] / refine_depth_test[valid_mask])
+        # print(scaling_factor)
+        # scaled_refine_depth_test = refine_depth_test * scaling_factor
+        # scaled_refine_depth_test[~valid_mask] = 0.0
 
         
         # # target depth valid/mask
@@ -186,13 +186,13 @@ def evaluate(dataset_path, depth_predictor, nsamples, sml_model_path):
             #points_refine, colors_refine, _ = project_depth_vectorize(1.0/sml_depth, input_image, p_CinG, R_CtoG, cam_K)
             #points_ga, colors_ga, _ = project_depth_vectorize(1.0/ga_depth, input_image, p_CinG, R_CtoG, cam_K)
             points_gt, colors_gt, _ = project_depth_vectorize(target_depth, input_image, p_CinG, R_CtoG, cam_K)
-            point_consis, colors_consis, _ = project_depth_vectorize(scaled_refine_depth_test, input_image, p_CinG, R_CtoG, cam_K)
+            #point_consis, colors_consis, _ = project_depth_vectorize(scaled_refine_depth_test, input_image, p_CinG, R_CtoG, cam_K)
             
             visualizer.publish_path(poses)
             visualizer.pose_callback(p_CinG, R_CtoG)
             #visualizer.publish_point_cloud_refine(points_refine, colors_refine)
             visualizer.publish_point_cloud_gt(points_gt, colors_gt)
-            visualizer.publish_point_cloud_refine(point_consis, colors_consis)
+            #visualizer.publish_point_cloud_refine(point_consis, colors_consis)
             rate.sleep()
     
     # # compute average error metrics
@@ -240,7 +240,7 @@ def evaluate_light(dataset_path, depth_predictor, nsamples, sml_model_path):
     print("device: %s" % device)
     
     # ranges for VOID
-    min_depth, max_depth = 0.2, 8.0
+    min_depth, max_depth = 0.2, 5.0
     min_pred, max_pred = 0.1, 8.0
 
     model = midasNet(min_pred, max_pred, min_depth, max_depth, nsamples, sml_model_path)
@@ -366,13 +366,13 @@ def evaluate_light(dataset_path, depth_predictor, nsamples, sml_model_path):
 
             points_refine, colors_refine, _ = project_depth_vectorize(sml_pred, image[0], p_CinG, R_CtoG, cam_K)
             #points_ga, colors_ga, _ = project_depth_vectorize(ga_depth, image[0], p_CinG, R_CtoG, cam_K)
-            #points_gt, colors_gt, _ = project_depth_vectorize(depth_gt, image[0], p_CinG, R_CtoG, cam_K)
+            points_gt, colors_gt, _ = project_depth_vectorize(depth_gt, image[0], p_CinG, R_CtoG, cam_K)
             #gt_depth_inv[0][0].numpy()
             
             visualizer.publish_path(poses)
             visualizer.pose_callback(p_CinG, R_CtoG)
             visualizer.publish_point_cloud_refine(points_refine, colors_refine)
-            #visualizer.publish_point_cloud_gt(points_gt, colors_gt)
+            visualizer.publish_point_cloud_gt(points_gt, colors_gt)
             rate.sleep()
     
     # compute average error metrics
@@ -402,7 +402,7 @@ def evaluate_light(dataset_path, depth_predictor, nsamples, sml_model_path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     
-    parser.add_argument("--dataset_path", type=str, default="/media/saimouli/Data6T/sc_depth/void/office3")
+    parser.add_argument("--dataset_path", type=str, default="/media/saimouli/Data6T/datasets/VOID_150_test/testing/mechanical_lab3")
     
     parser.add_argument("--depth_predictor", type=str, default='dpt_hybrid')
     

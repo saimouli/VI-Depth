@@ -91,6 +91,11 @@ class SML_consistent_dataset(Dataset):
             ga_depth_inv = sorted(ga_depth_inv_path.glob('*.npy'))
             ga_depth_inv = [ga_depth_inv[d] for d in frame_index]
 
+            #Load sparse depth points 
+            sparse_depth_path = scene / 'sparse_depth'
+            sparse_depth = sorted(sparse_depth_path.glob('*.png'))
+            sparse_depth = [sparse_depth[d] for d in frame_index]
+            
             # Load interpolated scaffolding
             interp_depth_path = scene / 'interp_scale'
             interp_depth = sorted(interp_depth_path.glob('*.npy'))
@@ -120,17 +125,20 @@ class SML_consistent_dataset(Dataset):
                 sample['tgt_pose'] = poses[sample_index['tgt_idx']]
                 sample['tgt_interp'] = interp_depth[sample_index['tgt_idx']]
                 sample['tgt_pose'] = poses[sample_index['tgt_idx']]
+                sample['tgt_sparse_depth'] = sparse_depth[sample_index['tgt_idx']]
 
 
                 sample['ref_imgs'] = []; sample['ref_ga_depth'] = []
                 sample['ref_gt_depth'] = []; sample['ref_pose'] = []
                 sample['ref_interp'] = []; sample['ref_pose'] = []
+                sample['ref_sparse_depth'] = []
                 for j in sample_index['ref_idx']:
                     sample['ref_imgs'].append(imgs[j])
                     sample['ref_ga_depth'].append(ga_depth_inv[j])
                     sample['ref_interp'].append(interp_depth[j])
                     sample['ref_pose'].append(poses[j])
                     sample['ref_gt_depth'].append(gt_depth[j])
+                    sample['ref_sparse_depth'].append(sparse_depth[j])
                 sequence_set.append(sample)
 
         self.samples = sequence_set
@@ -139,40 +147,42 @@ class SML_consistent_dataset(Dataset):
         sample = self.samples[index]
         tgt_img = load_input_image(str(sample['tgt_img']))
         tgt_gt_depth = load_sparse_depth(str(sample['tgt_gt_depth']), depth_scale=self.depth_scale)
+        tgt_sparse_depth = load_sparse_depth(str(sample['tgt_sparse_depth']), depth_scale=self.depth_scale)
         tgt_ga_depth = load_depth_image_from_npy(str(sample['tgt_ga_depth']))
         tgt_interp = load_depth_image_from_npy(str(sample['tgt_interp']))
         tgt_pose = np.loadtxt(str(sample['tgt_pose']))
 
         ref_img = [load_input_image(str(ref_img)) for ref_img in sample['ref_imgs']]
         ref_ga_depth = [load_depth_image_from_npy(str(ref_ga_depth)) for ref_ga_depth in sample['ref_ga_depth']]
+        ref_sparse_depth = [load_sparse_depth(str(ref_sparse_depth), depth_scale=self.depth_scale) for ref_sparse_depth in sample['ref_sparse_depth']]
         ref_interp = [load_depth_image_from_npy(str(ref_interp)) for ref_interp in sample['ref_interp']]
         ref_gt_depth = [load_sparse_depth(str(ref_gt_depth), depth_scale=self.depth_scale) for ref_gt_depth in sample['ref_gt_depth']]
         ref_pose = [np.loadtxt(pose) for pose in sample['ref_pose']]
         intrinsics = np.copy(sample['intrinsics'])
 
-        mask = (tgt_gt_depth < 8.0)
+        mask = (tgt_gt_depth < 5.0)
         mask *= (tgt_gt_depth > 0.2)
         tgt_gt_depth[~mask] = np.inf
         tgt_gt_depth_inv = 1.0 / tgt_gt_depth
         tgt_gt_depth_inv[tgt_gt_depth_inv == float("inf")] = 0
         tgt_gt_depth_inv = torch.from_numpy(tgt_gt_depth_inv).unsqueeze(0)
         
-        tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, tgt_pose = [
+        tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_sparse_depth, tgt_interp, tgt_pose = [
             T.astype(np.float32) if isinstance(T, np.ndarray) else T for T in [
-                tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, tgt_pose
+                tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_sparse_depth, tgt_interp, tgt_pose
             ]
         ]
         
-        #conver ref_img, ref_pose, ref_interp, intrinsics tensor to float 32
-        ref_img, ref_ga_depth, ref_interp, ref_gt_depth, ref_pose, intrinsics = [
+        #convert ref_img, ref_pose, ref_interp, intrinsics tensor to float 32
+        ref_img, ref_ga_depth, ref_interp, ref_gt_depth, ref_sparse_depth, ref_pose, intrinsics = [
             [torch.from_numpy(item).float() if isinstance(item, np.ndarray) else item for item in T]
             if isinstance(T, list) else torch.from_numpy(T).float() if isinstance(T, np.ndarray) else T
-            for T in [ref_img, ref_ga_depth, ref_interp, ref_gt_depth, ref_pose, intrinsics]
+            for T in [ref_img, ref_ga_depth, ref_interp, ref_gt_depth, ref_sparse_depth, ref_pose, intrinsics]
         ]
         
         #img, gt_depth, ga_depth, interp_scale
-        return tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, ref_img, \
-            ref_ga_depth, ref_interp, ref_gt_depth, tgt_pose, ref_pose, intrinsics
+        return tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, tgt_sparse_depth, ref_img, \
+            ref_ga_depth, ref_interp, ref_gt_depth, ref_sparse_depth, tgt_pose, ref_pose, intrinsics
     
     def __len__(self):
         return len(self.samples)

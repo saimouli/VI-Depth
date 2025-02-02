@@ -39,6 +39,10 @@ class midasNetConsistentModule(pl.LightningModule):
         self.log("learning_rate", current_lr, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
         return loss
     
+    #TODO: add depth metrics RMSE, MAE, etc
+    def validation_epoch_end(self, outputs):
+        pass
+    
     def validation_step(self, batch, batch_idx):
         loss = self._common_step(batch, batch_idx, stage="val")
         return loss
@@ -147,30 +151,30 @@ class midasNetConsistentModule(pl.LightningModule):
                 GA_pred = 1.0 / tgt_ga_depth[0]
                 GA_pred[GA_pred == float("inf")] = 0
 
-            def safe_normalize(tensor):
-                t_min = tensor.min()
-                t_range = tensor.max() - t_min
-                return (tensor - t_min) / t_range if t_range > 0 else tensor - t_min
+                def safe_normalize(tensor):
+                    t_min = tensor.min()
+                    t_range = tensor.max() - t_min
+                    return (tensor - t_min) / t_range if t_range > 0 else tensor - t_min
     
-            t_gt = safe_normalize(depth_gt_vis)
-            t_pred = safe_normalize(metric_pred_vis)
-            t_ga = safe_normalize(GA_pred)
+                t_gt = safe_normalize(depth_gt_vis)
+                t_pred = safe_normalize(metric_pred_vis)
+                t_ga = safe_normalize(GA_pred)
             
-            # t_gt = depth_gt_vis - depth_gt_vis.min()
-            # t_gt = t_gt / t_gt.max()
+                # t_gt = depth_gt_vis - depth_gt_vis.min()
+                # t_gt = t_gt / t_gt.max()
 
-            # t_pred = metric_pred_vis - metric_pred_vis.min()
-            # t_pred = t_pred / t_pred.max()
+                # t_pred = metric_pred_vis - metric_pred_vis.min()
+                # t_pred = t_pred / t_pred.max()
 
-            # t_ga = GA_pred - GA_pred.min()
-            # t_ga = t_ga / t_ga.max()
+                # t_ga = GA_pred - GA_pred.min()
+                # t_ga = t_ga / t_ga.max()
 
-            # Compute the error map (absolute difference)
-            error_map = torch.abs(metric_pred_vis - depth_gt_vis)
-            t_error = safe_normalize(error_map)
-            
-            t = torch.concat([t_gt, t_ga.unsqueeze(0), t_pred, t_error.unsqueeze(0)], dim=0)
-            self.log_img_tensorboard(tgt_img, t, batch_idx, self.current_epoch, mode=stage)
+                # Compute the error map (absolute difference)
+                error_map = torch.abs(metric_pred_vis - depth_gt_vis)
+                t_error = safe_normalize(error_map)
+                
+                t = torch.concat([t_gt, t_ga.unsqueeze(0), t_pred, t_error], dim=0)
+                self.log_img_tensorboard(tgt_img, t, batch_idx, self.current_epoch, mode=stage)
             
         return total_loss
         #TODO: compute loss for the pose as well

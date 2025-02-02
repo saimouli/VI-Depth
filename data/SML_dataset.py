@@ -53,21 +53,6 @@ class SML_dataset(Dataset):
         self.depth_scale = depth_scale
         model_transforms = transforms.get_transforms("dpt_hybrid", "void", str(150))
         self.ScaleMapLearner_transform = model_transforms["sml_model"]
-
-    def resize_with_aspect_ratio(self, image, target_width, ensure_multiple_of, interpolation=cv2.INTER_CUBIC):
-        original_height, original_width = image.shape[:2]
-        aspect_ratio = original_height / original_width
-
-        # Calculate new dimensions
-        new_width = target_width
-        new_height = int(round(new_width * aspect_ratio))
-        
-        # Ensure height is a multiple of the given value
-        new_height = (new_height // ensure_multiple_of) * ensure_multiple_of
-        
-        # Resize the image
-        resized_image = cv2.resize(image, (new_width, new_height), interpolation=interpolation)
-        return resized_image
         
     def __getitem__(self, index):
         image = load_input_image(self.image_paths[index])
@@ -109,7 +94,6 @@ class SML_dataset(Dataset):
         # plt.show()
 
         return image, gt_depth_inv, sparse_depth_inv, depth_pred_inv, ga_depth_inv, interp_scale, mask, pose_CtoG
-        #return image, gt_depth, sparse_depth, depth_pred, ga_depth, interp_scale
     
     def __len__(self):
         return self.n_samples
