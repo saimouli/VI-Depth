@@ -14,6 +14,7 @@ import pipeline
 import metrics
 
 import matplotlib.pyplot as plt
+import seaborn as sns
 from utils_eval import param_sweep_shift, param_sweep_scale, compute_ls_solution
 
 def get_ls_solution(depth_infer, input_sparse_depth, validity_map, min_pred, max_pred, max_depth, min_depth, mask, target_depth):
@@ -57,6 +58,7 @@ def evaluate(dataset_path, depth_predictor, nsamples, sml_model_path):
     avg_error_w_int_depth = metrics.ErrorMetricsAverager()
     avg_error_w_pred = metrics.ErrorMetricsAverager()
 
+    sparse_count = []; rmse_val = []; mae_val = []; absrel_val = []
     # iterate through inputs list
     for i in tqdm(range(len(test_image_list))):
         
@@ -74,6 +76,18 @@ def evaluate(dataset_path, depth_predictor, nsamples, sml_model_path):
         validity_map = np.array(Image.open(validity_map_fp), dtype=np.float32)
         assert(np.all(np.unique(validity_map) == [0, 256]))
         validity_map[validity_map > 0] = 1
+        
+        
+        #print("Before Pts: ", np.count_nonzero(validity_map))
+        # reduce_pts = int(np.count_nonzero(validity_map) * 0.10)
+        # nonzero_indices = np.argwhere(validity_map == 1)
+        # remove_indices = np.random.choice(len(nonzero_indices), size=reduce_pts, replace=False)
+        # points_to_remove = nonzero_indices[remove_indices]
+        # for x, y in points_to_remove:
+        #     validity_map[x, y] = 0
+        #print("After Pts: ", np.count_nonzero(validity_map))
+        
+        sparse_count.append(np.count_nonzero(validity_map))
 
         # target (ground truth) depth
         target_depth_fp = input_image_fp.replace("image", "ground_truth")
@@ -109,8 +123,14 @@ def evaluate(dataset_path, depth_predictor, nsamples, sml_model_path):
         # accumulate error metrics
         avg_error_w_int_depth.accumulate(error_w_int_depth)
         avg_error_w_pred.accumulate(error_w_pred)
-
-
+        
+        rmse_val.append(error_w_pred.rmse)
+        mae_val.append(error_w_pred.mae)
+        absrel_val.append(error_w_pred.absrel)
+    
+    plt.boxplot(sparse_count, vert=True, patch_artist=True)
+    plt.ylabel("Number of Sparse Points")
+    plt.show()
     # compute average error metrics
     print("Averaging metrics for globally-aligned depth over {} samples".format(
         avg_error_w_int_depth.total_count
@@ -275,13 +295,13 @@ if __name__=="__main__":
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('-ds', '--dataset-path', type=str, default='/media/saimouli/RPNG_FLASH_4/data/VOID_small/classroom6',
+    parser.add_argument('-ds', '--dataset-path', type=str, default='/media/saimouli/Data6T/datasets/VOID_150/testing',
                         help='Path to VOID release dataset.')
     parser.add_argument('-dp', '--depth-predictor', type=str, default='dpt_hybrid', 
                         help='Name of depth predictor to use in pipeline.')
     parser.add_argument('-ns', '--nsamples', type=int, default=150, 
                         help='Number of sparse metric depth samples available.')
-    parser.add_argument('-sm', '--sml-model-path', type=str, default='/home/saimouli/Downloads/sml_model.dpredictor.dpt_hybrid.nsamples.150.ckpt', 
+    parser.add_argument('-sm', '--sml-model-path', type=str, default='/home/saimouli/Documents/github/VI_Depth_sai/weights/sml_model.dpredictor.dpt_hybrid.nsamples.150.pretrained.ckpt', 
                         help='path')
 
     args = parser.parse_args()
