@@ -1,6 +1,11 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import os
+import sys
+module_path = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if module_path not in sys.path:
+    sys.path.append(module_path)
 from modules.midas.midas_net_custom import MidasNet_small_videpth
 import numpy as np
 import modules.midas.utils as utils
@@ -9,6 +14,7 @@ import utils.log_utils as log_utils
 from utils.common_op import resize_and_pad
 from modules.estimator import LeastSquaresEstimator
 from modules.interpolator import Interpolator2D
+from data.SML_dataset import SML_dataset
 
 class midasNet(nn.Module):
     def __init__(self, min_pred, max_pred, min_depth, max_depth, nsamples, sml_model_path):
@@ -107,3 +113,21 @@ class midasNet(nn.Module):
 
         #mask = torch.logical_and(1.0/metric_depth_inv > 0,1.0/metric_depth_inv < 8)
         return metric_depth_inv_resize, GA_depth_inv #, mask
+    
+# if __name__ == "__main__":
+#     model = midasNet(min_pred=0.1, max_pred=8.0, min_depth=0.2, max_depth=5.0, nsamples=150, sml_model_path=None)
+#     #dataset = torch.utils.data.DataLoader(SML_dataset(data_root='/media/saimouli/Data6T/datasets/VOID_150/testing', mode='val'))
+#     train_dataloader = torch.utils.data.DataLoader(
+#         SML_dataset(
+#             data_root = '/media/saimouli/Data6T/datasets/VOID_150/testing',
+#             mode = 'val',
+#             depth_scale = 1000.0,
+#         ),
+#         batch_size=2,
+#         shuffle=True,
+#         num_workers=1)
+    
+#     for batch_data in train_dataloader:
+#         image, gt_depth_inv, sparse_depth_inv, depth_pred_inv, ga_depth_inv, interp_scale, mask, pose_CtoG = batch_data
+#         #test with random input
+#         _, _ = model(sparse_depth_inv, image, depth_pred_inv, interp_scale, ga_depth_inv, None)

@@ -14,7 +14,6 @@ import pipeline
 import metrics
 
 import matplotlib.pyplot as plt
-import seaborn as sns
 from utils_eval import param_sweep_shift, param_sweep_scale, compute_ls_solution
 
 def get_ls_solution(depth_infer, input_sparse_depth, validity_map, min_pred, max_pred, max_depth, min_depth, mask, target_depth):

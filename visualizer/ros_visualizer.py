@@ -16,6 +16,8 @@ from scipy.spatial.transform import Rotation as R
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Pose
 from nav_msgs.msg import Path
+from sensor_msgs.msg import Image
+import numpy as np
 
 class PointCloudVisualizer:
     def __init__(self):
@@ -27,6 +29,7 @@ class PointCloudVisualizer:
         self.marker_array_pub = rospy.Publisher('path_markers', MarkerArray, queue_size=10)
         self.path_pub = rospy.Publisher('path_viz', Path, queue_size=10)
         self.pub_normals = rospy.Publisher('pc_normals', PointCloud2, queue_size=10)
+        self.pub_tgt_img = rospy.Publisher('tgt_img', Image, queue_size=10)
         # self.tf_buffer = tf2_ros.Buffer()
         # self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
         # self.tf_broadcaster = tf2_ros.TransformBroadcaster()
@@ -102,7 +105,7 @@ class PointCloudVisualizer:
         # Publish the transform
         self.tf_broadcaster.sendTransform(transform_msg)
     
-    def publish_sparse_points(self, sparse_pts, colors_sparse):
+    def publish_sparse_points(self, sparse_pts):
         header = std_msgs.msg.Header()
         header.stamp = rospy.Time.now()
         header.frame_id = "global"  # Change the frame ID if necessary
@@ -114,7 +117,7 @@ class PointCloudVisualizer:
 
         points_with_colors = []
         for i in range(len(sparse_pts)):
-            rgb = ((int(colors_sparse[i][0]) & 0xFF) << 16) | ((int(colors_sparse[i][1]) & 0xFF) << 8) | (int(colors_sparse[i][2]) & 0xFF)
+            rgb = (255 << 16)  # Red channel only
             point = list(sparse_pts[i]) + [rgb]
             points_with_colors.append(point)
 
@@ -200,3 +203,17 @@ class PointCloudVisualizer:
         print("Publishing GT: ", len(points_with_colors))
         point_cloud_msg = pc2.create_cloud(header, fields, points_with_colors)
         self.pub_gt.publish(point_cloud_msg)
+    
+    def publish_tgt_img(self, tgt_img):
+        assert tgt_img.ndim == 3, "tgt_img should have 3 dimensions (H, W, C)"
+        tgt_img_msg = Image()
+        tgt_img = tgt_img.astype(np.uint8)
+        tgt_img_msg.header.stamp = rospy.Time.now()
+        tgt_img_msg.header.frame_id = "camera"
+        tgt_img_msg.height = tgt_img.shape[0]
+        tgt_img_msg.width = tgt_img.shape[1]
+        tgt_img_msg.encoding = 'rgb8'
+        tgt_img_msg.is_bigendian = 0
+        tgt_img_msg.step = 3 * tgt_img.shape[1]
+        tgt_img_msg.data = tgt_img.tobytes()
+        self.pub_tgt_img.publish(tgt_img_msg)

@@ -111,7 +111,7 @@ class OutputScaleConv(nn.Module):
         return self.output_conv(x)
     
 class BasicUpdateBlockDepth(nn.Module):
-    def __init__(self, hidden_dim=128, cost_dim=64, ratio=3, context_dim=64, min_pred=None, max_pred=None):
+    def __init__(self, hidden_dim=128, cost_dim=64, ratio=3, context_dim=64, min_pred=None, max_pred=None, log_fn=None):
         super(BasicUpdateBlockDepth, self).__init__()
                 
         self.encoder = ProjectionInputDepth(cost_dim=cost_dim, hidden_dim=hidden_dim, out_chs=hidden_dim)
@@ -123,22 +123,37 @@ class BasicUpdateBlockDepth(nn.Module):
             nn.Conv2d(hidden_dim*2, ratio*ratio*9, 1, padding=0))
         self.min_pred = min_pred
         self.max_pred = max_pred
+        self.log_fn = log_fn
 
     def forward(self, hidden, cost_func, inv_depth, context, seq_len=4):
         inv_depth_list = [] 
         mask_list = []
+        
         for i in range(seq_len):
             cost = cost_func(inv_depth)
-            print("cost {}: mean{}".format(i, cost.mean()))
+            #print("cost {}: mean{}".format(i, cost.mean()))
+            if self.log_fn:
+                self.log_fn(f"UpdateBlock/Iteration_{i}/cost_mean", cost.mean().item(), on_step=True, logger=True)
+                
             input_features = self.encoder(inv_depth, cost)
             inp_i = torch.cat([context, input_features], dim=1)
 
+            if self.log_fn:
+                self.log_fn(f"UpdateBlock/Iteration_{i}/hidden_state_norm_before", hidden.norm().item(), on_step=True, logger=True)
+                
             hidden = self.depth_gru(hidden, inp_i)
             
+            if self.log_fn:
+                self.log_fn(f"UpdateBlock/Iteration_{i}/hidden_state_norm_after", hidden.norm().item(), on_step=True, logger=True)
+                
             delta_scales = self.depth_head(hidden)
-            delta_scales = F.relu(1.0 + delta_scales + 1e-5) #ensure positive scale
+            delta_scales = F.relu(1.0 + delta_scales) #ensure positive scale
             print(f"inv_depth mean step {i}: {inv_depth.mean().item()}")
             print("delta_scales mean step", i, delta_scales.mean().item())
+            
+            if self.log_fn:
+                self.log_fn(f"UpdateBlock/Iteration_{i}/delta_scales_mean", delta_scales.mean().item(), on_step=True, logger=True)
+                
             inv_depth_pred = inv_depth * delta_scales
 
             # clamp pred to min and max
@@ -159,17 +174,57 @@ class BasicUpdateBlockDepth(nn.Module):
              # *** Update for next iteration ***
             inv_depth = inv_depth_pred
             # scale mask to balence gradients
-            mask = .25 * self.mask(hidden) #helps numerical stability how?
+            mask = 0.25 * self.mask(hidden) #helps numerical stability how?
             
             inv_depth_list.append(inv_depth_pred)
             mask_list.append(mask)
             
         return hidden, mask_list, inv_depth_list
-       
+
+# class DifferentiableGaussNewton(nn.Module):
+#     def __init__(self, num_steps=3):
+#         super().__init__()
+#         self.num_steps = num_steps
+    
+#     def forward(self, features, depth, poses, sparse_points, K):
+#         """
+#         features: (B, C, H, W) - Target/reference features
+#         depth: (B, 1, H, W) - Current depth estimate
+#         poses: (B, N, 4, 4) - Camera poses (N = num keyframes)
+#         K: (B, 3, 3) - Intrinsics
+#         """
+#         b, _, h, w = depth.shape
+#         device = depth.device
+        
+#         for _ in range(self.num_steps):
+#             # Compute Jacobian and residuals
+#             J_pose, residuals = self.compute_jacobian_residuals(
+#                 features, depth, poses, sparse_points, K
+#             )
+            
+#             #Solve Gauss-Newton step: ΔT = -(J^T J)^-1 J^T r
+#             J_T = J_pose.transpose(-1, -2)
+#             H = J_T @ J_pose
+#             delta = -torch.linalg.inv(H + 1e-3 * torch.eye(6, device=device)) @ (J_T @ residuals)
+#             # Update poses (Lie algebra se3)
+#             poses = self.update_pose(poses, delta)
+#         return poses
+    
+#     def compute_jacobian_residuals(self, features, depth, poses, sparse_points, K):
+#         J_pose = 0; residuals = 0
+#         return J_pose, residuals
+    
+#     def update_pose(self, poses, delta):
+#         delat_mat = pp.se3.exp(delta)
+#         return pose @ delta_mat
+    
 class midasConsNet(nn.Module):
-    def __init__(self, min_pred, max_pred, min_depth, max_depth, nsamples, sml_model_path, is_train=True):
+    def __init__(self, min_pred, max_pred, min_depth, max_depth, nsamples, sml_model_path, 
+                 is_train=True, log_fn=None, isConvGRU=False):
         super(midasConsNet, self).__init__()
         self.is_train = is_train
+        self.log_fn = log_fn  # Logger function from Lightning module
+        self.UseConvGRU = isConvGRU
         
         self.min_pred, self.max_pred = min_pred, max_pred
         self.min_depth, self.max_depth = min_depth, max_depth
@@ -201,13 +256,17 @@ class midasConsNet(nn.Module):
             out_channels=self.hidden_dim + self.cost_dim, 
             kernel_size=3, stride=1, padding=1
         )
-                
-        self.update_block_depth = BasicUpdateBlockDepth(hidden_dim=self.hidden_dim, 
-                                                        cost_dim=self.cost_dim,
-                                                        ratio=3, 
-                                                        context_dim=self.cost_dim,
-                                                        min_pred=self.min_pred,
-                                                        max_pred=self.max_pred)
+        
+        if self.UseConvGRU:
+            self.update_block_depth = BasicUpdateBlockDepth(hidden_dim=self.hidden_dim, 
+                                                            cost_dim=self.cost_dim,
+                                                            ratio=3, 
+                                                            context_dim=self.cost_dim,
+                                                            min_pred=self.min_pred,
+                                                            max_pred=self.max_pred)
+            
+        else:
+            self.scaleOutput = OutputScaleConv(features=64, groups=1, activation=nn.ReLU(False), non_negative=False)
         
     def upsample_depth(self, depth, mask, ratio):
         """ Upsample depth field [H/ratio, W/ratio, 2] -> [H, W, 2] using convex combination """
@@ -241,6 +300,11 @@ class midasConsNet(nn.Module):
                                     mode='bilinear', padding_mode='zeros', align_corners=True) # (b, c, h, w)
         
         cost = (fmap - fmap_warped)**2
+        #cost_l1 = torch.abs(fmap - fmap_warped).mean()
+        #cost_ssim = (1 - self.ssim_loss(fmap, fmap_warped)).mean()
+        #cost = 0.85 * cost_l1 + 0.15 * cost_ssim 
+        #if self.global_step % 50 == 0:
+            #self.log_feature_pca(fmap, fmap_warped, self.global_step)
         #print("cost each: mean", cost.mean())
         
         return cost
@@ -251,7 +315,7 @@ class midasConsNet(nn.Module):
             cost = self.get_cost_each(tgt_pose, pose, fmap, fmap_r, utils.inv2depth(inv_depth), K, scale_factor)
             cost_list.append(cost)  # (b, c,h, w) (1,64,144,192)
         # cost = torch.stack(cost_list, dim=1).min(dim=1)[0]
-        print(f"Cost each view : {[cost.mean().item() for cost in cost_list]}")
+        #print(f"Cost each view : {[cost.mean().item() for cost in cost_list]}")
         cost = torch.stack(cost_list, dim=1).mean(dim=1)
         #print("cost mean", cost.mean())
         return cost
@@ -300,22 +364,48 @@ class midasConsNet(nn.Module):
         # Extract features using MidasNet #TODO: batch processing?
         tgt_feats = self.ScaleConsLearner(tgt_input) #[1, 64, 144, 192]
         ref_feats = [self.ScaleConsLearner(ref_input) for ref_input in ref_inputs] #[1, 64, 144, 192]
-        
         context_feats = self.contextLearner(context_input) #[1, 64, 144, 192]
         
         #step2: get the init scaled depth from the model
         #metric_depth_inv_tgt, _ = self.ScaleMapLearner(x, d)
-        scale_factor =  tgt_img.permute(0,3,1,2).shape[2] / tgt_feats.shape[2]
+        scale_factor =  tgt_img.permute(0,3,1,2).shape[2] / tgt_feats.shape[2] #->convert to 160,192?
         
         #poses
         #pose_list_init = []
         
-        # intialize depth and poses
+        #Intialize depth and poses
         #metric_depth_inv_tgt = tgt_ga_depth #[1, 480, 640] to [1,1,144,192]
         metric_depth_inv_tgt = F.interpolate(
             tgt_ga_depth.unsqueeze(1), size=(tgt_feats.shape[2], tgt_feats.shape[3]), mode='nearest'
         )
-
+        
+        if not self.UseConvGRU:
+            scale_map = self.scaleOutput(context_feats)
+            delta_scales = F.relu(1.0 + scale_map)  # Ensure scale is positive
+            inv_depth_pred = metric_depth_inv_tgt * delta_scales
+            
+            if self.min_pred is not None and self.max_pred is not None:
+                inv_depth_pred = torch.clamp(
+                    inv_depth_pred, 
+                    min=1.0 / self.max_pred, 
+                    max=1.0 / self.min_pred
+                )  
+                
+            #apply scale to depth before computing cost
+            tgt_pose = tgt_pose.detach()
+            ref_pose = [pose.detach() for pose in ref_pose]
+            depth_cost_map = self.depth_cost_calc(inv_depth_pred, tgt_feats, ref_feats, 
+                                                  pose_list=ref_pose, tgt_pose=tgt_pose,
+                                                  K=intrinsics, scale_factor=1.0/scale_factor)
+            refined_depth_inv = F.interpolate(
+                inv_depth_pred,
+                size=(tgt_img.shape[1], tgt_img.shape[2]),
+                mode='bicubic',
+                align_corners=False
+            )  # shape => [B, 1, 480, 640]
+                
+            return depth_cost_map, refined_depth_inv
+        
         #pose_list = pose_list_init
         inv_depth_predictions = [] #[metric_depth_inv_tgt] #to see the history of depth predictions
         
@@ -328,11 +418,16 @@ class midasConsNet(nn.Module):
         
         # step2 compute cost map and optimize depth scale iteratively
         for itr in range(self.iter_steps):
-            print("Iteration: {}".format(itr))
+            print("Iter: {}".format(itr))
+            self.log_fn(f"Iter_{itr}/hidden_state_norm", hidden_d.norm().item(), on_step=True, logger=True)
+            self.log_fn(f"Iter_{itr}/input_state_norm", inp_d.norm().item(), on_step=True, logger=True)
+            
             metric_depth_inv_tgt = metric_depth_inv_tgt.detach()
             tgt_pose = tgt_pose.detach()
             ref_pose = [pose.detach() for pose in ref_pose]
-            
+            # --------------------------
+            # 1. Update scale with ConvGRU
+            # --------------------------
             depth_cost_map_func = partial(self.depth_cost_calc, 
                                         fmap=tgt_feats,
                                         fmaps_ref=ref_feats,
@@ -363,8 +458,22 @@ class midasConsNet(nn.Module):
                 )  # shape => [B, 1, 480, 640]
                 
                 inv_depth_predictions.append(refined_depth_inv)
-                
+
+                if self.log_fn:
+                    self.log_fn(f"Iter_{itr}/depth_mean", refined_depth_inv.mean().item(), on_step=True, logger=True)
+                    self.log_fn(f"Iter_{itr}/depth_var", refined_depth_inv.var().item(), on_step=True, logger=True)
+                    
             metric_depth_inv_tgt = inv_depth_seqs[-1]
+            
+            # --------------------------
+            # 2. Differentiable Pose Refinement
+            # --------------------------
+            # poses = self.gn_layer(
+            #     features=tgt_feats,
+            #     depth=utils.inv2depth(metric_depth_inv_tgt),
+            #     poses=poses,
+            #     K=intrinsics
+            # )
 
         if self.is_train:
             return inv_depth_predictions

@@ -66,7 +66,7 @@ class ErrorMetricsAverager(object):
         self.total_count += 1
 
     def average(self):
-        # print(f"Averaging depth metrics over {self.total_count} samples")
+        print(f"Averaging depth metrics over {self.total_count} samples")
         self.rmse_avg = self.rmse_avg / self.total_count
         self.mae_avg = self.mae_avg / self.total_count
         self.absrel_avg = self.absrel_avg / self.total_count
