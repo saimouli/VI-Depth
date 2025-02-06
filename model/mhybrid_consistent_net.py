@@ -99,7 +99,7 @@ class OutputScaleConv(nn.Module):
 
         self.output_conv = nn.Sequential(
             nn.Conv2d(features, features//2, kernel_size=3, stride=1, padding=1, groups=groups),
-            #nn.Upsample(scale_factor=2, mode="bilinear"),
+            nn.Upsample(scale_factor=2, mode="bilinear"),
             nn.Conv2d(features//2, 32, kernel_size=3, stride=1, padding=1),
             activation,
             nn.Conv2d(32, 1, kernel_size=1, stride=1, padding=0),
@@ -217,7 +217,8 @@ class BasicUpdateBlockDepth(nn.Module):
 #     def update_pose(self, poses, delta):
 #         delat_mat = pp.se3.exp(delta)
 #         return pose @ delta_mat
-    
+
+  
 class midasConsNet(nn.Module):
     def __init__(self, min_pred, max_pred, min_depth, max_depth, nsamples, sml_model_path, 
                  is_train=True, log_fn=None, isConvGRU=False):
@@ -232,12 +233,14 @@ class midasConsNet(nn.Module):
         model_transforms = transforms.get_transforms("dpt_hybrid", "void", str(nsamples))
         self.ScaleMapLearner_transform = model_transforms["sml_model"]
 
-        self.ScaleConsLearner = MidasNet_small_cons_videpth(
+        self.FeatExtractor = MidasNet_small_cons_videpth(
             path=sml_model_path,
             min_pred=self.min_pred,
             max_pred=self.max_pred,
+            output_downsample=True,
             backbone="efficientnet_lite3",
         )
+        self.FeatExtractor.train()
         
         self.contextLearner = MidasNet_small_cons_videpth(
             in_channels=2,
@@ -246,6 +249,7 @@ class midasConsNet(nn.Module):
             max_pred=self.max_pred,
             backbone="efficientnet_lite3",
         )
+        self.contextLearner.train()
     
         self.hidden_dim = 128
         self.cost_dim = 64
@@ -256,6 +260,7 @@ class midasConsNet(nn.Module):
             out_channels=self.hidden_dim + self.cost_dim, 
             kernel_size=3, stride=1, padding=1
         )
+        self.maskNet = nn.Conv2d(64, 1, kernel_size=3, padding=1) 
         
         if self.UseConvGRU:
             self.update_block_depth = BasicUpdateBlockDepth(hidden_dim=self.hidden_dim, 
@@ -295,7 +300,8 @@ class midasConsNet(nn.Module):
         world_points = cam.reconstruct(depth, frame='w')
         # Project world points onto reference camera
         ref_coords = ref_cam.project(world_points, frame='w', normalize=True) #(b, h, w,2)
-
+        with torch.no_grad():
+            valid_mask = (ref_coords.abs().max(dim=-1)[0] <= 1).float()  # [B, H, W]
         fmap_warped = F.grid_sample(fmap_ref, ref_coords, 
                                     mode='bilinear', padding_mode='zeros', align_corners=True) # (b, c, h, w)
         
@@ -311,11 +317,20 @@ class midasConsNet(nn.Module):
     
     def depth_cost_calc(self, inv_depth, fmap, fmaps_ref, pose_list, tgt_pose, K, scale_factor):
         cost_list = []
+        mask_list = []
         for pose, fmap_r in zip(pose_list, fmaps_ref):
             cost = self.get_cost_each(tgt_pose, pose, fmap, fmap_r, utils.inv2depth(inv_depth), K, scale_factor)
+            
+            #mask_weight = torch.sigmoid(self.maskNet(fmap))
+            #mask_list.append(mask_weight)
+            #weighted_cost = cost * mask_weight #apply learned weighting
             cost_list.append(cost)  # (b, c,h, w) (1,64,144,192)
+            
         # cost = torch.stack(cost_list, dim=1).min(dim=1)[0]
         #print(f"Cost each view : {[cost.mean().item() for cost in cost_list]}")
+        #cost_stack = torch.stack(cost_list, dim=1)
+        #mask_stack = torch.stack(mask_list, dim=1)
+        #cost = (cost_stack.sum(dim=1) / (mask_stack.sum(dim=1) + 1e-6))  # Avoid division by zero
         cost = torch.stack(cost_list, dim=1).mean(dim=1)
         #print("cost mean", cost.mean())
         return cost
@@ -359,11 +374,12 @@ class midasConsNet(nn.Module):
             keys=["image", "int_depth", "int_depth_c", "int_scales_c"], 
             device=tgt_img.device
         )
-        tgt_input, context_input = torch.split(processed_batch, [4, 2], dim=1)
+        tgt_input, context_input = torch.split(processed_batch, [4, 2], dim=1) #[1,4,288,384]
+        init_metric_depth_inv = context_input[:, 0:1, :, :]
         
         # Extract features using MidasNet #TODO: batch processing?
-        tgt_feats = self.ScaleConsLearner(tgt_input) #[1, 64, 144, 192]
-        ref_feats = [self.ScaleConsLearner(ref_input) for ref_input in ref_inputs] #[1, 64, 144, 192]
+        tgt_feats = self.FeatExtractor(tgt_input) #[1, 64, 120, 160]
+        ref_feats = [self.FeatExtractor(ref_input) for ref_input in ref_inputs] #[1, 64, 120, 160]
         context_feats = self.contextLearner(context_input) #[1, 64, 144, 192]
         
         #step2: get the init scaled depth from the model
@@ -375,14 +391,14 @@ class midasConsNet(nn.Module):
         
         #Intialize depth and poses
         #metric_depth_inv_tgt = tgt_ga_depth #[1, 480, 640] to [1,1,144,192]
-        metric_depth_inv_tgt = F.interpolate(
-            tgt_ga_depth.unsqueeze(1), size=(tgt_feats.shape[2], tgt_feats.shape[3]), mode='nearest'
-        )
+        # metric_depth_inv_tgt = F.interpolate(
+        #     tgt_ga_depth.unsqueeze(1), size=(tgt_feats.shape[2], tgt_feats.shape[3]), mode='nearest'
+        # )
         
         if not self.UseConvGRU:
             scale_map = self.scaleOutput(context_feats)
             delta_scales = F.relu(1.0 + scale_map)  # Ensure scale is positive
-            inv_depth_pred = metric_depth_inv_tgt * delta_scales
+            inv_depth_pred = init_metric_depth_inv * delta_scales
             
             if self.min_pred is not None and self.max_pred is not None:
                 inv_depth_pred = torch.clamp(
@@ -397,6 +413,15 @@ class midasConsNet(nn.Module):
             depth_cost_map = self.depth_cost_calc(inv_depth_pred, tgt_feats, ref_feats, 
                                                   pose_list=ref_pose, tgt_pose=tgt_pose,
                                                   K=intrinsics, scale_factor=1.0/scale_factor)
+            
+            # refined_depth_inv = self.upsample_depth(
+            #     inv_depth_pred,  # input depth [B, 1, H/ratio, W/ratio]
+            #     up_mask_i,    # upsample mask [B, 9*ratio*ratio, H/ratio, W/ratio]
+            #     ratio=int(scale_factor),       # upsampling ratio
+            # )
+            
+            #TODO: propagate depth maybe SPN
+                    
             refined_depth_inv = F.interpolate(
                 inv_depth_pred,
                 size=(tgt_img.shape[1], tgt_img.shape[2]),

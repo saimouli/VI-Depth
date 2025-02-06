@@ -96,7 +96,7 @@ class MidasNet_small_videpth(BaseModel):
 
         Args:
             x (tensor): input data (ga depth, interpolated scale)
-            d (tensor): unalterated input depth (ga depth)
+            d (tensor): unalterated input depth (ga depth) (288,384)
 
         Returns:
             tensor: depth

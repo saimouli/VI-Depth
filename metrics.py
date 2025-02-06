@@ -51,6 +51,12 @@ class ErrorMetricsAverager(object):
         self.inv_rmse_avg, self.inv_mae_avg, self.inv_absrel_avg = 0, 0, 0
         self.total_count = 0
 
+    def reset(self):
+        # reset accumulators to zero
+        self.rmse_avg, self.mae_avg, self.absrel_avg = 0, 0, 0
+        self.inv_rmse_avg, self.inv_mae_avg, self.inv_absrel_avg = 0, 0, 0
+        self.total_count = 0
+        
     def accumulate(self, error_metrics):
         # adds to accumulators from ErrorMetrics object
         assert isinstance(error_metrics, ErrorMetrics)

@@ -21,8 +21,10 @@ def weights_init(m):
 class MidasNet_small_cons_videpth(BaseModel):
     """Network for monocular depth estimation.
     """
-    def __init__(self, device = 'cuda', path=None, features=64, backbone="efficientnet_lite3", non_negative=False, exportable=True, channels_last=False, align_corners=True,
-        blocks={'expand': True}, in_channels=4, regress='r', min_pred=None, max_pred=None, ratio=4):
+    def __init__(self, device = 'cuda', path=None, features=64, backbone="efficientnet_lite3", 
+                non_negative=False, exportable=True, channels_last=False, align_corners=True,
+                blocks={'expand': True}, in_channels=4, regress='r', min_pred=None, 
+                max_pred=None, output_downsample=None):
         super(MidasNet_small_cons_videpth, self).__init__()
 
         use_pretrained = False if path else True
@@ -30,6 +32,7 @@ class MidasNet_small_cons_videpth(BaseModel):
         self.channels_last = channels_last
         self.blocks = blocks
         self.backbone = backbone
+        self.output_downsample = output_downsample
 
         self.groups = 1
 
@@ -57,7 +60,9 @@ class MidasNet_small_cons_videpth(BaseModel):
         )
         self.first.apply(weights_init)
 
-        self.pretrained, self.scratch = _make_encoder(self.backbone, features, use_pretrained, groups=self.groups, expand=self.expand, exportable=exportable)
+        self.pretrained, self.scratch = _make_encoder(self.backbone, features, 
+                                                      use_pretrained, groups=self.groups, 
+                                                      expand=self.expand, exportable=exportable)
 
         self.scratch.activation = nn.ReLU(False)    
 
@@ -84,7 +89,7 @@ class MidasNet_small_cons_videpth(BaseModel):
             tensor: depth
         """
         if self.channels_last==True:
-            print("self.channels_last = ", self.channels_last)
+            #print("self.channels_last = ", self.channels_last)
             x.contiguous(memory_format=torch.channels_last)
         
         layer_0 = self.first(x)
@@ -94,6 +99,7 @@ class MidasNet_small_cons_videpth(BaseModel):
         layer_3 = self.pretrained.layer3(layer_2)
         layer_4 = self.pretrained.layer4(layer_3)
         
+        # Apply refinement layers:
         layer_1_rn = self.scratch.layer1_rn(layer_1)
         layer_2_rn = self.scratch.layer2_rn(layer_2)
         layer_3_rn = self.scratch.layer3_rn(layer_3)
@@ -104,5 +110,10 @@ class MidasNet_small_cons_videpth(BaseModel):
         path_2 = self.scratch.refinenet2(path_3, layer_2_rn)
         path_1 = self.scratch.refinenet1(path_2, layer_1_rn)
 
-        return path_1 #[1, 64, 144, 192] -> I want [1, 64, 120, 160]
+        if self.output_downsample:
+            target_h = 120
+            target_w = 160
+            path_1 = F.interpolate(path_1, size=(target_h, target_w),
+                                    mode='bicubic', align_corners=self.scratch.refinenet1.align_corners)
+        return path_1 #[1, 64, 120, 160]
         

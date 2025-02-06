@@ -21,6 +21,8 @@ class midasNetConsistentModule(pl.LightningModule):
         super(midasNetConsistentModule, self).__init__(*args, **kwargs)
         self.model = midasConsNet(min_pred, max_pred, min_depth, max_depth, nsamples, 
                                   sml_model_path, log_fn=self.log, isConvGRU=useConvGRU)
+        #print model params
+        print("Model Parameters: ", sum(p.numel() for p in self.model.parameters() if p.requires_grad))
         self.lr = lr
         self.max_depth = max_depth
         self.min_depth = min_depth
@@ -99,81 +101,6 @@ class midasNetConsistentModule(pl.LightningModule):
             avg_error_w_pred.total_count
         ))
         avg_error_w_pred.average()
-        
-        # Initialize accumulators
-        # total_rmse_pred, total_mae_pred, total_absrel_pred = 0.0, 0.0, 0.0
-        # total_inv_rmse_pred, total_inv_mae_pred, total_inv_absrel_pred = 0.0, 0.0, 0.0
-        
-        # total_rmse_ga, total_mae_ga, total_absrel_ga = 0.0, 0.0, 0.0
-        # total_inv_rmse_ga, total_inv_mae_ga, total_inv_absrel_ga = 0.0, 0.0, 0.0
-        
-        # total_samples = 0
-        
-        # def compute_metrics(pred, gt, mask):
-        #     estimate = pred[mask]
-        #     target = gt[mask]
-            
-        #     # Convert to mm
-        #     rmse_val = rmse(1000.0 * estimate, 1000.0 * target)
-        #     mae_val = mae(1000.0 * estimate, 1000.0 * target)
-        #     absrel_val = absrel(1000.0 * estimate, 1000.0 * target)
-            
-        #     # Convert units to 1/km
-        #     inv_rmse_val = inv_rmse(0.001 * estimate, 0.001 * target)
-        #     inv_mae_val = inv_mae(0.001 * estimate, 0.001 * target)
-        #     inv_absrel_val = inv_absrel(0.001 * estimate, 0.001 * target)
-            
-        #     return rmse_val, mae_val, absrel_val, inv_rmse_val, inv_mae_val, inv_absrel_val
-        
-        # # Compute metrics for each batch
-        # for output in outputs:
-        #     pred_depth = output["pred_depth"]
-        #     gt_depth = output["gt_depth"]
-        #     ga_depth = output["ga_depth"]
-            
-        #     batch_size = pred_depth.shape[0]
-        #     total_samples += batch_size
-            
-            
-        #     mask = (gt_depth > min_depth) & (gt_depth < max_depth)
-            
-        #     # Predicted depth metrics
-        #     rmse_pred, mae_pred, absrel_pred, inv_rmse_pred, inv_mae_pred, inv_absrel_pred = compute_metrics(
-        #         pred_depth, gt_depth, mask)
-            
-        #     # GA depth metrics
-        #     rmse_ga, mae_ga, absrel_ga, inv_rmse_ga, inv_mae_ga, inv_absrel_ga = compute_metrics(
-        #         ga_depth, gt_depth, mask)
-            
-        #     # Accumulate
-        #     total_rmse_pred += rmse_pred
-        #     total_mae_pred += mae_pred
-        #     total_absrel_pred += absrel_pred
-        #     total_inv_rmse_pred += inv_rmse_pred
-        #     total_inv_mae_pred += inv_mae_pred
-        #     total_inv_absrel_pred += inv_absrel_pred
-            
-        #     total_rmse_ga += rmse_ga
-        #     total_mae_ga += mae_ga
-        #     total_absrel_ga += absrel_ga
-        #     total_inv_rmse_ga += inv_rmse_ga
-        #     total_inv_mae_ga += inv_mae_ga
-        #     total_inv_absrel_ga += inv_absrel_ga
-        
-        # # Compute average metrics
-        # avg_rmse_pred = total_rmse_pred / total_samples
-        # avg_mae_pred = total_mae_pred / total_samples
-        # avg_absrel_pred = total_absrel_pred / total_samples
-        # avg_inv_rmse_pred = total_inv_rmse_pred / total_samples
-        # avg_inv_mae_pred = total_inv_mae_pred / total_samples
-        # avg_inv_absrel_pred = total_inv_absrel_pred / total_samples
-        
-        # avg_rmse_ga = total_rmse_ga / total_samples
-        # avg_mae_ga = total_mae_ga / total_samples
-        # avg_absrel_ga = total_absrel_ga / total_samples
-        # avg_inv_rmse_ga = total_inv_rmse_ga / total_samples
-        # avg_inv_mae_ga = total_inv_mae_ga / total_samples
-        # avg_inv_absrel_ga = total_inv_absrel_ga / total_samples
 
         # Create the table
         table = (
