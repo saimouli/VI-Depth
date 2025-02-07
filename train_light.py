@@ -11,8 +11,8 @@ from model.main_consistent import midasNetConsistentModule
 
 
 def cli_main():
-    #cli = LightningCLI(midasNetModule, datamodule_class=None)
-    cli = LightningCLI(midasNetConsistentModule, datamodule_class=None)
+    cli = LightningCLI(midasNetModule, datamodule_class=None)
+    #cli = LightningCLI(midasNetConsistentModule, datamodule_class=None)
 
 if __name__ == "__main__":
     cli_main()

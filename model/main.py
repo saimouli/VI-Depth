@@ -29,8 +29,13 @@ class midasNetModule(pl.LightningModule):
         #self.abs_loss = nn.L1Loss()
         #self.silog = SILogLoss()
         self.total_val_img = 0
-        self.avg_error_w_int_depth = metrics.ErrorMetricsAverager()
-        self.avg_error_w_pred = metrics.ErrorMetricsAverager()
+        # self.avg_error_w_int_depth = metrics.ErrorMetricsAverager_DDP(self.device)
+        # self.avg_error_w_pred = metrics.ErrorMetricsAverager_DDP(self.device)
+    
+    def on_fit_start(self):
+        """Ensure that metric averaging uses the correct device after model initialization."""
+        self.avg_error_w_int_depth = metrics.ErrorMetricsAverager_DDP(self.device)
+        self.avg_error_w_pred = metrics.ErrorMetricsAverager_DDP(self.device)
     
     def compute_loss(self, pred_depth, gt_depth):
         """
@@ -130,83 +135,63 @@ class midasNetModule(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         loss = self._common_step(batch, batch_idx, stage="val")
-        pred_depth = loss["pred_depth"]  # (batch_size, H, W)
-        gt_depth = loss["gt_depth"]
-        ga_depth = loss["ga_depth"]
+        pred_depth = loss["pred_depth"]  # (B, H, W)
+        gt_depth = loss["gt_depth"]      # (B, H, W)
+        ga_depth = loss["ga_depth"]      # (B, H, W)
 
+        batch_size = pred_depth.shape[0]
         max_depth, min_depth = self.max_depth, self.min_depth
-        self.total_val_img += pred_depth.shape[0]
-        
-        for i in range(pred_depth.shape[0]):  # Loop over batch
-            tgt_gt_depth = torch.from_numpy(gt_depth[i])
-            tgt_ga_depth = torch.from_numpy(ga_depth[i])
-            sml_depth_inv = torch.from_numpy(pred_depth[i])
-            
-            # Compute valid mask    
-            valid_mask = (tgt_gt_depth >= min_depth) & (tgt_gt_depth <= max_depth)
-            mask = valid_mask.cpu().numpy()
 
-            error_w_int_depth = metrics.ErrorMetrics()
-            error_w_int_depth.compute(
-                estimate=tgt_ga_depth.cpu().numpy(), 
-                target=tgt_gt_depth.cpu().numpy(), 
-                valid=mask.astype(bool),
-            )
+        for i in range(batch_size):
+            # Get tensors directly (assuming they're already on correct device)
+            tgt_gt = gt_depth[i]
+            tgt_ga = ga_depth[i]
+            pred = pred_depth[i]
 
-            error_w_pred = metrics.ErrorMetrics()
-            error_w_pred.compute(
-                estimate=sml_depth_inv.cpu().numpy(), 
-                target=tgt_gt_depth.cpu().numpy(), 
-                valid=mask.astype(bool),
-            )
+            # Compute valid mask
+            valid_mask = (tgt_gt >= min_depth) & (tgt_gt <= max_depth)
 
-            # Accumulate error metric
-            self.avg_error_w_int_depth.accumulate(error_w_int_depth)
-            self.avg_error_w_pred.accumulate(error_w_pred)
-        print("\n counter: ", self.avg_error_w_int_depth.total_count)
-        print(f"Batch {batch_idx}: Processing {len(batch[0])} images")
+            # Compute metrics for GA depth
+            ga_metrics = metrics.ErrorMetrics_DDP()
+            ga_metrics.compute(tgt_ga, tgt_gt, valid_mask)
+            self.avg_error_w_int_depth.accumulate(ga_metrics)
+
+            # Compute metrics for predicted depth
+            pred_metrics = metrics.ErrorMetrics_DDP()
+            pred_metrics.compute(pred, tgt_gt, valid_mask)
+            self.avg_error_w_pred.accumulate(pred_metrics)
+
         return loss
     
     def validation_epoch_end(self, outputs):
+        # Get synchronized metrics
+        ga_metrics = self.avg_error_w_int_depth.get_metrics()
+        pred_metrics = self.avg_error_w_pred.get_metrics()
         
-        print("Total images processed: ", self.total_val_img)
-        self.total_val_img = 0
-        
-        print("Final Averaged Metrics for globally-aligned depth over {} samples".format(
-            self.avg_error_w_int_depth.total_count
-        ))
-        print("Final Averaged Metrics for SML-aligned depth over {} samples".format(
-            self.avg_error_w_pred.total_count
-        ))
+        # Only log from main process
+        if self.trainer.is_global_zero:
+            table = (
+                "Metric                | GA Depth (mm) | Predicted Depth (mm)\n"
+                "----------------------|---------------|--------------------\n"
+                f"RMSE                 | {ga_metrics['rmse']:.4f} | {pred_metrics['rmse']:.4f}\n"
+                f"MAE                  | {ga_metrics['mae']:.4f} | {pred_metrics['mae']:.4f}\n"
+                f"AbsRel               | {ga_metrics['absrel']:.4f} | {pred_metrics['absrel']:.4f}\n"
+                f"Inv RMSE (1/km)      | {ga_metrics['inv_rmse']:.4f} | {pred_metrics['inv_rmse']:.4f}\n"
+                f"Inv MAE (1/km)       | {ga_metrics['inv_mae']:.4f} | {pred_metrics['inv_mae']:.4f}\n"
+                f"Inv AbsRel (1/km)    | {ga_metrics['inv_absrel']:.4f} | {pred_metrics['inv_absrel']:.4f}"
+            )
 
-        # Create the results table
-        table = (
-            "Metric                | GA Depth (mm) | Predicted Depth (mm)\n"
-            "----------------------|---------------|--------------------\n"
-            f"RMSE                 | {self.avg_error_w_int_depth.rmse_avg:.4f} | {self.avg_error_w_pred.rmse_avg:.4f}\n"
-            f"MAE                  | {self.avg_error_w_int_depth.mae_avg:.4f} | {self.avg_error_w_pred.mae_avg:.4f}\n"
-            f"AbsRel               | {self.avg_error_w_int_depth.absrel_avg:.4f} | {self.avg_error_w_pred.absrel_avg:.4f}\n"
-            f"Inv RMSE (1/km)      | {self.avg_error_w_int_depth.inv_rmse_avg:.4f} | {self.avg_error_w_pred.inv_rmse_avg:.4f}\n"
-            f"Inv MAE (1/km)       | {self.avg_error_w_int_depth.inv_mae_avg:.4f} | {self.avg_error_w_pred.inv_mae_avg:.4f}\n"
-            f"Inv AbsRel (1/km)    | {self.avg_error_w_int_depth.inv_absrel_avg:.4f} | {self.avg_error_w_pred.inv_absrel_avg:.4f}"
-        )
+            self.logger.experiment.add_text(
+                "Validation Metrics", 
+                table, 
+                global_step=self.global_step
+            )
+            print(f"\nValidation Metrics (Total Samples: {ga_metrics['total_count']}):\n{table}")
 
-        self.logger.experiment.add_text("Final Validation Metrics", table, global_step=self.global_step)
-
-        print("\nFinal Validation Metrics\n")
-        print(f"GA Depth: RMSE: {self.avg_error_w_int_depth.rmse_avg:.4f}, MAE: {self.avg_error_w_int_depth.mae_avg:.4f}, AbsRel: {self.avg_error_w_int_depth.absrel_avg:.4f}")
-        print(f"Pred Depth: RMSE: {self.avg_error_w_pred.rmse_avg:.4f}, MAE: {self.avg_error_w_pred.mae_avg:.4f}, AbsRel: {self.avg_error_w_pred.absrel_avg:.4f}")
-
-
-        self.logger.experiment.add_text("Validation Metrics", table, global_step=self.global_step)
-        
-        print("\nValidation Metrics Len:{}\n".format(self.avg_error_w_int_depth.total_count))
-        print(f"GA Depth: RMSE: {self.avg_error_w_int_depth.rmse_avg:.4f}, MAE: {self.avg_error_w_int_depth.mae_avg:.4f}, AbsRel: {self.avg_error_w_int_depth.absrel_avg:.4f}")
-        print(f"Pred Depth: RMSE: {self.avg_error_w_pred.rmse_avg:.4f}, MAE: {self.avg_error_w_pred.mae_avg:.4f}, AbsRel: {self.avg_error_w_pred.absrel_avg:.4f}")
-        
-        # Reset accumulators after logging
+        # Reset accumulators for next epoch
         self.avg_error_w_int_depth.reset()
         self.avg_error_w_pred.reset()
+        
     def _common_step(self, batch, batch_idx, stage="train"):
         #input_sparse_depth, input_image, rel_depth_pred, depth_gt, validity_map = batch
         #t1 = time.time()
@@ -285,9 +270,9 @@ class midasNetModule(pl.LightningModule):
             #loss, input_image, metric_depth_inv_pred, GA_depth_inv, depth_gt_inv
             "loss": loss,
             "mode": stage,
-            "pred_depth": metric_depth_inv_pred.detach().cpu().numpy(),
-            "gt_depth": depth_gt_inv.detach().cpu().numpy(),
-            "ga_depth": ga_depth_inv.unsqueeze(0).permute(1,0,2,3).detach().cpu().numpy(),
+            "pred_depth": metric_depth_inv_pred.detach(),
+            "gt_depth": depth_gt_inv.detach(),
+            "ga_depth": ga_depth_inv.unsqueeze(0).permute(1,0,2,3).detach(),
         }
 
     

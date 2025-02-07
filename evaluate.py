@@ -4,7 +4,7 @@ import argparse
 import torch
 import imageio
 import numpy as np
-
+np.bool = np.bool_
 from tqdm import tqdm
 from PIL import Image
 
@@ -34,6 +34,105 @@ def get_ls_solution(depth_infer, input_sparse_depth, validity_map, min_pred, max
     rmse_ls = error_w_int_depth_ls.rmse
     return rmse_ls, scale_ls, shift_ls
 
+def evaluate_ddp(dataset_path, depth_predictor, nsamples, sml_model_path, device, rank, world_size):
+    # Ranges for VOID
+    min_depth, max_depth = 0.2, 5.0
+    min_pred, max_pred = 0.1, 8.0
+
+    # Instantiate method
+    method = pipeline.VIDepth(
+        depth_predictor, nsamples, sml_model_path, 
+        min_pred, max_pred, min_depth, max_depth, device
+    )
+
+    # Get inputs
+    with open(f"{dataset_path}/test_image.txt") as f:
+        test_image_list = [line.rstrip() for line in f]
+
+    # Split the dataset across processes
+    test_image_list = test_image_list[rank::world_size]
+
+    # Initialize error aggregators
+    avg_error_w_int_depth = metrics.ErrorMetricsAverager_DDP(device)
+    avg_error_w_pred = metrics.ErrorMetricsAverager_DDP(device)
+
+    # Iterate through inputs list
+    for i in tqdm(range(len(test_image_list)), desc=f"Rank {rank}"):
+        # Image
+        input_image_fp = os.path.join(dataset_path, test_image_list[i])
+        input_image = utils.read_image(input_image_fp)
+
+        # Sparse depth
+        input_sparse_depth_fp = input_image_fp.replace("image", "sparse_depth")
+        input_sparse_depth = np.array(Image.open(input_sparse_depth_fp), dtype=np.float32) / 256.0
+        input_sparse_depth[input_sparse_depth <= 0] = 0.0
+
+        # Sparse depth validity map
+        validity_map_fp = input_image_fp.replace("image", "validity_map")
+        validity_map = np.array(Image.open(validity_map_fp), dtype=np.float32)
+        assert np.all(np.unique(validity_map) == [0, 256])
+        validity_map[validity_map > 0] = 1
+
+        # Target (ground truth) depth
+        target_depth_fp = input_image_fp.replace("image", "ground_truth")
+        target_depth = np.array(Image.open(target_depth_fp), dtype=np.float32) / 256.0
+        target_depth[target_depth <= 0] = 0.0
+
+        # Target depth valid/mask
+        mask = (target_depth < max_depth)
+        if min_depth is not None:
+            mask *= (target_depth > min_depth)
+        target_depth[~mask] = np.inf  # Set invalid depth
+        target_depth = 1.0 / target_depth  # Convert to inverse depth
+
+        # Run pipeline
+        output = method.run(input_image, input_sparse_depth, validity_map, device)
+
+        # Convert outputs to tensors
+        ga_depth = torch.from_numpy(output["ga_depth"]).to(device)
+        sml_depth = torch.from_numpy(output["sml_depth"]).to(device)
+        target_depth_tensor = torch.from_numpy(target_depth).to(device)
+        mask_tensor = torch.from_numpy(mask.astype(np.bool)).to(device)
+
+        # Compute error metrics using intermediate (globally aligned) depth
+        error_w_int_depth = metrics.ErrorMetrics_DDP()
+        error_w_int_depth.compute(ga_depth, target_depth_tensor, mask_tensor)
+
+        # Compute error metrics using SML output depth
+        error_w_pred = metrics.ErrorMetrics_DDP()
+        error_w_pred.compute(sml_depth, target_depth_tensor, mask_tensor)
+
+        # Accumulate error metrics
+        avg_error_w_int_depth.accumulate(error_w_int_depth)
+        avg_error_w_pred.accumulate(error_w_pred)
+
+    # Synchronize and compute average metrics across all processes
+    metrics_w_int_depth = avg_error_w_int_depth.get_metrics()
+    metrics_w_pred = avg_error_w_pred.get_metrics()
+
+    # Print results on rank 0
+    if rank == 0:
+        print("Averaging metrics for globally-aligned depth over {} samples".format(
+            metrics_w_int_depth["total_count"]
+        ))
+        print("Averaging metrics for SML-aligned depth over {} samples".format(
+            metrics_w_pred["total_count"]
+        ))
+
+        # Create a summary table
+        from prettytable import PrettyTable
+        summary_tb = PrettyTable()
+        summary_tb.field_names = ["metric", "GA Only", "GA+SML"]
+
+        summary_tb.add_row(["RMSE", f"{metrics_w_int_depth['rmse']:7.2f}", f"{metrics_w_pred['rmse']:7.2f}"])
+        summary_tb.add_row(["MAE", f"{metrics_w_int_depth['mae']:7.2f}", f"{metrics_w_pred['mae']:7.2f}"])
+        summary_tb.add_row(["AbsRel", f"{metrics_w_int_depth['absrel']:8.3f}", f"{metrics_w_pred['absrel']:8.3f}"])
+        summary_tb.add_row(["iRMSE", f"{metrics_w_int_depth['inv_rmse']:7.2f}", f"{metrics_w_pred['inv_rmse']:7.2f}"])
+        summary_tb.add_row(["iMAE", f"{metrics_w_int_depth['inv_mae']:7.2f}", f"{metrics_w_pred['inv_mae']:7.2f}"])
+        summary_tb.add_row(["iAbsRel", f"{metrics_w_int_depth['inv_absrel']:8.3f}", f"{metrics_w_pred['inv_absrel']:8.3f}"])
+
+        print(summary_tb)
+        
 def evaluate(dataset_path, depth_predictor, nsamples, sml_model_path):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device: %s" % device)
@@ -127,9 +226,9 @@ def evaluate(dataset_path, depth_predictor, nsamples, sml_model_path):
         mae_val.append(error_w_pred.mae)
         absrel_val.append(error_w_pred.absrel)
     
-    plt.boxplot(sparse_count, vert=True, patch_artist=True)
-    plt.ylabel("Number of Sparse Points")
-    plt.show()
+    # plt.boxplot(sparse_count, vert=True, patch_artist=True)
+    # plt.ylabel("Number of Sparse Points")
+    # plt.show()
     # compute average error metrics
     print("Averaging metrics for globally-aligned depth over {} samples".format(
         avg_error_w_int_depth.total_count
@@ -294,23 +393,33 @@ if __name__=="__main__":
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('-ds', '--dataset-path', type=str, default='/media/saimouli/Data6T/datasets/VOID_150/testing',
+    parser.add_argument('-ds', '--dataset-path', type=str, default='/home/sai/Documents/void_small/testing',
                         help='Path to VOID release dataset.')
     parser.add_argument('-dp', '--depth-predictor', type=str, default='dpt_hybrid', 
                         help='Name of depth predictor to use in pipeline.')
     parser.add_argument('-ns', '--nsamples', type=int, default=150, 
                         help='Number of sparse metric depth samples available.')
-    parser.add_argument('-sm', '--sml-model-path', type=str, default='/home/saimouli/Documents/github/VI_Depth_sai/weights/sml_model.dpredictor.dpt_hybrid.nsamples.150.pretrained.ckpt', 
+    parser.add_argument('-sm', '--sml-model-path', type=str, default='weights/sml_model.dpredictor.dpt_hybrid.nsamples.150.ckpt', 
                         help='path')
 
     args = parser.parse_args()
     print(args)
     
-    evaluate(
+    # evaluate(
+    #     args.dataset_path,
+    #     args.depth_predictor, 
+    #     args.nsamples, 
+    #     args.sml_model_path,
+    # )
+    
+    evaluate_ddp(
         args.dataset_path,
         args.depth_predictor, 
         args.nsamples, 
         args.sml_model_path,
+        device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        rank=0,
+        world_size=1,
     )
 
     # to test on classroom
