@@ -99,7 +99,7 @@ class OutputScaleConv(nn.Module):
 
         self.output_conv = nn.Sequential(
             nn.Conv2d(features, features//2, kernel_size=3, stride=1, padding=1, groups=groups),
-            nn.Upsample(scale_factor=2, mode="bilinear"),
+            #nn.Upsample(scale_factor=2, mode="bilinear"),
             nn.Conv2d(features//2, 32, kernel_size=3, stride=1, padding=1),
             activation,
             nn.Conv2d(32, 1, kernel_size=1, stride=1, padding=0),
@@ -247,6 +247,7 @@ class midasConsNet(nn.Module):
             path=sml_model_path,
             min_pred=self.min_pred,
             max_pred=self.max_pred,
+            output_downsample=True,
             backbone="efficientnet_lite3",
         )
         self.contextLearner.train()
@@ -300,8 +301,8 @@ class midasConsNet(nn.Module):
         world_points = cam.reconstruct(depth, frame='w')
         # Project world points onto reference camera
         ref_coords = ref_cam.project(world_points, frame='w', normalize=True) #(b, h, w,2)
-        with torch.no_grad():
-            valid_mask = (ref_coords.abs().max(dim=-1)[0] <= 1).float()  # [B, H, W]
+        #with torch.no_grad():
+        #    valid_mask = (ref_coords.abs().max(dim=-1)[0] <= 1).float()  # [B, H, W]
         fmap_warped = F.grid_sample(fmap_ref, ref_coords, 
                                     mode='bilinear', padding_mode='zeros', align_corners=True) # (b, c, h, w)
         
@@ -375,7 +376,7 @@ class midasConsNet(nn.Module):
             device=tgt_img.device
         )
         tgt_input, context_input = torch.split(processed_batch, [4, 2], dim=1) #[1,4,288,384]
-        init_metric_depth_inv = context_input[:, 0:1, :, :]
+        #init_metric_depth_inv = context_input[:, 0:1, :, :]
         
         # Extract features using MidasNet #TODO: batch processing?
         tgt_feats = self.FeatExtractor(tgt_input) #[1, 64, 120, 160]
@@ -390,15 +391,15 @@ class midasConsNet(nn.Module):
         #pose_list_init = []
         
         #Intialize depth and poses
-        #metric_depth_inv_tgt = tgt_ga_depth #[1, 480, 640] to [1,1,144,192]
-        # metric_depth_inv_tgt = F.interpolate(
-        #     tgt_ga_depth.unsqueeze(1), size=(tgt_feats.shape[2], tgt_feats.shape[3]), mode='nearest'
-        # )
+        #metric_depth_inv_tgt = tgt_ga_depth #[1, 480, 640] to [1,1,120,160]
+        metric_depth_inv_tgt = F.interpolate(
+            tgt_ga_depth.unsqueeze(1), size=(tgt_feats.shape[2], tgt_feats.shape[3]), mode='bicubic'
+        )
         
         if not self.UseConvGRU:
             scale_map = self.scaleOutput(context_feats)
             delta_scales = F.relu(1.0 + scale_map)  # Ensure scale is positive
-            inv_depth_pred = init_metric_depth_inv * delta_scales
+            inv_depth_pred = metric_depth_inv_tgt * delta_scales
             
             if self.min_pred is not None and self.max_pred is not None:
                 inv_depth_pred = torch.clamp(

@@ -243,7 +243,7 @@ class midasNetConsistentModule(pl.LightningModule):
         loss,_ = self.compute_loss(utils.inv2depth(refined_depth_inv),
                                 gt_depth,
                                 log_variance=None)
-        total_loss = loss + 0.5 * multiview_loss
+        total_loss = loss + 0.8 * multiview_loss
         
         #self.logger.experiment.add_scalar(f"{stage}_loss", loss, self.global_step)
         self.log(f"{stage}/multiview_loss", multiview_loss, on_step=True, on_epoch=True, sync_dist=True)
