@@ -293,9 +293,9 @@ class midasNetConsistentModule(pl.LightningModule):
         return {
             "loss": total_loss,
             "mode": stage,
-            "pred_depth": refined_depth_inv.detach().cpu().numpy(),
-            "gt_depth": tgt_gt_depth_inv.detach().cpu().numpy(),
-            "ga_depth": tgt_ga_depth.unsqueeze(0).permute(1,0,2,3).detach().cpu().numpy(),
+            "pred_depth": refined_depth_inv.detach(),
+            "gt_depth": tgt_gt_depth_inv.detach(),
+            "ga_depth": tgt_ga_depth.unsqueeze(0).permute(1,0,2,3).detach(),
         }
         #TODO: compute loss for the pose as well
         
