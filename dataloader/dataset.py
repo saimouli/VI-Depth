@@ -71,6 +71,8 @@ class SMLDataModule(pl.LightningDataModule):
                 mode="train",
                 depth_scale=256.0
             )
+        
+        if stage in ("fit", "validate"):
             self.test_dataset = SML_dataset(
                 self.data_val,
                 mode="val",

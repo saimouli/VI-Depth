@@ -24,7 +24,7 @@ class SML_dataset(Dataset):
     def __init__(self,
                  data_root,
                  mode="train",
-                 depth_scale=1000.0,
+                 depth_scale=256.0,
                 ):
         
         if mode == "train":

@@ -15,6 +15,8 @@ import metrics
 
 import matplotlib.pyplot as plt
 from utils_eval import param_sweep_shift, param_sweep_scale, compute_ls_solution
+from data.SML_dataset import SML_dataset
+from model.main import midasNetModule
 
 def get_ls_solution(depth_infer, input_sparse_depth, validity_map, min_pred, max_pred, max_depth, min_depth, mask, target_depth):
 
@@ -388,7 +390,87 @@ def evaluate_custom(dataset_path, depth_predictor, nsamples, sml_model_path):
     
     print(summary_tb)
 
+def evaluate_sml(dataset_path, depth_predictor, nsamples, sml_model_path):
+    min_depth, max_depth = 0.2, 5.0
+    #min_pred, max_pred = 0.1, 8.0
+    
+    avg_error_w_int_depth = metrics.ErrorMetricsAverager()
+    avg_error_w_pred = metrics.ErrorMetricsAverager()
+    
+    dataset = SML_dataset(data_root='/home/sai/Documents/void_small/testing', mode='val')
+    dataloader = torch.utils.data.DataLoader(dataset)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    model = midasNetModule().load_from_checkpoint("/home/sai/Documents/VI-Depth/weights/total_loss=0.105.ckpt")
+    #model.load_from_checkpoint("/home/sai/Documents/VI-Depth/weights/total_loss=0.105.ckpt")
+    model.eval()
+    model.to(device)
+    
+    rmse_val = []; mae_val = []; absrel_val = []
+    
+    for batch_data in dataloader:
+        batch_data = tuple(
+            [item.to(device) if isinstance(item, torch.Tensor) else 
+            [subitem.to(device) if isinstance(subitem, torch.Tensor) else subitem for subitem in item]
+            if isinstance(item, list) else item
+            for item in batch_data]
+        )
+        input_image, depth_gt_inv, input_sparse_depth, rel_depth_pred, ga_depth_inv, interp_scale, _,_ = batch_data
+        
+        sml_depth_inv = model(input_sparse_depth, input_image, rel_depth_pred, interp_scale, ga_depth_inv)
+        sml_depth_inv = sml_depth_inv.detach().cpu()
+        
+        tgt_gt_depth = utils.inv2depth(depth_gt_inv)
+        valid_mask = (tgt_gt_depth >= min_depth) & (tgt_gt_depth <= max_depth)
+        
+        error_w_int_depth = metrics.ErrorMetrics()
+        valid_mask = valid_mask[0].squeeze(0).cpu().numpy()
+        error_w_int_depth.compute(
+            estimate = ga_depth_inv[0].cpu().numpy(), 
+            target = depth_gt_inv[0].squeeze(0).cpu().numpy(), 
+            valid = valid_mask.astype(np.bool),
+        )
 
+        # compute error metrics using SML output depth
+        error_w_pred = metrics.ErrorMetrics()
+        error_w_pred.compute(
+            estimate = sml_depth_inv[0].cpu().squeeze(0).numpy(), 
+            target = depth_gt_inv[0].squeeze(0).cpu().numpy(), 
+            valid = valid_mask.astype(np.bool),
+        )
+
+        # accumulate error metrics
+        avg_error_w_int_depth.accumulate(error_w_int_depth)
+        avg_error_w_pred.accumulate(error_w_pred)
+            
+        rmse_val.append(error_w_pred.rmse)
+        mae_val.append(error_w_pred.mae)
+        absrel_val.append(error_w_pred.absrel)
+        
+    
+    print("Averaging metrics for globally-aligned depth over {} samples".format(
+        avg_error_w_int_depth.total_count
+    ))
+    avg_error_w_int_depth.average()
+
+    print("Averaging metrics for SML-aligned depth over {} samples".format(
+        avg_error_w_pred.total_count
+    ))
+    avg_error_w_pred.average()
+
+    from prettytable import PrettyTable
+    summary_tb = PrettyTable()
+    summary_tb.field_names = ["metric", "GA Only", "GA+SML"]
+
+    summary_tb.add_row(["RMSE", f"{avg_error_w_int_depth.rmse_avg:7.2f}", f"{avg_error_w_pred.rmse_avg:7.2f}"])
+    summary_tb.add_row(["MAE", f"{avg_error_w_int_depth.mae_avg:7.2f}", f"{avg_error_w_pred.mae_avg:7.2f}"])
+    summary_tb.add_row(["AbsRel", f"{avg_error_w_int_depth.absrel_avg:8.3f}", f"{avg_error_w_pred.absrel_avg:8.3f}"])
+    summary_tb.add_row(["iRMSE", f"{avg_error_w_int_depth.inv_rmse_avg:7.2f}", f"{avg_error_w_pred.inv_rmse_avg:7.2f}"])
+    summary_tb.add_row(["iMAE", f"{avg_error_w_int_depth.inv_mae_avg:7.2f}", f"{avg_error_w_pred.inv_mae_avg:7.2f}"])
+    summary_tb.add_row(["iAbsRel", f"{avg_error_w_int_depth.inv_absrel_avg:8.3f}", f"{avg_error_w_pred.inv_absrel_avg:8.3f}"])
+    
+    print(summary_tb)
+    
 if __name__=="__main__":
 
     parser = argparse.ArgumentParser()
@@ -412,14 +494,21 @@ if __name__=="__main__":
     #     args.sml_model_path,
     # )
     
-    evaluate_ddp(
+    # evaluate_ddp(
+    #     args.dataset_path,
+    #     args.depth_predictor, 
+    #     args.nsamples, 
+    #     args.sml_model_path,
+    #     device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    #     rank=0,
+    #     world_size=1,
+    # )
+    
+    evaluate_sml(
         args.dataset_path,
-        args.depth_predictor, 
-        args.nsamples, 
+        args.depth_predictor,
+        args.nsamples,
         args.sml_model_path,
-        device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-        rank=0,
-        world_size=1,
     )
 
     # to test on classroom

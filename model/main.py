@@ -36,6 +36,10 @@ class midasNetModule(pl.LightningModule):
         """Ensure that metric averaging uses the correct device after model initialization."""
         self.avg_error_w_int_depth = metrics.ErrorMetricsAverager_DDP(self.device)
         self.avg_error_w_pred = metrics.ErrorMetricsAverager_DDP(self.device)
+        
+    def on_validation_start(self):
+        self.avg_error_w_int_depth = metrics.ErrorMetricsAverager_DDP(self.device)
+        self.avg_error_w_pred = metrics.ErrorMetricsAverager_DDP(self.device)
     
     def compute_loss(self, pred_depth, gt_depth):
         """
@@ -123,8 +127,8 @@ class midasNetModule(pl.LightningModule):
         self.load_state_dict(state_dict)
     
     def forward(self, input_sparse_depth, input_image, rel_depth_pred, interp_scale, ga_depth_inv):
-        metric_depth_inv_pred, GA_depth_inv =  self.model(input_sparse_depth, input_image, rel_depth_pred, interp_scale, ga_depth_inv, None)
-        return metric_depth_inv_pred, GA_depth_inv
+        metric_depth_inv_pred, _ =  self.model(input_sparse_depth, input_image, rel_depth_pred, interp_scale, ga_depth_inv, None)
+        return metric_depth_inv_pred
     
     def training_step(self, batch, batch_idx):
         loss = self._common_step(batch, batch_idx)
