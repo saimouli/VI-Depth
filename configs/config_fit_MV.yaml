@@ -1,6 +1,5 @@
 # pytorch_lightning==1.9.0
 seed_everything: true
-directory: 'lightning_logs'
 trainer:
   accelerator: gpu
   strategy:
@@ -22,7 +21,7 @@ trainer:
   logger:
     class_path: pytorch_lightning.loggers.TensorBoardLogger
     init_args:
-      save_dir: ${directory}
+      save_dir: 'lightning_logs'
       name: 'MVSML'
   fast_dev_run: false
   max_epochs: 60
@@ -78,10 +77,10 @@ lr_scheduler:
     gamma: 0.5
 
 data:
-  class_path: dataloader.dataset.SMLDataConsistentModule #dataloader.dataset.SMLDataModule
+  class_path: dataloader.dataset.SMLDataConsistentModule
   init_args:
     data_root: '/home/sai/Documents/void_small'
-    sequence_length: 5
+    sequence_length: 3
     img_size: [480, 640]
     batch_size: 35 #8
     num_workers: 3

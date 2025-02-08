@@ -32,6 +32,15 @@ class midasNetConsistentModule(pl.LightningModule):
         self.abs_loss = nn.L1Loss()
         self.useConvGRU = useConvGRU
 
+    def on_fit_start(self):
+        """Ensure that metric averaging uses the correct device after model initialization."""
+        self.avg_error_w_int_depth = metrics.ErrorMetricsAverager_DDP(self.device)
+        self.avg_error_w_pred = metrics.ErrorMetricsAverager_DDP(self.device)
+
+    def on_validation_start(self):
+        self.avg_error_w_int_depth = metrics.ErrorMetricsAverager_DDP(self.device)
+        self.avg_error_w_pred = metrics.ErrorMetricsAverager_DDP(self.device)
+          
     def load_from_pth(self, file_path):
         state_dict = torch.load(file_path, map_location=self.device)
         self.load_state_dict(state_dict)
@@ -50,81 +59,89 @@ class midasNetConsistentModule(pl.LightningModule):
         self.log("learning_rate", current_lr, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
         return loss
     
-    #TODO: add depth metrics RMSE, MAE, etc
     def validation_epoch_end(self, outputs):
-        max_depth, min_depth = self.max_depth, self.min_depth
-        avg_error_w_int_depth = metrics.ErrorMetricsAverager()
-        avg_error_w_pred = metrics.ErrorMetricsAverager()
+        # Get synchronized metrics
+        ga_metrics = self.avg_error_w_int_depth.get_metrics()
+        pred_metrics = self.avg_error_w_pred.get_metrics()
         
-        for output in outputs:
-            pred_depth = output["pred_depth"]
-            gt_depth = output["gt_depth"]
-            ga_depth = output["ga_depth"]
-            
-            for i in range(pred_depth.shape[0]):
-                tgt_gt_depth = gt_depth[i]
-                tgt_ga_depth = ga_depth[i]
-                sml_depth_inv = pred_depth[i]
-                
-                tgt_gt_depth = torch.from_numpy(tgt_gt_depth)#.to(self.device)
-                tgt_ga_depth = torch.from_numpy(tgt_ga_depth)#.to(self.device)
-                sml_depth_inv = torch.from_numpy(sml_depth_inv)#.to(self.device)
-                
-                # Compute the valid mask    
-                valid_mask = (tgt_gt_depth >= min_depth) & (tgt_gt_depth <= max_depth)
-        
-                mask = valid_mask.cpu().numpy()
-                error_w_int_depth = metrics.ErrorMetrics()
-                error_w_int_depth.compute( #ga depth
-                    estimate = tgt_ga_depth.cpu().numpy(), 
-                    target = tgt_gt_depth.cpu().numpy(), 
-                    valid = mask.astype(bool),
-                )
-        
-                error_w_pred = metrics.ErrorMetrics()
-                error_w_pred.compute(
-                    estimate = sml_depth_inv.cpu().numpy(), 
-                    target = tgt_gt_depth.cpu().numpy(), 
-                    valid = mask.astype(bool),
-                )
-            
-                # # accumulate error metric
-                avg_error_w_int_depth.accumulate(error_w_int_depth)
-                avg_error_w_pred.accumulate(error_w_pred)
-            
-        print("Averaging metrics for globally-aligned depth over {} samples".format(
-            avg_error_w_int_depth.total_count
-        ))
-        avg_error_w_int_depth.average()
+        # Only log from main process
+        if self.trainer.is_global_zero:
+            table = (
+                "Metric                | GA Depth (mm) | Predicted Depth (mm)\n"
+                "----------------------|---------------|--------------------\n"
+                f"RMSE                 | {ga_metrics['rmse']:.4f} | {pred_metrics['rmse']:.4f}\n"
+                f"MAE                  | {ga_metrics['mae']:.4f} | {pred_metrics['mae']:.4f}\n"
+                f"AbsRel               | {ga_metrics['absrel']:.4f} | {pred_metrics['absrel']:.4f}\n"
+                f"Inv RMSE (1/km)      | {ga_metrics['inv_rmse']:.4f} | {pred_metrics['inv_rmse']:.4f}\n"
+                f"Inv MAE (1/km)       | {ga_metrics['inv_mae']:.4f} | {pred_metrics['inv_mae']:.4f}\n"
+                f"Inv AbsRel (1/km)    | {ga_metrics['inv_absrel']:.4f} | {pred_metrics['inv_absrel']:.4f}"
+            )
 
-        print("Averaging metrics for SML-aligned depth over {} samples".format(
-            avg_error_w_pred.total_count
-        ))
-        avg_error_w_pred.average()
+            self.logger.experiment.add_text(
+                "Validation Metrics", 
+                table, 
+                global_step=self.global_step
+            )
+            print(f"\nValidation Metrics (Total Samples: {ga_metrics['total_count']}):\n{table}")
 
-        # Create the table
-        table = (
-            "Metric                | GA Depth (mm) | Predicted Depth (mm)\n"
-            "----------------------|---------------|--------------------\n"
-            f"RMSE                 | {avg_error_w_int_depth.rmse_avg:.4f} | {avg_error_w_pred.rmse_avg:.4f}\n"
-            f"MAE                  | {avg_error_w_int_depth.mae_avg:.4f} | {avg_error_w_pred.mae_avg:.4f}\n"
-            f"AbsRel               | {avg_error_w_int_depth.absrel_avg:.4f} | {avg_error_w_pred.absrel_avg:.4f}\n"
-            f"Inv RMSE (1/km)      | {avg_error_w_int_depth.inv_rmse_avg:.4f} | {avg_error_w_pred.inv_rmse_avg:.4f}\n"
-            f"Inv MAE (1/km)       | {avg_error_w_int_depth.inv_mae_avg:.4f} | {avg_error_w_pred.inv_mae_avg:.4f}\n"
-            f"Inv AbsRel (1/km)    | {avg_error_w_int_depth.inv_absrel_avg:.4f} | {avg_error_w_pred.inv_absrel_avg:.4f}"
-        )
-
-        self.logger.experiment.add_text("Validation Metrics", table, global_step=self.global_step)
-        
-        print("\nValidation Metrics Len:{}\n".format(avg_error_w_int_depth.total_count))
-        print(f"GA Depth: RMSE: {avg_error_w_int_depth.rmse_avg:.4f}, MAE: {avg_error_w_int_depth.mae_avg:.4f}, AbsRel: {avg_error_w_int_depth.absrel_avg:.4f}")
-        print(f"Pred Depth: RMSE: {avg_error_w_pred.rmse_avg:.4f}, MAE: {avg_error_w_pred.mae_avg:.4f}, AbsRel: {avg_error_w_pred.absrel_avg:.4f}")
-        
+        # Reset accumulators for next epoch
+        self.avg_error_w_int_depth.reset()
+        self.avg_error_w_pred.reset()
         
     def validation_step(self, batch, batch_idx):
         loss = self._common_step(batch, batch_idx, stage="val")
+        pred_depth = loss["pred_depth"]  # (B, H, W)
+        gt_depth = loss["gt_depth"]      # (B, H, W)
+        ga_depth = loss["ga_depth"]      # (B, H, W)
+        
+        batch_size = pred_depth.shape[0]
+        max_depth, min_depth = self.max_depth, self.min_depth
+        
+        for i in range(batch_size):
+            tgt_gt = gt_depth[i]
+            tgt_ga = ga_depth[i]
+            pred = pred_depth[i]
+            
+            valid_mask = (tgt_gt >= min_depth) & (tgt_gt <= max_depth)
+            ga_metrics = metrics.ErrorMetrics_DDP()
+            ga_metrics.compute(tgt_ga, tgt_gt, valid_mask)
+            self.avg_error_w_int_depth.accumulate(ga_metrics)
+            
+            pred_metrics = metrics.ErrorMetrics_DDP()
+            pred_metrics.compute(pred, tgt_gt, valid_mask)
+            self.avg_error_w_pred.accumulate(pred_metrics)
+            
         return loss
-    
+
+    def validation_epoch_end(self, outputs):
+        # Get synchronized metrics
+        ga_metrics = self.avg_error_w_int_depth.get_metrics()
+        pred_metrics = self.avg_error_w_pred.get_metrics()
+        
+        # Only log from main process
+        if self.trainer.is_global_zero:
+            table = (
+                "Metric                | GA Depth (mm) | Predicted Depth (mm)\n"
+                "----------------------|---------------|--------------------\n"
+                f"RMSE                 | {ga_metrics['rmse']:.4f} | {pred_metrics['rmse']:.4f}\n"
+                f"MAE                  | {ga_metrics['mae']:.4f} | {pred_metrics['mae']:.4f}\n"
+                f"AbsRel               | {ga_metrics['absrel']:.4f} | {pred_metrics['absrel']:.4f}\n"
+                f"Inv RMSE (1/km)      | {ga_metrics['inv_rmse']:.4f} | {pred_metrics['inv_rmse']:.4f}\n"
+                f"Inv MAE (1/km)       | {ga_metrics['inv_mae']:.4f} | {pred_metrics['inv_mae']:.4f}\n"
+                f"Inv AbsRel (1/km)    | {ga_metrics['inv_absrel']:.4f} | {pred_metrics['inv_absrel']:.4f}"
+            )
+
+            self.logger.experiment.add_text(
+                "Validation Metrics", 
+                table, 
+                global_step=self.global_step
+            )
+            print(f"\nValidation Metrics (Total Samples: {ga_metrics['total_count']}):\n{table}")
+
+        # Reset accumulators for next epoch
+        self.avg_error_w_int_depth.reset()
+        self.avg_error_w_pred.reset()
+        
     def compute_exp_weighted_l1loss(self, metric_depth_pred, tgt_gt_depth, gamma=0.85):
         total_loss = 0.0
         total_weight = 0.0
