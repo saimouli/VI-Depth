@@ -71,6 +71,10 @@ class MidasNet_small_cons_videpth(BaseModel):
         self.scratch.refinenet2 = FeatureFusionBlock_custom(features2, self.scratch.activation, deconv=False, bn=False, expand=self.expand, align_corners=align_corners)
         self.scratch.refinenet1 = FeatureFusionBlock_custom(features1, self.scratch.activation, deconv=False, bn=False, align_corners=align_corners)
 
+        self.scratch_upsample = nn.Sequential(
+            nn.Conv2d(features, features, kernel_size=3, stride=1, padding=1, groups=self.groups),
+            nn.Upsample(scale_factor=2, mode="bilinear"),
+        )
         #self.scratch.output_conv = OutputConv(features, self.groups, self.scratch.activation, non_negative)
 
         #self.scale_map_learner = ScaleMapLearner(input_channels=features1 + in_channels, hidden_channels=features, output_channels=1)
@@ -111,9 +115,11 @@ class MidasNet_small_cons_videpth(BaseModel):
         path_1 = self.scratch.refinenet1(path_2, layer_1_rn)
 
         if self.output_downsample:
-            target_h = 120
-            target_w = 160
-            path_1 = F.interpolate(path_1, size=(target_h, target_w),
-                                    mode='bicubic', align_corners=self.scratch.refinenet1.align_corners)
+            path_1 = self.scratch_upsample(path_1)
+        # if self.output_downsample:
+        #     target_h = 120
+        #     target_w = 160
+        #     path_1 = F.interpolate(path_1, size=(target_h, target_w),
+        #                             mode='bicubic', align_corners=self.scratch.refinenet1.align_corners)
         return path_1 #[1, 64, 120, 160]
         

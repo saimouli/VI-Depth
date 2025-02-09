@@ -12,6 +12,7 @@ import modules.midas.utils as utils
 import modules.midas.transforms as transforms
 from utils.camera import Camera
 from functools import partial
+import torchvision
 #from modules.midas.blocks import OutputConv
 
 class Conv3x3(nn.Module):
@@ -99,7 +100,7 @@ class OutputScaleConv(nn.Module):
 
         self.output_conv = nn.Sequential(
             nn.Conv2d(features, features//2, kernel_size=3, stride=1, padding=1, groups=groups),
-            #nn.Upsample(scale_factor=2, mode="bilinear"),
+            nn.Upsample(scale_factor=2, mode="bilinear"),
             nn.Conv2d(features//2, 32, kernel_size=3, stride=1, padding=1),
             activation,
             nn.Conv2d(32, 1, kernel_size=1, stride=1, padding=0),
@@ -235,6 +236,7 @@ class midasConsNet(nn.Module):
 
         self.FeatExtractor = MidasNet_small_cons_videpth(
             path=sml_model_path,
+            features=32,
             min_pred=self.min_pred,
             max_pred=self.max_pred,
             output_downsample=True,
@@ -247,7 +249,7 @@ class midasConsNet(nn.Module):
             path=sml_model_path,
             min_pred=self.min_pred,
             max_pred=self.max_pred,
-            output_downsample=True,
+            output_downsample=False,
             backbone="efficientnet_lite3",
         )
         self.contextLearner.train()
@@ -301,12 +303,15 @@ class midasConsNet(nn.Module):
         world_points = cam.reconstruct(depth, frame='w')
         # Project world points onto reference camera
         ref_coords = ref_cam.project(world_points, frame='w', normalize=True) #(b, h, w,2)
-        #with torch.no_grad():
-        #    valid_mask = (ref_coords.abs().max(dim=-1)[0] <= 1).float()  # [B, H, W]
+        with torch.no_grad():
+           valid_mask = (ref_coords.abs().max(dim=-1)[0] <= 1).float()  # [B, H, W]
+           
         fmap_warped = F.grid_sample(fmap_ref, ref_coords, 
                                     mode='bilinear', padding_mode='zeros', align_corners=True) # (b, c, h, w)
         
         cost = (fmap - fmap_warped)**2
+        cost = cost * valid_mask.unsqueeze(1) 
+        cost = cost.mean(dim=1, keepdim=True)
         #cost_l1 = torch.abs(fmap - fmap_warped).mean()
         #cost_ssim = (1 - self.ssim_loss(fmap, fmap_warped)).mean()
         #cost = 0.85 * cost_l1 + 0.15 * cost_ssim 
@@ -314,18 +319,31 @@ class midasConsNet(nn.Module):
             #self.log_feature_pca(fmap, fmap_warped, self.global_step)
         #print("cost each: mean", cost.mean())
         
-        return cost
+        return {
+            'cost': cost,
+            'fmap': fmap,
+            'fmap_warped': fmap_warped,
+            'valid_mask': valid_mask
+        }
     
     def depth_cost_calc(self, inv_depth, fmap, fmaps_ref, pose_list, tgt_pose, K, scale_factor):
         cost_list = []
-        mask_list = []
-        for pose, fmap_r in zip(pose_list, fmaps_ref):
-            cost = self.get_cost_each(tgt_pose, pose, fmap, fmap_r, utils.inv2depth(inv_depth), K, scale_factor)
+        warping_vis = []
+        for idx, (pose, fmap_r) in enumerate(zip(pose_list, fmaps_ref)):
+            result = self.get_cost_each(tgt_pose, pose, fmap, fmap_r, 
+                                      utils.inv2depth(inv_depth), K, scale_factor)
             
+            if idx == 0 and self.is_train:
+                warping_vis.append({
+                    'src_feat': result['fmap'][0].detach(),
+                    'warped_feat': result['fmap_warped'][0].detach(),
+                    'valid_mask': result['valid_mask'][0].detach(),
+                    'cost': result['cost'][0].detach()
+                })
             #mask_weight = torch.sigmoid(self.maskNet(fmap))
             #mask_list.append(mask_weight)
             #weighted_cost = cost * mask_weight #apply learned weighting
-            cost_list.append(cost)  # (b, c,h, w) (1,64,144,192)
+            cost_list.append(result['cost'])  # (b, c,h, w) (1,64,144,192)
             
         # cost = torch.stack(cost_list, dim=1).min(dim=1)[0]
         #print(f"Cost each view : {[cost.mean().item() for cost in cost_list]}")
@@ -334,7 +352,7 @@ class midasConsNet(nn.Module):
         #cost = (cost_stack.sum(dim=1) / (mask_stack.sum(dim=1) + 1e-6))  # Avoid division by zero
         cost = torch.stack(cost_list, dim=1).mean(dim=1)
         #print("cost mean", cost.mean())
-        return cost
+        return cost, warping_vis
 
     def preprocess_batch(self, *args, keys, device=None):
         assert len(args) == len(keys)
@@ -353,7 +371,7 @@ class midasConsNet(nn.Module):
             batch_inputs.append(x)
         
         return torch.stack(batch_inputs, dim=0)
-
+    
     def forward(self, tgt_img, ref_imgs, tgt_ga_depth, ref_ga_depth, 
                 tgt_interp, ref_interp, tgt_pose, ref_pose, intrinsics):
         """
@@ -376,7 +394,7 @@ class midasConsNet(nn.Module):
             device=tgt_img.device
         )
         tgt_input, context_input = torch.split(processed_batch, [4, 2], dim=1) #[1,4,288,384]
-        #init_metric_depth_inv = context_input[:, 0:1, :, :]
+        init_metric_depth_inv = context_input[:, 0:1, :, :]
         
         # Extract features using MidasNet #TODO: batch processing?
         tgt_feats = self.FeatExtractor(tgt_input) #[1, 64, 120, 160]
@@ -385,21 +403,21 @@ class midasConsNet(nn.Module):
         
         #step2: get the init scaled depth from the model
         #metric_depth_inv_tgt, _ = self.ScaleMapLearner(x, d)
-        scale_factor =  tgt_img.permute(0,3,1,2).shape[2] / tgt_feats.shape[2] #->convert to 160,192?
+        scale_factor =  tgt_img.permute(0,3,1,2).shape[2] / tgt_feats.shape[2]
         
         #poses
         #pose_list_init = []
         
         #Intialize depth and poses
         #metric_depth_inv_tgt = tgt_ga_depth #[1, 480, 640] to [1,1,120,160]
-        metric_depth_inv_tgt = F.interpolate(
-            tgt_ga_depth.unsqueeze(1), size=(tgt_feats.shape[2], tgt_feats.shape[3]), mode='bicubic'
-        )
+        # metric_depth_inv_tgt = F.interpolate(
+        #     tgt_ga_depth.unsqueeze(1), size=(tgt_feats.shape[2], tgt_feats.shape[3]), mode='bicubic'
+        # )
         
         if not self.UseConvGRU:
             scale_map = self.scaleOutput(context_feats)
             delta_scales = F.relu(1.0 + scale_map)  # Ensure scale is positive
-            inv_depth_pred = metric_depth_inv_tgt * delta_scales
+            inv_depth_pred = init_metric_depth_inv * delta_scales
             
             if self.min_pred is not None and self.max_pred is not None:
                 inv_depth_pred = torch.clamp(
@@ -411,9 +429,10 @@ class midasConsNet(nn.Module):
             #apply scale to depth before computing cost
             tgt_pose = tgt_pose.detach()
             ref_pose = [pose.detach() for pose in ref_pose]
-            depth_cost_map = self.depth_cost_calc(inv_depth_pred, tgt_feats, ref_feats, 
+            depth_cost_map, warping_vis = self.depth_cost_calc(inv_depth_pred, tgt_feats, ref_feats, 
                                                   pose_list=ref_pose, tgt_pose=tgt_pose,
                                                   K=intrinsics, scale_factor=1.0/scale_factor)
+            
             
             # refined_depth_inv = self.upsample_depth(
             #     inv_depth_pred,  # input depth [B, 1, H/ratio, W/ratio]
@@ -421,8 +440,8 @@ class midasConsNet(nn.Module):
             #     ratio=int(scale_factor),       # upsampling ratio
             # )
             
+            
             #TODO: propagate depth maybe SPN
-                    
             refined_depth_inv = F.interpolate(
                 inv_depth_pred,
                 size=(tgt_img.shape[1], tgt_img.shape[2]),
@@ -430,7 +449,7 @@ class midasConsNet(nn.Module):
                 align_corners=False
             )  # shape => [B, 1, 480, 640]
                 
-            return depth_cost_map, refined_depth_inv
+            return depth_cost_map, refined_depth_inv, warping_vis
         
         #pose_list = pose_list_init
         inv_depth_predictions = [] #[metric_depth_inv_tgt] #to see the history of depth predictions
