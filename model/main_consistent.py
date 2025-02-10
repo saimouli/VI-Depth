@@ -11,6 +11,7 @@ import cv2
 import modules.midas.utils as utils
 from metrics import rmse, mae, absrel, inv_rmse, inv_mae, inv_absrel
 import metrics
+from sklearn.decomposition import PCA
 
 class midasNetConsistentModule(pl.LightningModule):
     def __init__(self, lr: float = 0.1, wd: float = 0.1, min_pred: float = 0.1, 
@@ -243,7 +244,12 @@ class midasNetConsistentModule(pl.LightningModule):
         loss,_ = self.compute_loss(utils.inv2depth(refined_depth_inv),
                                 gt_depth,
                                 log_variance=None)
-        total_loss = loss #+ 0.5 * multiview_loss
+        if self.current_epoch < 5:
+            total_loss = loss #+ 0 * multiview_loss
+        # elif 5 < self.current_epoch < 10:
+        #     total_loss = loss + 0.2 * multiview_loss
+        else:    
+            total_loss = loss + 0.1 * multiview_loss
         
         #self.logger.experiment.add_scalar(f"{stage}_loss", loss, self.global_step)
         self.log(f"{stage}/multiview_loss", multiview_loss, on_step=True, on_epoch=True, sync_dist=True)
@@ -431,6 +437,13 @@ class midasNetConsistentModule(pl.LightningModule):
                 - 'cost': Cost volume (error map), tensor of shape [B, 1, H, W]
             global_step (int): Current training step.
         """
+        def feature_to_rgb(feature):
+            pca = PCA(n_components=3)
+            flat_feat = feature.permute(1,2,0).reshape(-1, feature.shape[0]).cpu().numpy()
+            pca_feat = pca.fit_transform(flat_feat)
+            pca_feat = (pca_feat - pca_feat.min()) / (pca_feat.max() - pca_feat.min())
+            return torch.tensor(pca_feat.reshape(*feature.shape[1:], 3)).permute(2,0,1)
+        
         # Loop over each reference view that was warped
         for idx, vis in enumerate(warping_vis):
             # Select the first sample in the batch for logging.
@@ -440,26 +453,61 @@ class midasNetConsistentModule(pl.LightningModule):
             cost = vis['cost']                   # [1, H, W]
 
             # Visualize features by averaging over channels
-            src_feat_vis = src_feat.mean(dim=0, keepdim=True)       # [1, H, W]
-            warped_feat_vis = warped_feat.mean(dim=0, keepdim=True) # [1, H, W]
+            src_feat_vis = feature_to_rgb(src_feat) #src_feat.mean(dim=0, keepdim=True)       # [1, H, W]
+            warped_feat_vis = feature_to_rgb(warped_feat) #warped_feat.mean(dim=0, keepdim=True) # [1, H, W]
 
             # Normalize cost volume to [0, 1] for visualization purposes
             cost_min = cost.min()
             cost_max = cost.max()
             cost_vis = (cost - cost_min) / (cost_max - cost_min + 1e-6)  # [1, H, W]
-
+            cost_colored_np = plt.cm.jet(cost_vis[0].cpu().numpy())[...,:3]  # Convert to RGB
+            cost_vis = torch.from_numpy(cost_colored_np).permute(2, 0, 1).float()
+            
             # The valid mask is already a binary map; add a channel dimension for logging.
-            valid_mask_vis = valid_mask.unsqueeze(0)  # [1, H, W]
+            valid_mask_vis = valid_mask.unsqueeze(0).repeat(3,1,1).cpu() #valid_mask.unsqueeze(0)  # [1, H, W]
+            overlay = 0.7*src_feat_vis + 0.3*valid_mask_vis
 
             # Log images using TensorBoard (dataformats: "CHW" means Channel, Height, Width)
-            self.logger.experiment.add_image(f"Warping/View_{mode}/Src_Feature", src_feat_vis, self.global_step, dataformats="CHW")
-            self.logger.experiment.add_image(f"Warping/View_{mode}/Warped_Feature", warped_feat_vis, self.global_step, dataformats="CHW")
-            self.logger.experiment.add_image(f"Warping/View_{mode}/Cost", cost_vis, self.global_step, dataformats="CHW")
-            self.logger.experiment.add_image(f"Warping/View_{mode}/Valid_Mask", valid_mask_vis, self.global_step, dataformats="CHW")
+            self.logger.experiment.add_image(
+                f"Warping/View_{mode}/Overlay", 
+                overlay, 
+                self.global_step, 
+                dataformats="CHW"
+            )
+            self.logger.experiment.add_image(
+                f"Warping/View_{mode}/Src_Feature", 
+                src_feat_vis, 
+                self.global_step, 
+                dataformats="CHW"
+            )
+            self.logger.experiment.add_image(
+                f"Warping/View_{mode}/Warped_Feature", 
+                warped_feat_vis, 
+                self.global_step, 
+                dataformats="CHW"
+            )
+            self.logger.experiment.add_image(
+                f"Warping/View_{mode}/Cost", 
+                cost_vis, 
+                self.global_step, 
+                dataformats="CHW"
+            )
+            self.logger.experiment.add_image(
+                f"Warping/View_{mode}/Valid_Mask", 
+                valid_mask_vis, 
+                self.global_step, 
+                dataformats="CHW"
+            )
             
             # Optionally, log the average cost as a scalar so you can see if it decreases over time.
             avg_cost = cost_vis.mean().item()
-            self.log(f"Warping/View_{mode}/Avg_Cost", avg_cost, prog_bar=True, on_epoch=True, on_step=True, sync_dist=True)
+            self.log(
+                f"Warping/View_{mode}/Avg_Cost", 
+                avg_cost, 
+                prog_bar=True, 
+                on_epoch=True, 
+                on_step=True, 
+                sync_dist=True)
         
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(),

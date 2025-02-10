@@ -38,6 +38,7 @@ class SMLDataConsistentModule(pl.LightningDataModule):
     def train_dataloader(self):
         return DataLoader(
             self.train_dataset,
+            shuffle=True,
             batch_size=self.batch_size,
             num_workers=self.num_workers
         )
@@ -46,6 +47,7 @@ class SMLDataConsistentModule(pl.LightningDataModule):
         return DataLoader(
             self.test_dataset,
             batch_size=self.batch_size,
+            shuffle=False,
             num_workers=self.num_workers
         )
  
