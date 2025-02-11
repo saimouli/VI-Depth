@@ -219,6 +219,22 @@ class BasicUpdateBlockDepth(nn.Module):
 #         delat_mat = pp.se3.exp(delta)
 #         return pose @ delta_mat
 
+class MaskPredictor(nn.Module):
+    """Learns to predict occlusion/invalid region mask"""
+    def __init__(self, in_channels):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels*2, 16, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 16, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 1, 1),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, src_feat, warped_feat):
+        x = torch.cat([src_feat, warped_feat], dim=1)
+        return self.conv(x)
   
 class midasConsNet(nn.Module):
     def __init__(self, min_pred, max_pred, min_depth, max_depth, nsamples, sml_model_path, 
@@ -236,6 +252,7 @@ class midasConsNet(nn.Module):
 
         self.FeatExtractor = MidasNet_small_cons_videpth(
             path=sml_model_path,
+            in_channels=3,
             features=32,
             min_pred=self.min_pred,
             max_pred=self.max_pred,
@@ -253,6 +270,8 @@ class midasConsNet(nn.Module):
             backbone="efficientnet_lite3",
         )
         self.contextLearner.train()
+        
+        self.mask_predictor = MaskPredictor(in_channels=32)
     
         self.hidden_dim = 128
         self.cost_dim = 64
@@ -303,15 +322,21 @@ class midasConsNet(nn.Module):
         world_points = cam.reconstruct(depth, frame='w')
         # Project world points onto reference camera
         ref_coords = ref_cam.project(world_points, frame='w', normalize=True) #(b, h, w,2)
-        with torch.no_grad():
-           valid_mask = (ref_coords.abs().max(dim=-1)[0] <= 1).float()  # [B, H, W]
+        # with torch.no_grad():
+        #    valid_mask = (ref_coords.abs().max(dim=-1)[0] <= 1).float()  # [B, H, W]
            
         fmap_warped = F.grid_sample(fmap_ref, ref_coords, 
                                     mode='bilinear', padding_mode='zeros', align_corners=True) # (b, c, h, w)
         
-        cost = (fmap - fmap_warped)**2
-        cost = cost * valid_mask.unsqueeze(1) 
-        cost = cost.mean(dim=1, keepdim=True)
+        # cost = (fmap - fmap_warped)**2
+        # cost = cost * valid_mask.unsqueeze(1) 
+        # cost = cost.mean(dim=1, keepdim=True)
+        
+        #try to learn a mask
+        mask = torch.sigmoid(self.mask_predictor(fmap, fmap_warped))
+        residual = (fmap - fmap_warped).abs()
+        cost = (mask * residual).mean(dim=1, keepdim=True)
+        
         #cost_l1 = torch.abs(fmap - fmap_warped).mean()
         #cost_ssim = (1 - self.ssim_loss(fmap, fmap_warped)).mean()
         #cost = 0.85 * cost_l1 + 0.15 * cost_ssim 
@@ -323,7 +348,7 @@ class midasConsNet(nn.Module):
             'cost': cost,
             'fmap': fmap,
             'fmap_warped': fmap_warped,
-            'valid_mask': valid_mask
+            'valid_mask': mask
         }
     
     def depth_cost_calc(self, inv_depth, fmap, fmaps_ref, pose_list, tgt_pose, K, scale_factor):
@@ -380,9 +405,14 @@ class midasConsNet(nn.Module):
 
         #Step 1: Extract features using the base model
         #tgt_input = self.preprocess_batch(tgt_img, tgt_ga_depth, keys=["image", "int_depth"], device=tgt_img.device)
+        # ref_inputs = [
+        #     self.preprocess_batch(ref_img, ref_depth, keys=["image", "ga_depth"], device=ref_img.device)
+        #     for ref_img, ref_depth in zip(ref_imgs, ref_ga_depth)
+        # ]
+        
         ref_inputs = [
-            self.preprocess_batch(ref_img, ref_depth, keys=["image", "ga_depth"], device=ref_img.device)
-            for ref_img, ref_depth in zip(ref_imgs, ref_ga_depth)
+            self.preprocess_batch(ref_img, keys=["image"], device=ref_img.device)
+            for ref_img in ref_imgs
         ]
         
         # context_input = self.preprocess_batch(tgt_ga_depth, tgt_interp, 
@@ -395,6 +425,9 @@ class midasConsNet(nn.Module):
         )
         tgt_input, context_input = torch.split(processed_batch, [4, 2], dim=1) #[1,4,288,384]
         init_metric_depth_inv = context_input[:, 0:1, :, :]
+        
+        #test feat extraction only with the rgb image
+        tgt_input = processed_batch[:, :3, :, :] # Shape: [1, 3, H, W]
         
         # Extract features using MidasNet #TODO: batch processing?
         tgt_feats = self.FeatExtractor(tgt_input) #[1, 64, 120, 160]
@@ -427,6 +460,7 @@ class midasConsNet(nn.Module):
                 )  
                 
             #apply scale to depth before computing cost
+            #depth_cost_map = None; warping_vis = None
             tgt_pose = tgt_pose.detach()
             ref_pose = [pose.detach() for pose in ref_pose]
             depth_cost_map, warping_vis = self.depth_cost_calc(inv_depth_pred, tgt_feats, ref_feats, 

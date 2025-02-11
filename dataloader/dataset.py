@@ -39,12 +39,14 @@ class SMLDataConsistentModule(pl.LightningDataModule):
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
+            shuffle=True,
             num_workers=self.num_workers
         )
     
     def val_dataloader(self):
         return DataLoader(
             self.test_dataset,
+            shuffle=False,
             batch_size=self.batch_size,
             num_workers=self.num_workers
         )
