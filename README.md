@@ -130,3 +130,4 @@ If you reference our work, please consider citing the following:
 
 Our work builds on and uses code from [MiDaS](https://github.com/isl-org/MiDaS), [timm](https://github.com/rwightman/pytorch-image-models), and [PyTorch Lightning](https://lightning.ai/docs/pytorch/stable/). We'd like to thank the authors for making these libraries and frameworks available.
 
+_Last revisited: August 2024_
