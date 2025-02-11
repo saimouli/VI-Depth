@@ -40,7 +40,6 @@ class SMLDataConsistentModule(pl.LightningDataModule):
             self.train_dataset,
             shuffle=True,
             batch_size=self.batch_size,
-            shuffle=True,
             num_workers=self.num_workers
         )
     
@@ -49,7 +48,6 @@ class SMLDataConsistentModule(pl.LightningDataModule):
             self.test_dataset,
             shuffle=False,
             batch_size=self.batch_size,
-            shuffle=False,
             num_workers=self.num_workers
         )
  

@@ -160,7 +160,7 @@ class midasNetConsistentModule(pl.LightningModule):
         
         return total_loss / total_weight
 
-    def compute_loss(self, pred_depth, gt_depth, log_variance=None):
+    def compute_loss(self, pred_depth, gt_depth, log_variance=None, mask=None):
         """
         Computes the loss for depth prediction based on L1 depth loss and multiscale gradient matching.
 
@@ -185,6 +185,9 @@ class midasNetConsistentModule(pl.LightningModule):
             # L1 Depth loss
             l1_depth_loss = F.l1_loss(pred_depth * valid_mask, gt_depth * valid_mask, reduction='sum') / M
 
+        if mask is not None:
+            mask_entropy = F.binary_cross_entropy_with_logits(mask, valid_mask, reduction='mean')
+            
         # Multiscale gradient matching loss
         def compute_gradient_loss(pred, gt):
             diff = gt - pred
@@ -243,7 +246,8 @@ class midasNetConsistentModule(pl.LightningModule):
         multiview_loss = depth_cost_map.mean()
         loss,_ = self.compute_loss(utils.inv2depth(refined_depth_inv),
                                 gt_depth,
-                                log_variance=None)
+                                log_variance=None,
+                                mask=None)
         #total_loss = loss
         if self.current_epoch < 5:
            total_loss = loss  #+ 0.5 * multiview_loss
@@ -461,8 +465,6 @@ class midasNetConsistentModule(pl.LightningModule):
             # Visualize features by averaging over channels
             src_feat_vis = feature_to_rgb(src_feat) #src_feat.mean(dim=0, keepdim=True)       # [1, H, W]
             warped_feat_vis = feature_to_rgb(warped_feat) #warped_feat.mean(dim=0, keepdim=True) # [1, H, W]
-            src_feat_vis = feature_to_rgb(src_feat) #src_feat.mean(dim=0, keepdim=True)       # [1, H, W]
-            warped_feat_vis = feature_to_rgb(warped_feat) #warped_feat.mean(dim=0, keepdim=True) # [1, H, W]
 
             # Normalize cost volume to [0, 1] for visualization purposes
             cost_min = cost.min()
@@ -471,13 +473,8 @@ class midasNetConsistentModule(pl.LightningModule):
             cost_colored_np = plt.cm.jet(cost_vis[0].cpu().numpy())[...,:3]  # Convert to RGB
             cost_vis = torch.from_numpy(cost_colored_np).permute(2, 0, 1).float()
             
-            cost_colored_np = plt.cm.jet(cost_vis[0].cpu().numpy())[...,:3]  # Convert to RGB
-            cost_vis = torch.from_numpy(cost_colored_np).permute(2, 0, 1).float()
-            
             # The valid mask is already a binary map; add a channel dimension for logging.
-            valid_mask_vis = valid_mask.unsqueeze(0).repeat(3,1,1).cpu() #valid_mask.unsqueeze(0)  # [1, H, W]
-            overlay = 0.7*src_feat_vis + 0.3*valid_mask_vis
-            valid_mask_vis = valid_mask.unsqueeze(0).repeat(3,1,1).cpu() #valid_mask.unsqueeze(0)  # [1, H, W]
+            valid_mask_vis = valid_mask.repeat(3,1,1).cpu() #valid_mask.unsqueeze(0)  # [3, H, W]
             overlay = 0.7*src_feat_vis + 0.3*valid_mask_vis
 
             # Log images using TensorBoard (dataformats: "CHW" means Channel, Height, Width)
@@ -511,46 +508,9 @@ class midasNetConsistentModule(pl.LightningModule):
                 self.global_step, 
                 dataformats="CHW"
             )
-            self.logger.experiment.add_image(
-                f"Warping/View_{mode}/Overlay", 
-                overlay, 
-                self.global_step, 
-                dataformats="CHW"
-            )
-            self.logger.experiment.add_image(
-                f"Warping/View_{mode}/Src_Feature", 
-                src_feat_vis, 
-                self.global_step, 
-                dataformats="CHW"
-            )
-            self.logger.experiment.add_image(
-                f"Warping/View_{mode}/Warped_Feature", 
-                warped_feat_vis, 
-                self.global_step, 
-                dataformats="CHW"
-            )
-            self.logger.experiment.add_image(
-                f"Warping/View_{mode}/Cost", 
-                cost_vis, 
-                self.global_step, 
-                dataformats="CHW"
-            )
-            self.logger.experiment.add_image(
-                f"Warping/View_{mode}/Valid_Mask", 
-                valid_mask_vis, 
-                self.global_step, 
-                dataformats="CHW"
-            )
             
             # Optionally, log the average cost as a scalar so you can see if it decreases over time.
             avg_cost = cost_vis.mean().item()
-            self.log(
-                f"Warping/View_{mode}/Avg_Cost", 
-                avg_cost, 
-                prog_bar=True, 
-                on_epoch=True, 
-                on_step=True, 
-                sync_dist=True)
             self.log(
                 f"Warping/View_{mode}/Avg_Cost", 
                 avg_cost, 
