@@ -48,7 +48,7 @@ class midasNetConsistentModule(pl.LightningModule):
     
     def forward(self, tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, ref_imgs,
                 ref_ga_depth, ref_interp, ref_gt_depth, tgt_pose, ref_pose, intrinsics):
-        _, pred_inv_depth =  self.model(tgt_img, ref_imgs, tgt_ga_depth, ref_ga_depth, tgt_interp,
+        _, pred_inv_depth,_ =  self.model(tgt_img, ref_imgs, tgt_ga_depth, ref_ga_depth, tgt_interp,
                           ref_interp, tgt_pose, ref_pose, intrinsics)
 
         return pred_inv_depth
@@ -160,7 +160,7 @@ class midasNetConsistentModule(pl.LightningModule):
         
         return total_loss / total_weight
 
-    def compute_loss(self, pred_depth, gt_depth, log_variance=None):
+    def compute_loss(self, pred_depth, gt_depth, log_variance=None, mask=None):
         """
         Computes the loss for depth prediction based on L1 depth loss and multiscale gradient matching.
 
@@ -185,6 +185,9 @@ class midasNetConsistentModule(pl.LightningModule):
             # L1 Depth loss
             l1_depth_loss = F.l1_loss(pred_depth * valid_mask, gt_depth * valid_mask, reduction='sum') / M
 
+        if mask is not None:
+            mask_entropy = F.binary_cross_entropy_with_logits(mask, valid_mask, reduction='mean')
+            
         # Multiscale gradient matching loss
         def compute_gradient_loss(pred, gt):
             diff = gt - pred
@@ -243,17 +246,17 @@ class midasNetConsistentModule(pl.LightningModule):
         multiview_loss = depth_cost_map.mean()
         loss,_ = self.compute_loss(utils.inv2depth(refined_depth_inv),
                                 gt_depth,
-                                log_variance=None)
+                                log_variance=None,
+                                mask=None)
+        #total_loss = loss
         if self.current_epoch < 5:
-            total_loss = loss #+ 0 * multiview_loss
-        # elif 5 < self.current_epoch < 10:
-        #     total_loss = loss + 0.2 * multiview_loss
-        else:    
-            total_loss = loss + 0.1 * multiview_loss
+           total_loss = loss  #+ 0.5 * multiview_loss
+        else:
+           total_loss = loss + 0.01*multiview_loss
         
         #self.logger.experiment.add_scalar(f"{stage}_loss", loss, self.global_step)
         self.log(f"{stage}/multiview_loss", multiview_loss, on_step=True, on_epoch=True, sync_dist=True)
-        self.log(f"{stage}/l1_depth_loss", loss, on_step=True, on_epoch=True, sync_dist=True)
+        self.log(f"{stage}/l1_depth_grad_loss", loss, on_step=True, on_epoch=True, sync_dist=True)
         self.log(f"{stage}/total_loss", total_loss, on_step=True, on_epoch=True, sync_dist=True)
         
         with torch.no_grad():
@@ -444,6 +447,13 @@ class midasNetConsistentModule(pl.LightningModule):
             pca_feat = (pca_feat - pca_feat.min()) / (pca_feat.max() - pca_feat.min())
             return torch.tensor(pca_feat.reshape(*feature.shape[1:], 3)).permute(2,0,1)
         
+        def feature_to_rgb(feature):
+            pca = PCA(n_components=3)
+            flat_feat = feature.permute(1,2,0).reshape(-1, feature.shape[0]).cpu().numpy()
+            pca_feat = pca.fit_transform(flat_feat)
+            pca_feat = (pca_feat - pca_feat.min()) / (pca_feat.max() - pca_feat.min())
+            return torch.tensor(pca_feat.reshape(*feature.shape[1:], 3)).permute(2,0,1)
+        
         # Loop over each reference view that was warped
         for idx, vis in enumerate(warping_vis):
             # Select the first sample in the batch for logging.
@@ -464,7 +474,7 @@ class midasNetConsistentModule(pl.LightningModule):
             cost_vis = torch.from_numpy(cost_colored_np).permute(2, 0, 1).float()
             
             # The valid mask is already a binary map; add a channel dimension for logging.
-            valid_mask_vis = valid_mask.unsqueeze(0).repeat(3,1,1).cpu() #valid_mask.unsqueeze(0)  # [1, H, W]
+            valid_mask_vis = valid_mask.repeat(3,1,1).cpu() #valid_mask.unsqueeze(0)  # [3, H, W]
             overlay = 0.7*src_feat_vis + 0.3*valid_mask_vis
 
             # Log images using TensorBoard (dataformats: "CHW" means Channel, Height, Width)

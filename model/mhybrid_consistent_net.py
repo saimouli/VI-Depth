@@ -219,7 +219,7 @@ class BasicUpdateBlockDepth(nn.Module):
 #         delat_mat = pp.se3.exp(delta)
 #         return pose @ delta_mat
 
-  
+    
 class midasConsNet(nn.Module):
     def __init__(self, min_pred, max_pred, min_depth, max_depth, nsamples, sml_model_path, 
                  is_train=True, log_fn=None, isConvGRU=False):
@@ -236,7 +236,8 @@ class midasConsNet(nn.Module):
 
         self.FeatExtractor = MidasNet_small_cons_videpth(
             path=sml_model_path,
-            features=32,
+            in_channels=3,
+            features=16,
             min_pred=self.min_pred,
             max_pred=self.max_pred,
             output_downsample=True,
@@ -290,6 +291,18 @@ class midasConsNet(nn.Module):
         up_flow = up_flow.permute(0, 1, 4, 2, 5, 3)
         return up_flow.reshape(N, 1, ratio*H, ratio*W)
     
+    def ssim(self, x, y, window_size=3):
+        # Simplified SSIM implementation
+        mu_x = F.avg_pool2d(x, window_size, 1, padding=window_size//2)
+        mu_y = F.avg_pool2d(y, window_size, 1, padding=window_size//2)
+        
+        sigma_x = F.avg_pool2d(x**2, window_size, 1, padding=window_size//2) - mu_x**2
+        sigma_y = F.avg_pool2d(y**2, window_size, 1, padding=window_size//2) - mu_y**2
+        sigma_xy = F.avg_pool2d(x*y, window_size, 1, padding=window_size//2) - mu_x*mu_y
+        
+        return ((2*mu_x*mu_y + 1e-6) / (mu_x**2 + mu_y**2 + 1e-6)) * \
+            ((2*sigma_xy + 1e-6) / (sigma_x + sigma_y + 1e-6))
+           
     def get_cost_each(self, tgt_pose, pose, fmap, fmap_ref, depth, K, scale_factor):
         """
             ga_depth: (b, 1, h, w)
@@ -309,16 +322,24 @@ class midasConsNet(nn.Module):
         fmap_warped = F.grid_sample(fmap_ref, ref_coords, 
                                     mode='bilinear', padding_mode='zeros', align_corners=True) # (b, c, h, w)
         
+        # Robust feature normalization
+        #fmap_norm = F.normalize(fmap, p=2, dim=1)
+        #fmap_warped_norm = F.normalize(fmap_warped, p=2, dim=1)
+        
+        # Learned occlusion mask with improved architecture
+        #mask = self.enhanced_mask_predictor(fmap_norm, fmap_warped_norm)
+        # Combine geometric and learned masks
+        #combined_mask = valid_mask.unsqueeze(1) * mask
+        
+        # Robust similarity metrics
+        # l1_cost = (fmap_norm - fmap_warped_norm).abs().mean(dim=1, keepdim=True)
+        # ssim_cost = self.ssim(fmap_norm, fmap_warped_norm)
+        # cost = (0.85 * ssim_cost + 0.15 * l1_cost) * valid_mask.unsqueeze(1) 
+        
         cost = (fmap - fmap_warped)**2
         cost = cost * valid_mask.unsqueeze(1) 
         cost = cost.mean(dim=1, keepdim=True)
-        #cost_l1 = torch.abs(fmap - fmap_warped).mean()
-        #cost_ssim = (1 - self.ssim_loss(fmap, fmap_warped)).mean()
-        #cost = 0.85 * cost_l1 + 0.15 * cost_ssim 
-        #if self.global_step % 50 == 0:
-            #self.log_feature_pca(fmap, fmap_warped, self.global_step)
-        #print("cost each: mean", cost.mean())
-        
+
         return {
             'cost': cost,
             'fmap': fmap,
@@ -340,18 +361,10 @@ class midasConsNet(nn.Module):
                     'valid_mask': result['valid_mask'][0].detach(),
                     'cost': result['cost'][0].detach()
                 })
-            #mask_weight = torch.sigmoid(self.maskNet(fmap))
-            #mask_list.append(mask_weight)
-            #weighted_cost = cost * mask_weight #apply learned weighting
+
             cost_list.append(result['cost'])  # (b, c,h, w) (1,64,144,192)
-            
-        # cost = torch.stack(cost_list, dim=1).min(dim=1)[0]
-        #print(f"Cost each view : {[cost.mean().item() for cost in cost_list]}")
-        #cost_stack = torch.stack(cost_list, dim=1)
-        #mask_stack = torch.stack(mask_list, dim=1)
-        #cost = (cost_stack.sum(dim=1) / (mask_stack.sum(dim=1) + 1e-6))  # Avoid division by zero
+        
         cost = torch.stack(cost_list, dim=1).mean(dim=1)
-        #print("cost mean", cost.mean())
         return cost, warping_vis
 
     def preprocess_batch(self, *args, keys, device=None):
@@ -380,9 +393,14 @@ class midasConsNet(nn.Module):
 
         #Step 1: Extract features using the base model
         #tgt_input = self.preprocess_batch(tgt_img, tgt_ga_depth, keys=["image", "int_depth"], device=tgt_img.device)
+        # ref_inputs = [
+        #     self.preprocess_batch(ref_img, ref_depth, keys=["image", "ga_depth"], device=ref_img.device)
+        #     for ref_img, ref_depth in zip(ref_imgs, ref_ga_depth)
+        # ]
+        
         ref_inputs = [
-            self.preprocess_batch(ref_img, ref_depth, keys=["image", "ga_depth"], device=ref_img.device)
-            for ref_img, ref_depth in zip(ref_imgs, ref_ga_depth)
+            self.preprocess_batch(ref_img, keys=["image"], device=ref_img.device)
+            for ref_img in ref_imgs
         ]
         
         # context_input = self.preprocess_batch(tgt_ga_depth, tgt_interp, 
@@ -395,6 +413,9 @@ class midasConsNet(nn.Module):
         )
         tgt_input, context_input = torch.split(processed_batch, [4, 2], dim=1) #[1,4,288,384]
         init_metric_depth_inv = context_input[:, 0:1, :, :]
+        
+        #test feat extraction only with the rgb image
+        tgt_input = processed_batch[:, :3, :, :] # Shape: [1, 3, H, W]
         
         # Extract features using MidasNet #TODO: batch processing?
         tgt_feats = self.FeatExtractor(tgt_input) #[1, 64, 120, 160]
@@ -427,6 +448,7 @@ class midasConsNet(nn.Module):
                 )  
                 
             #apply scale to depth before computing cost
+            #depth_cost_map = None; warping_vis = None
             tgt_pose = tgt_pose.detach()
             ref_pose = [pose.detach() for pose in ref_pose]
             depth_cost_map, warping_vis = self.depth_cost_calc(inv_depth_pred, tgt_feats, ref_feats, 
