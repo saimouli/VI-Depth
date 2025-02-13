@@ -12,6 +12,8 @@ import modules.midas.utils as utils
 from metrics import rmse, mae, absrel, inv_rmse, inv_mae, inv_absrel
 import metrics
 from sklearn.decomposition import PCA
+from utils.camera import Camera
+import pypose as pp
 
 class midasNetConsistentModule(pl.LightningModule):
     def __init__(self, lr: float = 0.1, wd: float = 0.1, min_pred: float = 0.1, 
@@ -160,6 +162,45 @@ class midasNetConsistentModule(pl.LightningModule):
         
         return total_loss / total_weight
 
+    def compute_reproj_loss(self, depth_pred, depth_gt, tgt_pose_pred, tgt_pose_gt,
+                            ref_pose_pred, ref_pose_gt, K):
+        #Loss = ||π(T_pred * X_pred) - π(T_gt * X_gt)||
+        #where X_pred = π^-1(x, D_pred), X_gt = π^-1(x, D_gt)
+        valid_depth_mask = ((depth_gt > self.min_depth) & (depth_gt <= self.max_depth)).float().detach()
+        #device = depth_pred.device
+        B, _, H, W = depth_pred.shape
+        
+        # Reconstruct 3D points using PREDICTED target pose and depth(global frame)
+        tgt_cam_pred = Camera(K=K, Twc=tgt_pose_pred)
+        points_pred_world = tgt_cam_pred.reconstruct(depth_pred*valid_depth_mask, frame='w')
+        
+        # Reconstruct GT points using GT target pose and depth (global frame)
+        tgt_cam_gt = Camera(K=K, Twc=tgt_pose_gt)
+        points_gt_world = tgt_cam_gt.reconstruct(depth_gt*valid_depth_mask, frame='w')
+        
+        # Project using PREDICTED reference poses (global frame)
+        proj_pred = []
+        for ref_pose in ref_pose_pred:
+            ref_cam_pred = Camera(K=K, Twc=ref_pose)
+            proj = ref_cam_pred.project(points_pred_world, frame='w', normalize=True)
+            proj_pred.append(proj)
+        
+        # Project using GT reference poses and depth (global frame)
+        proj_gt = []
+        for ref_pose in ref_pose_gt:
+            ref_cam_gt = Camera(K=K, Twc=ref_pose)
+            proj = ref_cam_gt.project(points_gt_world, frame='w', normalize=True)
+            proj_gt.append(proj)
+        
+        # Compute masked reprojection error
+        loss = 0
+        for p_pred, p_gt in zip(proj_pred, proj_gt):
+            valid_mask = (p_pred.abs().max(dim=-1)[0] <= 1.0).float().detach()
+            error = torch.norm(p_pred - p_gt, dim=-1) * valid_mask
+            loss += error.sum() / valid_mask.sum()
+            
+        return loss / len(proj_pred)
+        
     def compute_loss(self, pred_depth, gt_depth, log_variance=None, mask=None):
         """
         Computes the loss for depth prediction based on L1 depth loss and multiscale gradient matching.
@@ -174,7 +215,7 @@ class midasNetConsistentModule(pl.LightningModule):
         - loss_info (dict): Detailed information about individual loss components
         """
         # Ensure valid mask for pixels with ground truth
-        valid_mask = ((gt_depth > 0) & (gt_depth <= 5)).float()
+        valid_mask = ((gt_depth > self.min_depth) & (gt_depth <= self.max_depth)).float().detach()
         M = valid_mask.sum()
 
         if log_variance is not None:
@@ -218,12 +259,14 @@ class midasNetConsistentModule(pl.LightningModule):
 
         return total_loss, loss_info
     
-    #TODO: also supervise reference depth?
     def _common_step(self, batch, batch_idx, stage="train"):
         #input_sparse_depth, input_image, rel_depth_pred, depth_gt, validity_map = batch
         tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp,_, ref_imgs, \
         ref_ga_depth, ref_interp, ref_gt_depth, _, tgt_pose, ref_pose, intrinsics = batch
 
+        #convert to 4x4 pose matrix from 3x4
+        
+        
         gt_depth = utils.inv2depth(tgt_gt_depth_inv)
         
         # if self.useConvGRU:
@@ -240,66 +283,50 @@ class midasNetConsistentModule(pl.LightningModule):
         #     total_loss = self.compute_exp_weighted_l1loss(metric_depth_pred, 
         #                                             gt_depth)
         # else:
-        depth_cost_map, refined_depth_inv, warping_vis = self.model(tgt_img, ref_imgs, tgt_ga_depth, ref_ga_depth, 
-                                    tgt_interp, ref_interp, tgt_pose, ref_pose, intrinsics)
+        refined_depth_inv, refined_target_pose, refined_ref_poses, warping_vis = self.model(tgt_img, ref_imgs,
+                                                                                            tgt_ga_depth, ref_ga_depth, 
+                                                                                            tgt_interp, ref_interp, tgt_pose, 
+                                                                                            ref_pose, intrinsics)
             
-        multiview_loss = depth_cost_map.mean()
-        loss,_ = self.compute_loss(utils.inv2depth(refined_depth_inv),
+        # 1. Depth L1 Loss
+        depth_loss,_ = self.compute_loss(utils.inv2depth(refined_depth_inv),
                                 gt_depth,
                                 log_variance=None,
                                 mask=None)
+        
+        # 2. Reprojection loss (global frame)
+        reproj_loss = self.compute_reproj_loss(
+            utils.inv2depth(refined_depth_inv), gt_depth,
+            refined_target_pose,  # Predicted target pose
+            tgt_pose,             # GT target pose
+            refined_ref_poses,    # Predicted reference poses
+            ref_pose,             # GT reference poses
+            intrinsics
+        )
+        
+        #pose regularization
+        # pose_reg = torch.norm(se3_log_map(refined_target_pose @ tgt_pose.inverse()))
+        # for refined_pose, gt_pose in zip(refined_ref_poses, ref_pose):
+        #     pose_reg += torch.norm(se3_log_map(refined_pose @ gt_pose.inverse()))
+    
         #total_loss = loss
         if self.current_epoch < 5:
-           total_loss = loss  #+ 0.5 * multiview_loss
+           total_loss = depth_loss
         else:
-           total_loss = loss + 0.01*multiview_loss
+           total_loss = depth_loss + 0.8 * reproj_loss #+ 0.01 * pose_reg
         
         #self.logger.experiment.add_scalar(f"{stage}_loss", loss, self.global_step)
-        self.log(f"{stage}/multiview_loss", multiview_loss, on_step=True, on_epoch=True, sync_dist=True)
-        self.log(f"{stage}/l1_depth_grad_loss", loss, on_step=True, on_epoch=True, sync_dist=True)
+        #self.log(f"{stage}/pose_reg_loss", pose_reg, on_step=True, on_epoch=True, sync_dist=True)
+        self.log(f"{stage}/reproj_loss", reproj_loss, on_step=True, on_epoch=True, sync_dist=True)
+        self.log(f"{stage}/l1_depth_loss", depth_loss, on_step=True, on_epoch=True, sync_dist=True)
         self.log(f"{stage}/total_loss", total_loss, on_step=True, on_epoch=True, sync_dist=True)
         
         with torch.no_grad():
             if batch_idx % 10 == 0:
-                # depth_gt_vis = gt_depth[0]
-
-                # if self.useConvGRU:
-                #     metric_pred_vis = metric_depth_pred[-1][0]
-                # else:
-                #     metric_pred_vis = metric_depth_inv_pred
-
-                # GA_pred = 1.0 / tgt_ga_depth[0]
-                # GA_pred[GA_pred == float("inf")] = 0
-                
-                self.log_warping(warping_vis, mode=stage)
-                
+                if len(warping_vis) > 0:
+                    self.log_warping(warping_vis, mode=stage)
                 self.log_img_tensorboard(tgt_img, gt_depth, utils.inv2depth(tgt_ga_depth).unsqueeze(0).permute(1,0,2,3), 
                                          utils.inv2depth(refined_depth_inv), batch_idx, self.current_epoch, mode=stage)
-                # def safe_normalize(tensor):
-                #     t_min = tensor.min()
-                #     t_range = tensor.max() - t_min
-                #     return (tensor - t_min) / t_range if t_range > 0 else tensor - t_min
-    
-                # t_gt = safe_normalize(depth_gt_vis)
-                # t_pred = safe_normalize(metric_pred_vis)
-                # t_ga = safe_normalize(GA_pred)
-            
-                # # t_gt = depth_gt_vis - depth_gt_vis.min()
-                # # t_gt = t_gt / t_gt.max()
-
-                # # t_pred = metric_pred_vis - metric_pred_vis.min()
-                # # t_pred = t_pred / t_pred.max()
-
-                # # t_ga = GA_pred - GA_pred.min()
-                # # t_ga = t_ga / t_ga.max()
-
-                # # Compute the error map (absolute difference)
-                # error_map = torch.abs(metric_pred_vis - depth_gt_vis)
-                # t_error = safe_normalize(error_map)
-                
-                # t = torch.concat([t_gt, t_ga.unsqueeze(0), t_pred, t_error], dim=0)
-                # self.log_img_tensorboard(tgt_img, t, batch_idx, self.current_epoch, mode=stage)
-            
         return {
             "loss": total_loss,
             "mode": stage,
