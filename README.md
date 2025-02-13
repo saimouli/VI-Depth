@@ -1,3 +1,7 @@
+```
+pip install pytorch-lightning==1.9.0 torch==1.13
+```
+
 # Monocular Visual-Inertial Depth Estimation
 
 This repository contains code and models for our paper:
