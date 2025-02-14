@@ -13,7 +13,7 @@ from metrics import rmse, mae, absrel, inv_rmse, inv_mae, inv_absrel
 import metrics
 from sklearn.decomposition import PCA
 from utils.camera import Camera
-import pypose as pp
+from pytorch3d.transforms import se3_exp_map, se3_log_map
 
 class midasNetConsistentModule(pl.LightningModule):
     def __init__(self, lr: float = 0.1, wd: float = 0.1, min_pred: float = 0.1, 
@@ -167,15 +167,16 @@ class midasNetConsistentModule(pl.LightningModule):
         #Loss = ||π(T_pred * X_pred) - π(T_gt * X_gt)||
         #where X_pred = π^-1(x, D_pred), X_gt = π^-1(x, D_gt)
         valid_depth_mask = ((depth_gt > self.min_depth) & (depth_gt <= self.max_depth)).float().detach()
-        #device = depth_pred.device
+        device = depth_pred.device
         B, _, H, W = depth_pred.shape
+        scale_factor = 1.0
         
         # Reconstruct 3D points using PREDICTED target pose and depth(global frame)
-        tgt_cam_pred = Camera(K=K, Twc=tgt_pose_pred)
+        tgt_cam_pred = Camera(K=K, Twc=tgt_pose_pred).scaled(scale_factor).to(device)
         points_pred_world = tgt_cam_pred.reconstruct(depth_pred*valid_depth_mask, frame='w')
         
         # Reconstruct GT points using GT target pose and depth (global frame)
-        tgt_cam_gt = Camera(K=K, Twc=tgt_pose_gt)
+        tgt_cam_gt = Camera(K=K, Twc=tgt_pose_gt).scaled(scale_factor).to(device)
         points_gt_world = tgt_cam_gt.reconstruct(depth_gt*valid_depth_mask, frame='w')
         
         # Project using PREDICTED reference poses (global frame)
@@ -195,9 +196,11 @@ class midasNetConsistentModule(pl.LightningModule):
         # Compute masked reprojection error
         loss = 0
         for p_pred, p_gt in zip(proj_pred, proj_gt):
-            valid_mask = (p_pred.abs().max(dim=-1)[0] <= 1.0).float().detach()
+            valid_mask = (p_pred.abs().max(dim=-1)[0] <= 1.0) & (p_gt.abs().max(dim=-1)[0] <= 1.0)
+            valid_mask = valid_mask.float().detach() * valid_depth_mask.squeeze(1)
+            
             error = torch.norm(p_pred - p_gt, dim=-1) * valid_mask
-            loss += error.sum() / valid_mask.sum()
+            loss += error.sum() / (valid_mask.sum() + 1e-6)
             
         return loss / len(proj_pred)
         

@@ -186,7 +186,11 @@ class Camera(nn.Module):
             return Xc
         # If in world frame of reference
         elif frame == 'w':
-            return self.Twc @ Xc
+            if not isinstance(self.Twc, Pose):  
+                return Pose(self.Twc) @ Xc  
+            else:  
+                return self.Twc @ Xc  
+
         # If none of the above
         else:
             raise ValueError('Unknown reference frame {}'.format(frame))
@@ -214,7 +218,10 @@ class Camera(nn.Module):
         if frame == 'c':
             Xc = self.K.bmm(X.view(B, 3, -1))
         elif frame == 'w':
-            Xc = self.K.bmm((self.Tcw.to(X.dtype) @ X).view(B, 3, -1))
+            if not isinstance(self.Twc, Pose):
+                Xc = self.K.bmm((Pose(self.Twc).to(X.dtype) @ X).view(B, 3, -1))
+            else:
+                Xc = self.K.bmm((self.Tcw.to(X.dtype) @ X).view(B, 3, -1))
         else:
             raise ValueError('Unknown reference frame {}'.format(frame))
 

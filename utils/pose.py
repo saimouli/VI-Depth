@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 
 def euler2mat(angle):
     """Convert euler angles to rotation matrix"""
@@ -243,3 +244,21 @@ class Pose:
                 raise ValueError('Unknown tensor dimensions {}'.format(other.shape))
         else:
             raise NotImplementedError()
+        
+        
+# #test quat2rot
+# import numpy as np
+# matrix = np.array([
+#     [0.9878559, -0.1388341, 0.0697565],
+#     [0.1551003,  0.9077532, -0.3897793],
+#     [-0.0092070,  0.3958650,  0.9182625]
+# ])
+
+# mat = torch.from_numpy(matrix).float()
+
+# from pytorch3d.transforms import matrix_to_quaternion as torch_m2q
+# quat = torch_m2q(mat) #[w, x, y, z]
+# print(quat)
+
+# quat_test = matrix_to_quaternion(mat)
+# print(quat_test)

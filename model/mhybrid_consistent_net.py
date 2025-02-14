@@ -11,9 +11,10 @@ import numpy as np
 import modules.midas.utils as utils
 import modules.midas.transforms as transforms
 from utils.camera import Camera
-import pypose as pp 
+#import pypose as pp 
 from utils.pose import Pose
 from functools import partial
+from pytorch3d.transforms import se3_exp_map, se3_log_map
 import torchvision
 #from modules.midas.blocks import OutputConv
 
@@ -227,12 +228,12 @@ class DepthPoseRefineNet(nn.Module):
         super().__init__()
         # Feature processing
         self.N_ref = N_ref
-        self.conv1 = Conv3x3(64, hidden_dim) # Features + warped features
-        self.conv2 = Conv3x3(hidden_dim, 64)
+        self.conv1 = Conv3x3(96, hidden_dim) # Features + warped features
+        self.conv2 = Conv3x3(hidden_dim, 96)
         
         # Depth scale head
         self.depth_head = nn.Sequential(
-            nn.Conv2d(64, 32, 1),
+            nn.Conv2d(96, 32, 1),
             nn.ReLU(True),
             nn.Conv2d(32, 1, 1),
             nn.ReLU(True)  # Keep scale positive
@@ -240,7 +241,7 @@ class DepthPoseRefineNet(nn.Module):
         
         # Pose refinement head 
         self.pose_head = nn.Sequential(
-            nn.Conv2d(64, 32, 1),
+            nn.Conv2d(96, 32, 1),
             nn.ReLU(True),
             nn.Conv2d(32, 6 * (1 + self.N_ref), 1)  # SE3 parameters
         )
@@ -288,6 +289,7 @@ class midasConsNet(nn.Module):
         
         self.contextLearner = MidasNet_small_cons_videpth(
             in_channels=2,
+            features=64,
             path=sml_model_path,
             min_pred=self.min_pred,
             max_pred=self.max_pred,
@@ -342,25 +344,32 @@ class midasConsNet(nn.Module):
         return inv_depth_pred
     
     #Convert initial poses to pyproj.LieTensor (4x4 SE3 matrices)
-    def pose3x4_to_se3(self,pose_3x4):
-        """Convert [B, 3, 4] pose to [B, 6] se3 LieTensor"""
-        rotation = pose_3x4[:, :, :3]
-        translation = pose_3x4[:, :, 3]
-        translation = translation.contiguous().view(-1, 3)
-        
-        quat = torch.linalg.matrix_to_quaternion(rotation)
-        so3_lie = pp.SO3(quat)
-        axis_angle = so3_lie.log()
-         
-        se3_pose = pp.SE3(torch.cat([translation, axis_angle], dim=-1))
-        return se3_pose  # [B, 6]
+    def pose3x4_to_se3(self, pose_3x4):
+        """
+        Convert [B, 3, 4] pose matrix to [B, 6] se3 parameters (translation + axis-angle).
+        """
+        # Extract rotation and translation from standard 3x4 pose matrix
+        rotation = pose_3x4[..., :3]  # [B, 3, 3]
+        translation = pose_3x4[..., 3]  # [B, 3]
+
+        # Build 4x4 matrix compatible with PyTorch3D's se3_log_map
+        batch_size = rotation.shape[0]
+        transform = torch.eye(4, device=rotation.device).repeat(batch_size, 1, 1)
+        transform[:, :3, :3] = rotation  # Upper-left 3x3 = rotation
+        transform[:, :3, 3] = 0.0        # Zero-out 4th column (PyTorch3D requirement)
+        transform[:, 3, :3] = translation  # Translation in 4th row[:3]
+
+        # Convert to se3 parameters (translation + axis-angle)
+        return se3_log_map(transform)  # [B, 6]
     
     # Convert back to 3x4 matrix format if needed
     def se3_to_pose3x4(self,se3_pose):
         """Convert pyproj.LieTensor to [B, 3, 4] pose matrix"""
-        transform_matrix = se3_pose.matrix()
-        pose_3x4 = transform_matrix[..., :3, :]
-        return pose_3x4
+        transform = se3_exp_map(se3_pose)   # [B, 4, 4]
+        rotation = transform[:, :3, :3]
+        translation = transform[:, 3, :3]
+        
+        return torch.cat([rotation, translation.unsqueeze(-1)], dim=-1)  # [B, 3, 4]
 
     def get_cost_each(self, tgt_pose, pose, fmap, fmap_ref, depth, K, scale_factor):
         """
@@ -430,6 +439,18 @@ class midasConsNet(nn.Module):
         
         return torch.stack(batch_inputs, dim=0)
     
+    def se3_update(self, current_se3, delta_se3):
+        """Update SE3 parameters using PyTorch3D's exponential map"""
+        # Convert to 4x4 transformation matrices
+        current_mat = se3_exp_map(current_se3)  # [B, 4, 4]
+        delta_mat = se3_exp_map(delta_se3)      # [B, 4, 4]
+        
+        # Compose transformations
+        updated_mat = delta_mat @ current_mat
+        
+        # Convert back to se3 parameters
+        return se3_log_map(updated_mat)  # [B, 6]
+    
     def forward(self, tgt_img, ref_imgs, tgt_ga_depth, ref_ga_depth, 
                 tgt_interp, ref_interp, tgt_pose, ref_pose, intrinsics):
         """
@@ -491,13 +512,13 @@ class midasConsNet(nn.Module):
             warped_feats_list, valid_mask_list = [], []
                  
             #process each reference view
-            for idx, (pose, fmap_r) in enumerate(zip(refined_ref_poses, ref_feats)):
-                pose_3x4 = self.se3_to_pose3x4(pose)
-                tgt_pose_3x4 = self.se3_to_pose3x4(refined_target_pose)
+            for idx, (se3_ref, fmap_r) in enumerate(zip(refined_ref_poses, ref_feats)):
+                pose_ref_3x4 = self.se3_to_pose3x4(se3_ref)
+                pose_tgt_3x4 = self.se3_to_pose3x4(refined_target_pose)
 
                 result = self.get_cost_each(
-                    tgt_pose_3x4, 
-                    pose_3x4, 
+                    pose_tgt_3x4, 
+                    pose_ref_3x4, 
                     tgt_feats, 
                     fmap_r, 
                     utils.inv2depth(refined_inv_depth), 
@@ -517,24 +538,23 @@ class midasConsNet(nn.Module):
                     })
                     
             aggregated_warped_feats = torch.cat(warped_feats_list, dim=1)
-            
             # Predict refinements
-            delta_scale, delta_pose_tgt, *delta_pose_ref = self.refine_net(
+            delta_scale, delta_pose_tgt, delta_pose_ref = self.refine_net(
                 tgt_feats, 
                 aggregated_warped_feats)
                     
             #update target pose
-            delta_pose_tgt_lie = pp.LieTensor(delta_pose_tgt, ltype=pp.se3_type)
-            refined_target_pose = delta_pose_tgt_lie.Exp() @ refined_target_pose
+            refined_target_pose = self.se3_update(refined_target_pose, delta_pose_tgt)
                     
-            # Update reference poses (SE3)
+            # Update reference poses
             refined_ref_poses = [
-                pp.LieTensor(delta, ltype=pp.se3_type).Exp() @ pose
-                for delta, pose in zip(delta_pose_ref, refined_ref_poses)
+                self.se3_update(pose, delta)
+                for pose, delta in zip(refined_ref_poses, delta_pose_ref)
             ]
                     
             # Update depth
             refined_inv_depth = refined_inv_depth * delta_scale
+            
             #clamp depth
             if self.min_pred is not None and self.max_pred is not None:
                 refined_inv_depth = torch.clamp(

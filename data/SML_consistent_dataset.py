@@ -1,11 +1,11 @@
+import sys
 import numpy as np
 import torch.utils.data
 import os
-import sys
-module_path = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+module_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../modules"))
 if module_path not in sys.path:
     sys.path.append(module_path)
-import modules.midas.utils as utils
+import midas.utils as utils
 from PIL import Image
 #from path import Path
 from pathlib import Path
@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 from utils.camera import Camera
 import torch.nn.functional as F
 from torch.utils.data import Dataset
+from pytorch3d.transforms import se3_exp_map, se3_log_map
 
 def load_input_image(input_image_fp):
     return utils.read_image(input_image_fp)
@@ -142,7 +143,52 @@ class SML_consistent_dataset(Dataset):
                 sequence_set.append(sample)
 
         self.samples = sequence_set
+    
+    def data_augment(img):
+        random_gamma = np.random.uniform(0.9, 1.1)
+        random_brightness = np.random.uniform(0.8, 1.2)
+        random_colors = np.random.uniform(0.8, 1.2, [3])
 
+        img = 255.0 * ((img / 255.0) ** random_gamma)
+        img *= random_brightness
+        img *= np.reshape(random_colors, [1, 3, 1, 1])
+        img = np.clip(img, 0.0, 255.0).astype(np.uint8)
+        return img
+
+    # Add SE(3) perturbations (mimic VIO drift)
+    def add_perturbation(pose, max_trans=0.03, max_rot_deg=2.0):
+        """Add random SE(3) perturbation to pose (3x4 numpy array)"""
+        # Convert to 4x4 matrix [R|t; 0|1]
+        pose_mat = torch.eye(4)
+        pose_mat[:3, :4] = pose  # [3,4] -> [4,4] with bottom row [0,0,0,1]
+        
+        # Generate random SE(3) perturbation parameters
+        # Translation: random direction with magnitude between 0-3cm
+        trans_mag = torch.rand(1) * max_trans  # [0, 0.03]
+        trans_dir = torch.randn(3)
+        trans_dir /= torch.norm(trans_dir)  # random unit vector
+        translation = trans_dir * trans_mag
+        
+        # Rotation: random axis with angle between 0-2 degrees
+        # In reality for VIO only the yaw angle drifts significantly
+        rot_deg = torch.rand(1) * max_rot_deg  # [0, 2]
+        rot_rad = torch.deg2rad(rot_deg)
+        axis = torch.randn(3)
+        axis /= torch.norm(axis)  # random unit axis
+        rotation = axis * rot_rad
+        
+        # Combine into 6D se3 vector [translation, rotation]
+        se3_params = torch.cat([translation, rotation])  # [6]
+        
+        # Convert to perturbation matrix
+        perturb_mat = se3_exp_map(se3_params.unsqueeze(0))[0]  # [4,4]
+        
+        # Apply perturbation in LOCAL frame: T_new = T_original @ perturb_mat
+        perturbed_mat = torch.matmul(pose_mat, perturb_mat)
+        
+        # Convert back to 3x4
+        return perturbed_mat[:3, :4]
+    
     def __getitem__(self, index):
         sample = self.samples[index]
         tgt_img = load_input_image(str(sample['tgt_img']))
@@ -173,6 +219,7 @@ class SML_consistent_dataset(Dataset):
             ]
         ]
         
+        
         #convert ref_img, ref_pose, ref_interp, intrinsics tensor to float 32
         ref_img, ref_ga_depth, ref_interp, ref_gt_depth, ref_sparse_depth, ref_pose, intrinsics = [
             [torch.from_numpy(item).float() if isinstance(item, np.ndarray) else item for item in T]
@@ -180,9 +227,13 @@ class SML_consistent_dataset(Dataset):
             for T in [ref_img, ref_ga_depth, ref_interp, ref_gt_depth, ref_sparse_depth, ref_pose, intrinsics]
         ]
         
+        tgt_pose_perturbed = self.add_perturbation(tgt_pose)
+        ref_pose_perturbed = [self.add_perturbation(p) for p in ref_pose]
+        
         #img, gt_depth, ga_depth, interp_scale
         return tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, tgt_sparse_depth, ref_img, \
-            ref_ga_depth, ref_interp, ref_gt_depth, ref_sparse_depth, tgt_pose, ref_pose, intrinsics
+            ref_ga_depth, ref_interp, ref_gt_depth, ref_sparse_depth, tgt_pose, ref_pose, intrinsics, \
+            tgt_pose_perturbed, ref_pose_perturbed
     
     def __len__(self):
         return len(self.samples)
