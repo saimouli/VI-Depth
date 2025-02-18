@@ -247,6 +247,7 @@ class midasConsNet(nn.Module):
         
         self.contextLearner = MidasNet_small_cons_videpth(
             in_channels=2,
+            features=32,
             path=sml_model_path,
             min_pred=self.min_pred,
             max_pred=self.max_pred,
@@ -275,7 +276,7 @@ class midasConsNet(nn.Module):
                                                             max_pred=self.max_pred)
             
         else:
-            self.scaleOutput = OutputScaleConv(features=64, groups=1, activation=nn.ReLU(False), non_negative=False)
+            self.scaleOutput = OutputScaleConv(features=32, groups=1, activation=nn.ReLU(False), non_negative=False)
         
     def upsample_depth(self, depth, mask, ratio):
         """ Upsample depth field [H/ratio, W/ratio, 2] -> [H, W, 2] using convex combination """
@@ -448,12 +449,12 @@ class midasConsNet(nn.Module):
                 )  
                 
             #apply scale to depth before computing cost
-            #depth_cost_map = None; warping_vis = None
-            tgt_pose = tgt_pose.detach()
-            ref_pose = [pose.detach() for pose in ref_pose]
-            depth_cost_map, warping_vis = self.depth_cost_calc(inv_depth_pred, tgt_feats, ref_feats, 
-                                                  pose_list=ref_pose, tgt_pose=tgt_pose,
-                                                  K=intrinsics, scale_factor=1.0/scale_factor)
+            depth_cost_map = None; warping_vis = None
+            # tgt_pose = tgt_pose.detach()
+            # ref_pose = [pose.detach() for pose in ref_pose]
+            # depth_cost_map, warping_vis = self.depth_cost_calc(inv_depth_pred, tgt_feats, ref_feats, 
+            #                                       pose_list=ref_pose, tgt_pose=tgt_pose,
+            #                                       K=intrinsics, scale_factor=1.0/scale_factor)
             
             
             # refined_depth_inv = self.upsample_depth(

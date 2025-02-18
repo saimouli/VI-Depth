@@ -243,7 +243,7 @@ class midasNetConsistentModule(pl.LightningModule):
         depth_cost_map, refined_depth_inv, warping_vis = self.model(tgt_img, ref_imgs, tgt_ga_depth, ref_ga_depth, 
                                     tgt_interp, ref_interp, tgt_pose, ref_pose, intrinsics)
             
-        multiview_loss = depth_cost_map.mean()
+        #multiview_loss = depth_cost_map.mean()
         loss,_ = self.compute_loss(utils.inv2depth(refined_depth_inv),
                                 gt_depth,
                                 log_variance=None,
@@ -252,10 +252,10 @@ class midasNetConsistentModule(pl.LightningModule):
         if self.current_epoch < 5:
            total_loss = loss  #+ 0.5 * multiview_loss
         else:
-           total_loss = loss + 0.01*multiview_loss
+           total_loss = loss #+ 0.01*multiview_loss
         
         #self.logger.experiment.add_scalar(f"{stage}_loss", loss, self.global_step)
-        self.log(f"{stage}/multiview_loss", multiview_loss, on_step=True, on_epoch=True, sync_dist=True)
+        #self.log(f"{stage}/multiview_loss", multiview_loss, on_step=True, on_epoch=True, sync_dist=True)
         self.log(f"{stage}/l1_depth_grad_loss", loss, on_step=True, on_epoch=True, sync_dist=True)
         self.log(f"{stage}/total_loss", total_loss, on_step=True, on_epoch=True, sync_dist=True)
         
@@ -271,7 +271,7 @@ class midasNetConsistentModule(pl.LightningModule):
                 # GA_pred = 1.0 / tgt_ga_depth[0]
                 # GA_pred[GA_pred == float("inf")] = 0
                 
-                self.log_warping(warping_vis, mode=stage)
+                #self.log_warping(warping_vis, mode=stage)
                 
                 self.log_img_tensorboard(tgt_img, gt_depth, utils.inv2depth(tgt_ga_depth).unsqueeze(0).permute(1,0,2,3), 
                                          utils.inv2depth(refined_depth_inv), batch_idx, self.current_epoch, mode=stage)
