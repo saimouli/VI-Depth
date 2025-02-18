@@ -236,14 +236,14 @@ class DepthPoseRefineNet(nn.Module):
             nn.Conv2d(96, 32, 1),
             nn.ReLU(True),
             nn.Conv2d(32, 1, 1),
-            nn.ReLU(True)  # Keep scale positive
+            nn.Softplus() #nn.ReLU(True)  # Keep scale positive
         )
         
         # Pose refinement head 
         self.pose_head = nn.Sequential(
-            nn.Conv2d(96, 128, 3),
+            nn.Conv2d(96, 128, 3, padding=1),
             nn.ReLU(True),
-            nn.Conv2d(128, 6 * self.N_ref, 1)  # SE3 parameters
+            nn.Conv2d(128, 6 * self.N_ref + 1, 1)  # SE3 parameters +1 for spatial attention
         )
         
     def forward(self, tgt_feat, warped_feat):
@@ -253,8 +253,13 @@ class DepthPoseRefineNet(nn.Module):
         x = F.relu(self.conv2(x))
         
         # Predict depth scale and pose updates
-        depth_scale = F.relu(1.0 + self.depth_head(x))  # 1 + delta for stability
-        pose_updates = self.pose_head(x).mean(dim=(2, 3))
+        depth_scale = 1.0 + 0.1 * self.depth_head(x) #F.relu(1.0 + self.depth_head(x))  # 1 + delta for stability
+        
+        # Pose updates with spatial attention
+        pose_feats = self.pose_head(x)
+        attention = torch.softmax(pose_feats[:, -1:, ...], dim=1)  # [B, 1, H, W]
+        pose_updates = (pose_feats[:, :-1, ...] * attention).mean(dim=(2, 3))
+        #pose_updates = self.pose_head(x).mean(dim=(2, 3))
         
         # Split into target and reference residuals
         delta_pose_ref = pose_updates.view(-1, self.N_ref, 6) #[B, N_ref, 6]
@@ -286,6 +291,7 @@ class midasConsNet(nn.Module):
         )
         for param in self.FeatExtractor.parameters():
             param.requires_grad = False
+        self.FeatExtractor.eval()
         
         self.contextLearner = MidasNet_small_cons_videpth(
             in_channels=2,
@@ -394,8 +400,7 @@ class midasConsNet(nn.Module):
         fmap_warped = F.grid_sample(fmap_ref, ref_coords, 
                                     mode='bilinear', padding_mode='zeros', align_corners=True) # (b, c, h, w)
         
-        cost = (fmap - fmap_warped)**2
-        cost = cost * valid_mask.unsqueeze(1) 
+        cost = (fmap - fmap_warped)**2 * valid_mask.unsqueeze(1) #cost = (fmap * fmap_warped).sum(dim=1, keepdim=True) #try correlation
         cost = cost.mean(dim=1, keepdim=True)
 
         return {
@@ -481,7 +486,7 @@ class midasConsNet(nn.Module):
         
         # Step 3: Refine depth and pose
         scale_map = self.scaleOutput(context_feats)
-        delta_scales = 1.0 + 0.1 * scale_map #F.relu(1.0 + scale_map)  # Ensure scale is positive
+        delta_scales = F.relu(1.0 + scale_map)  # Ensure scale is positive
         inv_depth_pred = init_metric_depth_inv * delta_scales
             
         if self.min_pred is not None and self.max_pred is not None:

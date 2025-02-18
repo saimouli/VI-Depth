@@ -405,7 +405,7 @@ class midasNetConsistentModule(pl.LightningModule):
         
         # 2. Reprojection loss
         reproj_loss = self.compute_reproj_loss(
-            utils.inv2depth(refined_depth_inv), gt_depth,
+            gt_depth, gt_depth,
             refined_target_pose,  # Predicted target pose
             tgt_pose,             # GT target pose
             refined_ref_poses,    # Predicted reference poses
