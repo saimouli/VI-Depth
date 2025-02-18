@@ -78,9 +78,10 @@ class ErrorMetrics_DDP:
         """Compute pose errors between predicted and ground truth poses."""
         if pose_pred is None or pose_gt is None:
             # Handle empty pose case (matches non-DDP initialization)
-            device = pose_pred.device if pose_pred is not None else pose_gt.device
+            device = pose_pred.device if pose_pred is not None else 'cpu'
             self.trans_rmse = torch.tensor(np.inf, device=device)
             self.rot_rmse = torch.tensor(np.inf, device=device)
+            return
         # Relative pose error
         rel_pose = torch.inverse(pose_pred) @ pose_gt
 
@@ -139,6 +140,17 @@ class ErrorMetricsAverager_DDP:
             self.total_pose_count += 1
             self.trans_rmse_sum += error_metrics.trans_rmse.detach().to(self.device)
             self.rot_rmse_sum += error_metrics.rot_rmse.detach().to(self.device)
+    
+    def get_pose_metrics(self):
+        total_pose_count = self.all_gather(self.total_pose_count.detach()).sum()
+        trans_rmse_sum = self.all_gather(self.trans_rmse_sum.detach()).sum()
+        rot_rmse_sum = self.all_gather(self.rot_rmse_sum.detach()).sum()
+        
+        return {
+            'trans_rmse': trans_rmse_sum / total_pose_count if total_pose_count > 0 else torch.tensor(np.inf),
+            'rot_rmse': rot_rmse_sum / total_pose_count if total_pose_count > 0 else torch.tensor(np.inf),
+            'total_pose_count': total_pose_count
+        }
         
     def get_metrics(self):
         """Return synchronized metrics as a dictionary"""
@@ -150,8 +162,6 @@ class ErrorMetricsAverager_DDP:
         inv_mae_sum = self.all_gather(self.inv_mae_sum.detach()).sum()
         inv_absrel_sum = self.all_gather(self.inv_absrel_sum.detach()).sum()
         total_count = self.all_gather(self.total_count.detach()).sum()
-        trans_rmse_sum = self.all_gather(self.trans_rmse_sum.detach()).sum()
-        rot_rmse_sum = self.all_gather(self.rot_rmse_sum.detach()).sum()
 
         # Handle edge case with no valid batches (matches non-DDP)
         if total_count == 0:
@@ -174,9 +184,7 @@ class ErrorMetricsAverager_DDP:
             'inv_rmse': inv_rmse_sum / total_count,
             'inv_mae': inv_mae_sum / total_count,
             'inv_absrel': inv_absrel_sum / total_count,
-            'trans_rmse': trans_rmse_sum / total_count,
-            'rot_rmse': rot_rmse_sum / total_count,
-            'total_count': total_count
+            'total_count': total_count,
         }
 
     def all_gather(self, tensor):

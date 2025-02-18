@@ -68,7 +68,7 @@ class midasNetConsistentModule(pl.LightningModule):
         # Get synchronized metrics
         ga_metrics = self.avg_error_w_int_depth.get_metrics()
         pred_metrics = self.avg_error_w_pred.get_metrics()
-        pose_metrics = self.avg_error_pose_pred.get_metrics()
+        pose_metrics = self.avg_error_pose_pred.get_pose_metrics()
         
         # Only log from main process
         if self.trainer.is_global_zero:
@@ -123,13 +123,12 @@ class midasNetConsistentModule(pl.LightningModule):
             pred_metrics.compute(pred, tgt_gt, valid_mask)
             self.avg_error_w_pred.accumulate(pred_metrics)
             
-            pose_errors = []
-            for j in range(len(ref_pred_poses)):
-                pose_metrics = metrics.ErrorMetrics_DDP()
-                pose_metrics.compute_pose(ref_pred_poses[j][i], ref_gt_poses[j][i])
-                pose_errors.append(pose_metrics)
+            for ref_idx in range(len(ref_pred_poses)):
+                pred_pose = ref_pred_poses[ref_idx][i]
+                gt_pose = ref_gt_poses[ref_idx][i]
                 
-                # Accumulate pose errors
+                pose_metrics = metrics.ErrorMetrics_DDP()
+                pose_metrics.compute_pose(pred_pose, gt_pose)
                 self.avg_error_pose_pred.accumulate_pose(pose_metrics)
                         
         return loss
