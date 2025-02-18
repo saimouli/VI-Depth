@@ -28,6 +28,10 @@ class ErrorMetrics_DDP:
         self.inv_rmse = None
         self.inv_mae = None
         self.inv_absrel = None
+        
+        self.trans_rmse = None
+        self.rot_rmse = None
+        
 
     def compute(self, estimate: torch.Tensor, target: torch.Tensor, valid_mask: torch.Tensor):
         """Compute metrics using PyTorch tensors directly (inputs: inverse depth 1/m)"""
@@ -69,6 +73,26 @@ class ErrorMetrics_DDP:
         self.inv_rmse = irmse(0.001 * valid_estimate_depth, 0.001 * valid_target_depth)
         self.inv_mae = imae(0.001 * valid_estimate_depth, 0.001 * valid_target_depth)
         self.inv_absrel = iabsrel(0.001 * valid_estimate_depth, 0.001 * valid_target_depth)
+        
+    def compute_pose(self, pose_pred, pose_gt):
+        """Compute pose errors between predicted and ground truth poses."""
+        if pose_pred is None or pose_gt is None:
+            # Handle empty pose case (matches non-DDP initialization)
+            device = pose_pred.device if pose_pred is not None else pose_gt.device
+            self.trans_rmse = torch.tensor(np.inf, device=device)
+            self.rot_rmse = torch.tensor(np.inf, device=device)
+        # Relative pose error
+        rel_pose = torch.inverse(pose_pred) @ pose_gt
+
+        # Translation error (meters)
+        trans_error = torch.norm(rel_pose[:3, 3])
+        self.trans_rmse = trans_error
+
+        # Rotation error (degrees)
+        trace = torch.trace(rel_pose[:3, :3])
+        cos_theta = torch.clamp((trace - 1) / 2, -1.0, 1.0)
+        rot_error = torch.acos(cos_theta) * 180 / torch.pi
+        self.rot_rmse = rot_error
 
 class ErrorMetricsAverager_DDP:
     def __init__(self, device):
@@ -80,6 +104,10 @@ class ErrorMetricsAverager_DDP:
         self.inv_mae_sum = torch.tensor(0.0, device=device)
         self.inv_absrel_sum = torch.tensor(0.0, device=device)
         self.total_count = torch.tensor(0, device=device)
+        self.total_pose_count = torch.tensor(0, device=device)
+        
+        self.trans_rmse_sum = torch.tensor(0.0, device=device)
+        self.rot_rmse_sum = torch.tensor(0.0, device=device)
 
     def reset(self):
         """Reset all accumulators while maintaining device placement"""
@@ -90,6 +118,9 @@ class ErrorMetricsAverager_DDP:
         self.inv_mae_sum.zero_()
         self.inv_absrel_sum.zero_()
         self.total_count.zero_()
+        self.total_pose_count.zero_()
+        self.trans_rmse_sum.zero_()
+        self.rot_rmse_sum.zero_()
 
     def accumulate(self, error_metrics):
         """Accumulate metrics from a single ErrorMetrics_DDP instance"""
@@ -103,6 +134,12 @@ class ErrorMetricsAverager_DDP:
             self.inv_absrel_sum += error_metrics.inv_absrel.detach().to(self.device)
             self.total_count += 1
 
+    def accumulate_pose(self, error_metrics):
+        if not torch.isinf(error_metrics.trans_rmse):
+            self.total_pose_count += 1
+            self.trans_rmse_sum += error_metrics.trans_rmse.detach().to(self.device)
+            self.rot_rmse_sum += error_metrics.rot_rmse.detach().to(self.device)
+        
     def get_metrics(self):
         """Return synchronized metrics as a dictionary"""
         # Gather results from all processes
@@ -113,6 +150,8 @@ class ErrorMetricsAverager_DDP:
         inv_mae_sum = self.all_gather(self.inv_mae_sum.detach()).sum()
         inv_absrel_sum = self.all_gather(self.inv_absrel_sum.detach()).sum()
         total_count = self.all_gather(self.total_count.detach()).sum()
+        trans_rmse_sum = self.all_gather(self.trans_rmse_sum.detach()).sum()
+        rot_rmse_sum = self.all_gather(self.rot_rmse_sum.detach()).sum()
 
         # Handle edge case with no valid batches (matches non-DDP)
         if total_count == 0:
@@ -123,6 +162,8 @@ class ErrorMetricsAverager_DDP:
                 'inv_rmse': torch.tensor(np.inf, device=self.device),
                 'inv_mae': torch.tensor(np.inf, device=self.device),
                 'inv_absrel': torch.tensor(np.inf, device=self.device),
+                'trans_rmse': torch.tensor(np.inf, device=self.device),
+                'rot_rmse': torch.tensor(np.inf, device=self.device),
                 'total_count': total_count
             }
 
@@ -133,6 +174,8 @@ class ErrorMetricsAverager_DDP:
             'inv_rmse': inv_rmse_sum / total_count,
             'inv_mae': inv_mae_sum / total_count,
             'inv_absrel': inv_absrel_sum / total_count,
+            'trans_rmse': trans_rmse_sum / total_count,
+            'rot_rmse': rot_rmse_sum / total_count,
             'total_count': total_count
         }
 

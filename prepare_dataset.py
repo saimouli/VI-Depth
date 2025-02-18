@@ -133,7 +133,14 @@ def save_priors(data_dir):
             #     break
             #test = 0
         # for list in image_folder read the image and sparse depth from respective folders
-        
+
+def rotation_angle(R1, R2):
+    """Compute the angle (in degrees) between two rotation matrices using trace."""
+    R = R1 @ R2.T  # Relative rotation
+    cos_theta = (np.trace(R) - 1) / 2
+    cos_theta = np.clip(cos_theta, -1, 1)  # Numerical stability
+    return np.degrees(np.arccos(cos_theta))  # Convert to degrees
+ 
 def create_frame_index(data_dir):
     # Creates frame that has motion > 0.1 cm
     import os
@@ -156,16 +163,19 @@ def create_frame_index(data_dir):
         index = [0]; frame_names = [images[0]]
         for idx in range(1, len(images)):
 
-            frame1 = cv2.imread(images_path[index[-1]])
-            frame2 = cv2.imread(images_path[idx])
+            #frame1 = cv2.imread(images_path[index[-1]])
+            #frame2 = cv2.imread(images_path[idx])
 
             pose1 = np.loadtxt(pose_path[index[-1]])
             pose2 = np.loadtxt(pose_path[idx])
 
-            #if pose movement is > 0.1cm
-            # pose_diff = np.linalg.norm(pose1[:3, 3] - pose2[:3, 3])
-            # if pose_diff < 0.1:
-            #     continue
+            #if pose movement is > 0.1m?
+            pose_diff = np.linalg.norm(pose1[:3, 3] - pose2[:3, 3])
+            R1, R2 = pose1[:3, :3], pose2[:3, :3]
+            rot_angle = rotation_angle(R1, R2)
+            
+            if pose_diff < 0.1 and rot_angle < 6:
+                continue
             index.append(idx)
             frame_names.append(images[idx])
 
@@ -176,7 +186,7 @@ def create_frame_index(data_dir):
 
 
 if __name__ == "__main__":
-    data_dir = "/media/saimouli/Data6T/datasets/VOID_150/testing" #"/media/saimouli/RPNG_FLASH_4/datasets/VOID_150/training"
+    data_dir = "/media/saimouli/Data6T/datasets/VOID_150_test/training" #"/media/saimouli/RPNG_FLASH_4/datasets/VOID_150/training"
     # save_priors(data_dir)
 
     create_frame_index(data_dir)

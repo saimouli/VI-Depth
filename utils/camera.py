@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from utils.pose import Pose
+from pytorch3d.transforms import se3_exp_map, se3_log_map
 
 def scale_intrinsics(K, x_scale, y_scale):
     """Scale intrinsics given x_scale and y_scale factors"""
@@ -74,6 +75,60 @@ def image_grid(B, H, W, dtype, device, normalized=False):
     grid = torch.stack([xs, ys, ones], dim=1)
     return grid
 
+#Convert initial poses to pyproj.LieTensor (4x4 SE3 matrices)
+def pose_to_se3(pose):
+    """
+    Convert [B, 4, 4] pose matrix to [B, 6] se3 parameters (translation + axis-angle).
+    Note: pytorch takes [R 0;T 1] format
+    """
+    # Extract rotation and translation from standard 3x4 pose matrix
+    rotation = pose[:,:3, :3]  # [B, 3, 3]
+    translation = pose[:,:3,3]  # [B, 3]
+
+    # Build 4x4 matrix compatible with PyTorch3D's se3_log_map
+    batch_size = rotation.shape[0]
+    transform = torch.eye(4, device=rotation.device).repeat(batch_size, 1, 1)
+    transform[:, :3, :3] = rotation  # Upper-left 3x3 = rotation
+    transform[:, :3, 3] = 0.0        # Zero-out 4th column (PyTorch3D requirement)
+    transform[:, 3, :3] = translation  # Translation in 4th row[:3]
+
+    # Convert to se3 parameters (translation + axis-angle)
+    return se3_log_map(transform)  # [B, 6]
+    
+# Convert back to 3x4 matrix format if needed
+def se3_to_pose(se3_pose):
+    """Convert pyproj.LieTensor to [B, 3, 4] pose matrix"""
+    transform = se3_exp_map(se3_pose)   # [B, 4, 4]
+    rotation = transform[:, :3, :3]
+    translation = transform[:, 3, :3]
+        
+    bottom_row = torch.tensor([0, 0, 0, 1], 
+                            device=rotation.device, dtype=rotation.dtype).repeat(rotation.shape[0], 1, 1)
+    mat = torch.cat([torch.cat([rotation, translation.unsqueeze(-1)], dim=-1), bottom_row], dim=1)
+    return mat  # [B, 4, 4]
+
+def se3_update(current_se3, delta_se3):
+    """Update SE3 parameters using PyTorch3D's exponential map"""
+    # Convert to 4x4 transformation matrices
+    current_mat = se3_exp_map(current_se3)  # [B, 4, 4]
+    delta_mat = se3_exp_map(delta_se3)      # [B, 4, 4]
+        
+    # Rearrange PyTorch3D format [R 0; T 1] to standard format [R T; 0 1]
+    current_mat_standard = current_mat.clone()
+    current_mat_standard[:, :3, 3] = current_mat[:, 3, :3]  # Move translation to correct position
+    current_mat_standard[:, 3, :3] = 0  # Ensure bottom row is [0, 0, 0, 1]
+        
+    delta_mat_standard = delta_mat.clone()
+    delta_mat_standard[:, :3, 3] = delta_mat[:, 3, :3]  # Move translation to correct position
+    delta_mat_standard[:, 3, :3] = 0  # Ensure bottom row is [0, 0, 0, 1]
+        
+    # Compose transformations in standard format
+    #Apply update: new_T = delta_T * T  (left multiplication)
+    updated_mat = delta_mat_standard @ current_mat_standard
+        
+    # Convert back to se3 parameters
+    return pose_to_se3(updated_mat)  # [B, 6]
+    
 class Camera(nn.Module):
     def __init__(self, K, Twc=None):
         super().__init__()
@@ -218,8 +273,8 @@ class Camera(nn.Module):
         if frame == 'c':
             Xc = self.K.bmm(X.view(B, 3, -1))
         elif frame == 'w':
-            if not isinstance(self.Twc, Pose):
-                Xc = self.K.bmm((Pose(self.Twc).to(X.dtype) @ X).view(B, 3, -1))
+            if not isinstance(self.Tcw, Pose):
+                Xc = self.K.bmm((Pose(self.Tcw).to(X.dtype) @ X).view(B, 3, -1))
             else:
                 Xc = self.K.bmm((self.Tcw.to(X.dtype) @ X).view(B, 3, -1))
         else:

@@ -39,11 +39,13 @@ class midasNetConsistentModule(pl.LightningModule):
         """Ensure that metric averaging uses the correct device after model initialization."""
         self.avg_error_w_int_depth = metrics.ErrorMetricsAverager_DDP(self.device)
         self.avg_error_w_pred = metrics.ErrorMetricsAverager_DDP(self.device)
+        self.avg_error_pose_pred = metrics.ErrorMetricsAverager_DDP(self.device)
 
     def on_validation_start(self):
         self.avg_error_w_int_depth = metrics.ErrorMetricsAverager_DDP(self.device)
         self.avg_error_w_pred = metrics.ErrorMetricsAverager_DDP(self.device)
-          
+        self.avg_error_pose_pred = metrics.ErrorMetricsAverager_DDP(self.device)
+        
     def load_from_pth(self, file_path):
         state_dict = torch.load(file_path, map_location=self.device)
         self.load_state_dict(state_dict)
@@ -66,18 +68,22 @@ class midasNetConsistentModule(pl.LightningModule):
         # Get synchronized metrics
         ga_metrics = self.avg_error_w_int_depth.get_metrics()
         pred_metrics = self.avg_error_w_pred.get_metrics()
+        pose_metrics = self.avg_error_pose_pred.get_metrics()
         
         # Only log from main process
         if self.trainer.is_global_zero:
             table = (
                 "Metric                | GA Depth (mm) | Predicted Depth (mm)\n"
-                "----------------------|---------------|--------------------\n"
+                "----------------------|---------------|----------------------\n"
                 f"RMSE                 | {ga_metrics['rmse']:.4f} | {pred_metrics['rmse']:.4f}\n"
                 f"MAE                  | {ga_metrics['mae']:.4f} | {pred_metrics['mae']:.4f}\n"
                 f"AbsRel               | {ga_metrics['absrel']:.4f} | {pred_metrics['absrel']:.4f}\n"
                 f"Inv RMSE (1/km)      | {ga_metrics['inv_rmse']:.4f} | {pred_metrics['inv_rmse']:.4f}\n"
                 f"Inv MAE (1/km)       | {ga_metrics['inv_mae']:.4f} | {pred_metrics['inv_mae']:.4f}\n"
-                f"Inv AbsRel (1/km)    | {ga_metrics['inv_absrel']:.4f} | {pred_metrics['inv_absrel']:.4f}"
+                f"Inv AbsRel (1/km)    | {ga_metrics['inv_absrel']:.4f} | {pred_metrics['inv_absrel']:.4f}\n"  # Fixed newline
+                "----------------------|---------------|----------------------\n"
+                f"Trans RMSE (m)       | -             | {pose_metrics['trans_rmse']:.4f}\n"
+                f"Rot RMSE (deg)       | -             | {pose_metrics['rot_rmse']:.4f}"
             )
 
             self.logger.experiment.add_text(
@@ -90,12 +96,15 @@ class midasNetConsistentModule(pl.LightningModule):
         # Reset accumulators for next epoch
         self.avg_error_w_int_depth.reset()
         self.avg_error_w_pred.reset()
+        self.avg_error_pose_pred.reset()
         
     def validation_step(self, batch, batch_idx):
         loss = self._common_step(batch, batch_idx, stage="val")
         pred_depth = loss["pred_depth"]  # (B, H, W)
         gt_depth = loss["gt_depth"]      # (B, H, W)
         ga_depth = loss["ga_depth"]      # (B, H, W)
+        ref_gt_poses = loss["ref_gt_poses"]
+        ref_pred_poses = loss["ref_pred_poses"]
         
         batch_size = pred_depth.shape[0]
         max_depth, min_depth = self.max_depth, self.min_depth
@@ -114,36 +123,16 @@ class midasNetConsistentModule(pl.LightningModule):
             pred_metrics.compute(pred, tgt_gt, valid_mask)
             self.avg_error_w_pred.accumulate(pred_metrics)
             
+            pose_errors = []
+            for j in range(len(ref_pred_poses)):
+                pose_metrics = metrics.ErrorMetrics_DDP()
+                pose_metrics.compute_pose(ref_pred_poses[j][i], ref_gt_poses[j][i])
+                pose_errors.append(pose_metrics)
+                
+                # Accumulate pose errors
+                self.avg_error_pose_pred.accumulate_pose(pose_metrics)
+                        
         return loss
-
-    def validation_epoch_end(self, outputs):
-        # Get synchronized metrics
-        ga_metrics = self.avg_error_w_int_depth.get_metrics()
-        pred_metrics = self.avg_error_w_pred.get_metrics()
-        
-        # Only log from main process
-        if self.trainer.is_global_zero:
-            table = (
-                "Metric                | GA Depth (mm) | Predicted Depth (mm)\n"
-                "----------------------|---------------|--------------------\n"
-                f"RMSE                 | {ga_metrics['rmse']:.4f} | {pred_metrics['rmse']:.4f}\n"
-                f"MAE                  | {ga_metrics['mae']:.4f} | {pred_metrics['mae']:.4f}\n"
-                f"AbsRel               | {ga_metrics['absrel']:.4f} | {pred_metrics['absrel']:.4f}\n"
-                f"Inv RMSE (1/km)      | {ga_metrics['inv_rmse']:.4f} | {pred_metrics['inv_rmse']:.4f}\n"
-                f"Inv MAE (1/km)       | {ga_metrics['inv_mae']:.4f} | {pred_metrics['inv_mae']:.4f}\n"
-                f"Inv AbsRel (1/km)    | {ga_metrics['inv_absrel']:.4f} | {pred_metrics['inv_absrel']:.4f}"
-            )
-
-            self.logger.experiment.add_text(
-                "Validation Metrics", 
-                table, 
-                global_step=self.global_step
-            )
-            print(f"\nValidation Metrics (Total Samples: {ga_metrics['total_count']}):\n{table}")
-
-        # Reset accumulators for next epoch
-        self.avg_error_w_int_depth.reset()
-        self.avg_error_w_pred.reset()
         
     def compute_exp_weighted_l1loss(self, metric_depth_pred, tgt_gt_depth, gamma=0.85):
         total_loss = 0.0
@@ -162,47 +151,160 @@ class midasNetConsistentModule(pl.LightningModule):
         
         return total_loss / total_weight
 
+    @torch.no_grad()
+    def visualize_reproj_error(
+        self,
+        ref_img,          # Target image [B, H, W, 3] (numpy array, RGB, 0-255)
+        proj_pred,        # Predicted reprojected points [B, H, W, 2]
+        proj_gt,          # Ground truth reprojected points [B, H, W, 2]
+        valid_mask,       # Valid mask [B, H, W]
+        sample_points=100,  # Number of points to sample for visualization
+        mode="train"
+    ):
+        """
+        Visualize reprojection error by overlaying predicted and GT points on the target image.
+        """
+        # Convert tensors to numpy arrays
+        if isinstance(ref_img, torch.Tensor):
+            ref_img = ref_img.cpu().numpy()
+        if isinstance(proj_pred, torch.Tensor):
+            proj_pred = proj_pred.cpu().numpy()
+        if isinstance(proj_gt, torch.Tensor):
+            proj_gt = proj_gt.cpu().numpy()
+        if isinstance(valid_mask, torch.Tensor):
+            valid_mask = valid_mask.cpu().numpy()
+
+        # Ensure images are in [0, 255] range
+        if ref_img.max() <= 1.0:
+            ref_img = (ref_img * 255).astype(np.uint8)
+
+        # Determine number of batches to plot
+        num_batches = min(3, ref_img.shape[0])
+        
+        combined_image = None
+        # # Create subplot grid
+        # fig, axes = plt.subplots(1, num_batches, figsize=(5*num_batches, 5))
+        # if num_batches == 1:
+        #     axes = [axes]  # Ensure axes is always iterable
+
+        for batch_idx in range(num_batches):
+            batch_img = ref_img[batch_idx].copy()  # Copy to avoid modifying original image
+            batch_proj_pred = proj_pred[batch_idx]
+            batch_proj_gt = proj_gt[batch_idx]
+            batch_valid_mask = valid_mask[batch_idx]
+
+            H, W = batch_img.shape[:2]
+            y_coords, x_coords = np.meshgrid(np.arange(H), np.arange(W), indexing='ij')
+            y_samples = y_coords.flatten()
+            x_samples = x_coords.flatten()
+            sample_indices = np.random.choice(
+                H * W, 
+                size=min(sample_points, H * W), 
+                replace=False
+            )
+            
+            valid_indices = np.where(batch_valid_mask.flatten() == 1)[0]
+            valid_sample_indices = np.intersect1d(valid_indices, sample_indices)
+            if len(valid_sample_indices) == 0:
+                continue  # Skip if no valid points
+            
+            y_valid = y_samples[valid_sample_indices]
+            x_valid = x_samples[valid_sample_indices]
+            
+            pred_px = ((batch_proj_pred[y_valid, x_valid] + 1) * np.array([W/2, H/2])).astype(int)
+            gt_px = ((batch_proj_gt[y_valid, x_valid] + 1) * np.array([W/2, H/2])).astype(int)
+            
+            # Draw GT points (Green) and Predicted points (Red)
+            for g, p in zip(gt_px, pred_px):
+                cv2.circle(batch_img, (g[0], g[1]), 4, (0, 255, 0), -1)  # GT (Green)
+                cv2.circle(batch_img, (p[0], p[1]), 4, (0, 0, 255), -1)  # Predicted (Red)
+                cv2.line(batch_img, (g[0], g[1]), (p[0], p[1]), (255, 255, 0), 2)  # Cyan line
+
+            # Add batch label at the top of the image
+            cv2.putText(batch_img, f"Batch {batch_idx}", (20, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
+            
+            # Stack images horizontally
+            if combined_image is None:
+                combined_image = batch_img
+            else:
+                combined_image = np.hstack((combined_image, batch_img))
+
+            if combined_image is None:
+                return 
+            
+            combined_image = cv2.cvtColor(combined_image, cv2.COLOR_RGB2BGR)
+            img_tensor = torch.from_numpy(combined_image).permute(2, 0, 1)
+            
+            self.logger.experiment.add_image(f"{mode}_Reprojection Error", 
+                                            img_tensor, 
+                                            global_step=self.global_step,
+                                            dataformats="CHW")
+
+        #axes[-1].legend(loc='upper right', bbox_to_anchor=(1.3, 1))
+        #plt.tight_layout()
+        #plt.show()
+            
     def compute_reproj_loss(self, depth_pred, depth_gt, tgt_pose_pred, tgt_pose_gt,
-                            ref_pose_pred, ref_pose_gt, K):
+                            ref_pose_pred, ref_pose_gt, K,ref_img, log_tb=False, mode="train"):
         #Loss = ||π(T_pred * X_pred) - π(T_gt * X_gt)||
         #where X_pred = π^-1(x, D_pred), X_gt = π^-1(x, D_gt)
-        valid_depth_mask = ((depth_gt > self.min_depth) & (depth_gt <= self.max_depth)).float().detach()
         device = depth_pred.device
         B, _, H, W = depth_pred.shape
-        scale_factor = 1.0
-        
-        # Reconstruct 3D points using PREDICTED target pose and depth(global frame)
-        tgt_cam_pred = Camera(K=K, Twc=tgt_pose_pred).scaled(scale_factor).to(device)
-        points_pred_world = tgt_cam_pred.reconstruct(depth_pred*valid_depth_mask, frame='w')
-        
-        # Reconstruct GT points using GT target pose and depth (global frame)
-        tgt_cam_gt = Camera(K=K, Twc=tgt_pose_gt).scaled(scale_factor).to(device)
-        points_gt_world = tgt_cam_gt.reconstruct(depth_gt*valid_depth_mask, frame='w')
-        
-        # Project using PREDICTED reference poses (global frame)
-        proj_pred = []
-        for ref_pose in ref_pose_pred:
-            ref_cam_pred = Camera(K=K, Twc=ref_pose)
-            proj = ref_cam_pred.project(points_pred_world, frame='w', normalize=True)
-            proj_pred.append(proj)
-        
-        # Project using GT reference poses and depth (global frame)
-        proj_gt = []
-        for ref_pose in ref_pose_gt:
-            ref_cam_gt = Camera(K=K, Twc=ref_pose)
-            proj = ref_cam_gt.project(points_gt_world, frame='w', normalize=True)
-            proj_gt.append(proj)
-        
-        # Compute masked reprojection error
-        loss = 0
-        for p_pred, p_gt in zip(proj_pred, proj_gt):
-            valid_mask = (p_pred.abs().max(dim=-1)[0] <= 1.0) & (p_gt.abs().max(dim=-1)[0] <= 1.0)
-            valid_mask = valid_mask.float().detach() * valid_depth_mask.squeeze(1)
+        scale_factor = H / depth_pred.shape[2] 
+        N_ref = len(ref_pose_pred)
             
-            error = torch.norm(p_pred - p_gt, dim=-1) * valid_mask
-            loss += error.sum() / (valid_mask.sum() + 1e-6)
+        depth_pred = torch.clamp(depth_pred, min=0.2, max=5.0)
+        depth_gt = torch.clamp(depth_gt, min=0.2, max=5.0)
+        valid_depth_mask = ((depth_gt > 0.2) & (depth_gt <= 5.0)).bool().detach()
             
-        return loss / len(proj_pred)
+        # Reconstruct 3D points in world coordinates
+        def reconstruct_points(pose, depth):
+            cam = Camera(K=K, Twc=pose).scaled(scale_factor).to(device)
+            return cam.reconstruct(depth, frame='w')  # [B, 3, H, W]
+
+        points_pred = reconstruct_points(tgt_pose_pred, depth_pred)
+        points_gt = reconstruct_points(tgt_pose_gt, depth_gt)
+
+        # Projection function
+        def project(pose, points):
+            cam = Camera(K=K, Twc=pose).scaled(scale_factor).to(device)
+            return cam.project(points, frame='w', normalize=True)  # [B, H, W, 2]
+
+        total_loss = 0
+        valid_count = 1e-6  # Avoid division by zero
+
+        for ref_idx in range(N_ref):
+            # Get reference poses for current view
+            ref_pose_p = ref_pose_pred[ref_idx]  # [1, 4, 4]
+            ref_pose_g = ref_pose_gt[ref_idx]    # [1, 4, 4]
+
+            # Project points
+            proj_pred = project(ref_pose_p, points_pred)  # [1, H, W, 2]
+            proj_gt = project(ref_pose_g, points_gt)     # [1, H, W, 2]
+
+            # Calculate valid projections
+            valid_proj = proj_pred.abs().max(dim=-1)[0] <= 1.0
+            valid_proj &= (proj_gt.abs().max(dim=-1)[0] <= 1.0)    
+            valid = valid_depth_mask.squeeze(1) & valid_proj  # [1, H, W]
+
+            # Calculate Huber loss
+            error = F.huber_loss(proj_pred, proj_gt, reduction='none').mean(-1)
+            total_loss += (error * valid).sum()
+            valid_count += valid.sum()
+
+            # Visualize first sample in batch and first reference view
+            with torch.no_grad():
+                if ref_idx == 0 and log_tb:
+                    self.visualize_reproj_error(
+                        ref_img[ref_idx],
+                        proj_pred.detach().cpu().numpy(),
+                        proj_gt.detach().cpu().numpy(),
+                        valid.bool().cpu().numpy(),
+                        mode=mode
+                    )
+
+        return total_loss / valid_count
         
     def compute_loss(self, pred_depth, gt_depth, log_variance=None, mask=None):
         """
@@ -265,10 +367,8 @@ class midasNetConsistentModule(pl.LightningModule):
     def _common_step(self, batch, batch_idx, stage="train"):
         #input_sparse_depth, input_image, rel_depth_pred, depth_gt, validity_map = batch
         tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp,_, ref_imgs, \
-        ref_ga_depth, ref_interp, ref_gt_depth, _, tgt_pose, ref_pose, intrinsics = batch
-
-        #convert to 4x4 pose matrix from 3x4
-        
+        ref_ga_depth, ref_interp, _, _, tgt_pose, ref_pose, intrinsics, \
+            tgt_pose_perturbed, ref_pose_perturbed = batch
         
         gt_depth = utils.inv2depth(tgt_gt_depth_inv)
         
@@ -288,23 +388,33 @@ class midasNetConsistentModule(pl.LightningModule):
         # else:
         refined_depth_inv, refined_target_pose, refined_ref_poses, warping_vis = self.model(tgt_img, ref_imgs,
                                                                                             tgt_ga_depth, ref_ga_depth, 
-                                                                                            tgt_interp, ref_interp, tgt_pose, 
-                                                                                            ref_pose, intrinsics)
+                                                                                            tgt_interp, ref_interp, 
+                                                                                            tgt_pose_perturbed, 
+                                                                                            ref_pose_perturbed, 
+                                                                                            intrinsics)
             
         # 1. Depth L1 Loss
         depth_loss,_ = self.compute_loss(utils.inv2depth(refined_depth_inv),
                                 gt_depth,
                                 log_variance=None,
                                 mask=None)
+        #visualize flag
+        if batch_idx %10 == 0:
+            log_tb = True
+        else:
+            log_tb = False
         
-        # 2. Reprojection loss (global frame)
+        # 2. Reprojection loss
         reproj_loss = self.compute_reproj_loss(
             utils.inv2depth(refined_depth_inv), gt_depth,
             refined_target_pose,  # Predicted target pose
             tgt_pose,             # GT target pose
             refined_ref_poses,    # Predicted reference poses
             ref_pose,             # GT reference poses
-            intrinsics
+            intrinsics,
+            ref_imgs,
+            log_tb=log_tb,
+            mode=stage
         )
         
         #pose regularization
@@ -313,10 +423,10 @@ class midasNetConsistentModule(pl.LightningModule):
         #     pose_reg += torch.norm(se3_log_map(refined_pose @ gt_pose.inverse()))
     
         #total_loss = loss
-        if self.current_epoch < 5:
-           total_loss = depth_loss
-        else:
-           total_loss = depth_loss + 0.8 * reproj_loss #+ 0.01 * pose_reg
+        #if self.current_epoch < 0:
+        #   total_loss = depth_loss
+        #else:
+        total_loss = depth_loss + 1.0 * reproj_loss #+ 0.01 * pose_reg
         
         #self.logger.experiment.add_scalar(f"{stage}_loss", loss, self.global_step)
         #self.log(f"{stage}/pose_reg_loss", pose_reg, on_step=True, on_epoch=True, sync_dist=True)
@@ -336,6 +446,8 @@ class midasNetConsistentModule(pl.LightningModule):
             "pred_depth": refined_depth_inv.detach(),
             "gt_depth": tgt_gt_depth_inv.detach(),
             "ga_depth": tgt_ga_depth.unsqueeze(0).permute(1,0,2,3).detach(),
+            "ref_gt_poses": ref_pose,
+            "ref_pred_poses": refined_ref_poses,
         }
         #TODO: compute loss for the pose as well
         

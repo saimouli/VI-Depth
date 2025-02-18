@@ -176,7 +176,7 @@ class Pose:
             The output 4x4 transformation matrix.
         """
         if Tcw.shape[1:] == (4, 4):  # If already 4x4, no changes needed
-            return cls(Tcw)
+            return Tcw
 
         B = Tcw.shape[0]
         bottom_row = torch.tensor([0, 0, 0, 1], device=Tcw.device, dtype=Tcw.dtype).unsqueeze(0).repeat(B, 1, 1)
