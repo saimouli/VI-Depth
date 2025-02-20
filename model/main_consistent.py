@@ -385,11 +385,16 @@ class midasNetConsistentModule(pl.LightningModule):
         #     total_loss = self.compute_exp_weighted_l1loss(metric_depth_pred, 
         #                                             gt_depth)
         # else:
+        
+        #convert to relative poses making the target pose identity
+        with torch.no_grad():
+            ref_rel_poses = [tgt_pose.inverse() @ ref_p for ref_p in ref_pose_perturbed]
+            
         refined_depth_inv, refined_target_pose, refined_ref_poses, warping_vis = self.model(tgt_img, ref_imgs,
                                                                                             tgt_ga_depth, ref_ga_depth, 
                                                                                             tgt_interp, ref_interp, 
-                                                                                            tgt_pose_perturbed, 
-                                                                                            ref_pose_perturbed, 
+                                                                                            tgt_pose, 
+                                                                                            ref_rel_poses, 
                                                                                             intrinsics)
             
         # 1. Depth L1 Loss

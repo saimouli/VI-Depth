@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 from pytorch3d.transforms import se3_exp_map, se3_log_map
 import cv2
+from utils.camera import Camera, pose_to_se3, se3_to_pose, se3_update
 
 def load_input_image(input_image_fp):
     return utils.read_image(input_image_fp)
@@ -170,7 +171,7 @@ class SML_consistent_dataset(Dataset):
         return img
 
     # Add SE(3) perturbations (mimic VIO drift)
-    def add_perturbation(self, pose, max_trans=0.40, max_rot_deg=5.0):
+    def add_perturbation(self, pose, max_trans=0.10, max_rot_deg=5.0):
         """Add random SE(3) perturbation to pose (3x4 numpy array)"""
         if isinstance(pose, np.ndarray):
             pose = torch.from_numpy(pose).float()
@@ -247,7 +248,7 @@ class SML_consistent_dataset(Dataset):
             for T in [ref_img, ref_ga_depth, ref_interp, ref_gt_depth, ref_sparse_depth, ref_pose, intrinsics]
         ]
         
-        tgt_pose_perturbed = self.add_perturbation(tgt_pose)
+        tgt_pose_perturbed = tgt_pose #self.add_perturbation(tgt_pose)
         ref_pose_perturbed = [self.add_perturbation(p) for p in ref_pose]
         
         #img, gt_depth, ga_depth, interp_scale
@@ -276,9 +277,10 @@ class SML_consistent_dataset(Dataset):
         
 # #       perturbed_pose = ref_pose[0].clone().detach().requires_grad_(True)
 # #       optimizer = torch.optim.Adam([perturbed_pose], lr=1e-3)
-#         cam = Camera(K=intrinsics.float(), Twc=tgt_pose).scaled(scale_factor)
-#         ref_cam1 = Camera(K=intrinsics.float(), Twc=ref_pose[0]).scaled(scale_factor)
-#         ref_cam2 = Camera(K=intrinsics.float(), Twc=ref_pose[1]).scaled(scale_factor)
+#         ref_rel_poses = [tgt_pose.inverse() @ ref_p for ref_p in ref_pose_per]
+#         cam = Camera(K=intrinsics.float()).scaled(scale_factor)
+#         ref_cam1 = Camera(K=intrinsics.float(), Twc=ref_rel_poses[0]).scaled(scale_factor)
+#         ref_cam2 = Camera(K=intrinsics.float(), Twc=ref_rel_poses[1]).scaled(scale_factor)
 
 #         gt_depth = utils.inv2depth(tgt_gt_depth_inv)
 #         world_points = cam.reconstruct(gt_depth, frame='w')

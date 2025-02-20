@@ -6,7 +6,7 @@ import sys
 module_path = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if module_path not in sys.path:
     sys.path.append(module_path)
-from modules.midas.midas_net_cons_custom import MidasNet_small_cons_videpth
+from modules.midas.midas_net_cons_custom import MidasNet_small_cons_videpth, ResNetEncoder
 import numpy as np
 import modules.midas.utils as utils
 import modules.midas.transforms as transforms
@@ -36,7 +36,7 @@ class Conv3x3(nn.Module):
         return out
 
 class ProjectionInputDepth(nn.Module):
-    def __init__(self, cost_dim, hidden_dim, out_chs):
+    def __init__(self, cost_dim, hidden_dim, out_chs, downsample_ratio=2):
         super().__init__()
         self.out_chs = out_chs
         self.convc1 = nn.Conv2d(cost_dim, hidden_dim, 1, padding=0)
@@ -46,6 +46,15 @@ class ProjectionInputDepth(nn.Module):
         self.convd2 = nn.Conv2d(hidden_dim, 64, 3, padding=1)
         
         self.convd = nn.Conv2d(64+hidden_dim, out_chs - 1, 3, padding=1)
+        
+        # Downsample layer
+        if downsample_ratio > 1:
+            self.downsample = nn.Sequential(
+                nn.Conv2d(out_chs, out_chs, kernel_size=3, stride=downsample_ratio, padding=1),
+                nn.ReLU(inplace=True)
+            )
+        else:
+            self.downsample = nn.Identity()
         
     def forward(self, depth, cost):
         #cost -> shape [B, cost_dim, H, W]
@@ -59,8 +68,43 @@ class ProjectionInputDepth(nn.Module):
         
         out_d = F.relu(self.convd(cor_dfm))
         # final shape -> [B, out_chs, H, W]
-        return torch.cat([out_d, depth], dim=1)
+        out = torch.cat([out_d, depth], dim=1)
+        return self.downsample(out)
 
+class ProjectionInputPose(nn.Module):
+    def __init__(self, cost_dim, hidden_dim, out_chs, downsample_ratio=8):
+        super().__init__()
+        self.out_chs = out_chs
+        self.convc1 = nn.Conv2d(cost_dim, hidden_dim, 1, padding=0)
+        self.convc2 = nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1)
+               
+        self.convp1 = nn.Conv2d(6, hidden_dim, 7, padding=3)
+        self.convp2 = nn.Conv2d(hidden_dim, 64, 3, padding=1)
+        
+        self.convp = nn.Conv2d(64+hidden_dim, out_chs - 6, 3, padding=1)
+        # Downsample layer
+        if downsample_ratio > 1:
+            self.downsample = nn.Sequential(
+                nn.Conv2d(out_chs, out_chs, kernel_size=3, stride=downsample_ratio, padding=1),
+                nn.ReLU(inplace=True)
+            )
+        else:
+            self.downsample = nn.Identity()
+            
+    def forward(self, pose, cost):
+        bs, _, h, w = cost.shape
+        cor = F.relu(self.convc1(cost))
+        cor = F.relu(self.convc2(cor))
+        
+        pose = pose.view(bs, 6, 1, 1).repeat(1, 1, h, w)
+        pfm = F.relu(self.convp1(pose))
+        pfm = F.relu(self.convp2(pfm))
+        cor_pfm = torch.cat([cor, pfm], dim=1)
+                
+        out_p = F.relu(self.convp(cor_pfm))
+        out= torch.cat([out_p, pose], dim=1)
+        return self.downsample(out)
+    
 #Limitations: 
 # limited receptive field: (1,5) and (5,1) convolutions separable
 # lack of global context
@@ -134,24 +178,24 @@ class BasicUpdateBlockDepth(nn.Module):
         mask_list = []
         
         for i in range(seq_len):
-            cost = cost_func(inv_depth)
+            cost, _ = cost_func(inv_depth)
             #print("cost {}: mean{}".format(i, cost.mean()))
             if self.log_fn:
                 self.log_fn(f"UpdateBlock/Iteration_{i}/cost_mean", cost.mean().item(), on_step=True, logger=True)
                 
-            input_features = self.encoder(inv_depth, cost)
-            inp_i = torch.cat([context, input_features], dim=1)
+            input_features = self.encoder(inv_depth, cost) #(b,1,288,384),(b,32,288,384) 
+            inp_i = torch.cat([context, input_features], dim=1)#(2,32,144,192),(2,128,288,384) 
 
-            if self.log_fn:
-                self.log_fn(f"UpdateBlock/Iteration_{i}/hidden_state_norm_before", hidden.norm().item(), on_step=True, logger=True)
+            #if self.log_fn:
+            #    self.log_fn(f"UpdateBlock/Iteration_{i}/hidden_state_norm_before", hidden.norm().item(), on_step=True, logger=True)
                 
             hidden = self.depth_gru(hidden, inp_i)
             
-            if self.log_fn:
-                self.log_fn(f"UpdateBlock/Iteration_{i}/hidden_state_norm_after", hidden.norm().item(), on_step=True, logger=True)
+            #if self.log_fn:
+            #    self.log_fn(f"UpdateBlock/Iteration_{i}/hidden_state_norm_after", hidden.norm().item(), on_step=True, logger=True)
                 
             delta_scales = self.depth_head(hidden)
-            delta_scales = F.relu(1.0 + delta_scales) #ensure positive scale
+            delta_scales = 1.0 + 0.5 * torch.tanh(delta_scales)  # [0.5, 1.5] range #ensure positive scale
             print(f"inv_depth mean step {i}: {inv_depth.mean().item()}")
             print("delta_scales mean step", i, delta_scales.mean().item())
             
@@ -167,62 +211,54 @@ class BasicUpdateBlockDepth(nn.Module):
                     min=1.0 / self.max_pred, 
                     max=1.0 / self.min_pred
                 )   
-            # if self.min_pred is not None:
-            #     min_pred_inv = 1.0/self.min_pred
-            #     inv_depth_pred[inv_depth_pred > min_pred_inv] = min_pred_inv
-            #     #pred[pred < self.min_pred] = self.min_pred
-            # if self.max_pred is not None:
-            #     max_pred_inv = 1.0/self.max_pred
-            #     inv_depth_pred[inv_depth_pred < max_pred_inv] = max_pred_inv
             
              # *** Update for next iteration ***
             inv_depth = inv_depth_pred
             # scale mask to balence gradients
-            mask = 0.25 * self.mask(hidden) #helps numerical stability how?
+            mask = 0.25 * self.mask(hidden) #helps numerical stability
             
             inv_depth_list.append(inv_depth_pred)
             mask_list.append(mask)
             
         return hidden, mask_list, inv_depth_list
-
-# class DifferentiableGaussNewton(nn.Module):
-#     def __init__(self, num_steps=3):
-#         super().__init__()
-#         self.num_steps = num_steps
     
-#     def forward(self, features, depth, poses, sparse_points, K):
-#         """
-#         features: (B, C, H, W) - Target/reference features
-#         depth: (B, 1, H, W) - Current depth estimate
-#         poses: (B, N, 4, 4) - Camera poses (N = num keyframes)
-#         K: (B, 3, 3) - Intrinsics
-#         """
-#         b, _, h, w = depth.shape
-#         device = depth.device
+class PoseHead(nn.Module):
+    def __init__(self, input_dim=256, hidden_dim=128):
+        super(PoseHead, self).__init__()
         
-#         for _ in range(self.num_steps):
-#             # Compute Jacobian and residuals
-#             J_pose, residuals = self.compute_jacobian_residuals(
-#                 features, depth, poses, sparse_points, K
-#             )
-            
-#             #Solve Gauss-Newton step: ΔT = -(J^T J)^-1 J^T r
-#             J_T = J_pose.transpose(-1, -2)
-#             H = J_T @ J_pose
-#             delta = -torch.linalg.inv(H + 1e-3 * torch.eye(6, device=device)) @ (J_T @ residuals)
-#             # Update poses (Lie algebra se3)
-#             poses = self.update_pose(poses, delta)
-#         return poses
-    
-#     def compute_jacobian_residuals(self, features, depth, poses, sparse_points, K):
-#         J_pose = 0; residuals = 0
-#         return J_pose, residuals
-    
-#     def update_pose(self, poses, delta):
-#         delat_mat = pp.se3.exp(delta)
-#         return pose @ delta_mat
+        self.conv1_pose = nn.Conv2d(input_dim, hidden_dim, 3, padding=1)
+        self.conv2_pose = nn.Conv2d(hidden_dim, 6, 3, padding=1)
 
-#currently trying to learn a network to refine the depth and pose
+        self.relu = nn.ReLU(inplace=True)
+        
+    def forward(self, x_p):
+        out = self.conv2_pose(self.relu(self.conv1_pose(x_p))).mean(3).mean(2)
+        return torch.cat([out[:, :3], 0.01 * out[:, 3:]], dim=1)
+    
+class BasicUpdateBlockPose(nn.Module):
+    def __init__(self, hidden_dim=128, cost_dim=64, ratio=3, context_dim=64, log_fn=None):
+        super(BasicUpdateBlockPose, self).__init__()
+        self.encoder = ProjectionInputPose(cost_dim=cost_dim, hidden_dim=hidden_dim, out_chs=hidden_dim)
+        self.pose_gru = SepConvGRU(hidden_dim=hidden_dim, input_dim=self.encoder.out_chs+context_dim)
+        self.pose_head = PoseHead(hidden_dim, hidden_dim=hidden_dim)
+        
+    def forward(self, hidden_p, cost_func, ref_pose, inp, seq_len=4):
+        pose_list = []
+        #convert to ref_pose from 4x4 to 6x1
+        ref_pose_init = pose_to_se3(ref_pose)
+        for i in range(seq_len):
+            res = cost_func(poseC2W=ref_pose)
+            cost = res['cost']
+            input_features = self.encoder(ref_pose_init, cost)
+            inp_i = torch.cat([inp, input_features], dim=1)
+                
+            hidden_p = self.pose_gru(hidden_p, inp_i)
+            delta_pose = self.pose_head(hidden_p)
+                
+            pose = ref_pose @ se3_to_pose(delta_pose)
+            pose_list.append(pose)
+        return hidden_p, pose_list
+
 class DepthPoseRefineNet(nn.Module):
     def __init__(self, hidden_dim=128, N_ref=2):
         super().__init__()
@@ -236,7 +272,7 @@ class DepthPoseRefineNet(nn.Module):
             nn.Conv2d(96, 32, 1),
             nn.ReLU(True),
             nn.Conv2d(32, 1, 1),
-            nn.Softplus() #nn.ReLU(True)  # Keep scale positive
+            nn.Tanh()() #nn.ReLU(True)  # Keep scale positive
         )
         
         # Pose refinement head 
@@ -253,7 +289,7 @@ class DepthPoseRefineNet(nn.Module):
         x = F.relu(self.conv2(x))
         
         # Predict depth scale and pose updates
-        depth_scale = 1.0 + 0.1 * self.depth_head(x) #F.relu(1.0 + self.depth_head(x))  # 1 + delta for stability
+        depth_scale = 1.0 + 0.2 * self.depth_head(x) #F.relu(1.0 + self.depth_head(x))  # 1 + delta for stability
         
         # Pose updates with spatial attention
         pose_feats = self.pose_head(x)
@@ -265,6 +301,19 @@ class DepthPoseRefineNet(nn.Module):
         delta_pose_ref = pose_updates.view(-1, self.N_ref, 6) #[B, N_ref, 6]
         
         return depth_scale, delta_pose_ref
+
+class UpMaskNet(nn.Module):
+    def __init__(self, hidden_dim=128, ratio=8):
+        super(UpMaskNet, self).__init__()
+        self.mask = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim*2, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim*2, ratio*ratio*9, 1, padding=0))
+
+    def forward(self, feat):
+        # scale mask to balence gradients
+        mask = .25 * self.mask(feat)
+        return mask
     
 class midasConsNet(nn.Module):
     def __init__(self, min_pred, max_pred, min_depth, max_depth, nsamples, sml_model_path, 
@@ -280,6 +329,7 @@ class midasConsNet(nn.Module):
         model_transforms = transforms.get_transforms("dpt_hybrid", "void", str(nsamples))
         self.ScaleMapLearner_transform = model_transforms["sml_model"]
 
+        # Feature extractor (frozen)
         self.FeatExtractor = MidasNet_small_cons_videpth(
             path=sml_model_path,
             in_channels=3,
@@ -305,7 +355,7 @@ class midasConsNet(nn.Module):
         self.contextLearner.train()
     
         self.hidden_dim = 128
-        self.cost_dim = 64
+        self.cost_dim = 32
         self.iter_steps = 3
         
         self.context_conv = nn.Conv2d(
@@ -313,9 +363,12 @@ class midasConsNet(nn.Module):
             out_channels=self.hidden_dim + self.cost_dim, 
             kernel_size=3, stride=1, padding=1
         )
-        self.refine_net = DepthPoseRefineNet(hidden_dim=self.hidden_dim)
+        #self.refine_net = DepthPoseRefineNet(hidden_dim=self.hidden_dim)
         
         if self.UseConvGRU:
+            self.contextPose = ResNetEncoder(out_chs=self.hidden_dim+self.cost_dim, 
+                                           stride=8, num_input_images=2)#pose
+            
             self.update_block_depth = BasicUpdateBlockDepth(hidden_dim=self.hidden_dim, 
                                                             cost_dim=self.cost_dim,
                                                             ratio=3, 
@@ -323,8 +376,17 @@ class midasConsNet(nn.Module):
                                                             min_pred=self.min_pred,
                                                             max_pred=self.max_pred)
             
+            self.update_block_pose = BasicUpdateBlockPose(hidden_dim=self.hidden_dim,
+                                                          cost_dim=self.cost_dim,
+                                                          ratio=3,
+                                                          context_dim=self.cost_dim)
+            self.inter_sup = False
+            
         else:
-            self.scaleOutput = OutputScaleConv(features=64, groups=1, activation=nn.ReLU(False), non_negative=False)
+            self.refine_net = DepthPoseRefineNet(hidden_dim=self.hidden_dim)
+            
+        self.scaleOutput = OutputScaleConv(features=64, groups=1, 
+                                            activation=nn.ReLU(False), non_negative=False)
         
     def upsample_depth(self, depth, mask, ratio):
         """ Upsample depth field [H/ratio, W/ratio, 2] -> [H, W, 2] using convex combination """
@@ -348,38 +410,6 @@ class midasConsNet(nn.Module):
                 max=1.0 / self.min_pred
             )
         return inv_depth_pred
-    
-    # #Convert initial poses to pyproj.LieTensor (4x4 SE3 matrices)
-    # def pose_to_se3(self, pose):
-    #     """
-    #     Convert [B, 4, 4] pose matrix to [B, 6] se3 parameters (translation + axis-angle).
-    #     Note: pytorch takes [R 0;T 1] format
-    #     """
-    #     # Extract rotation and translation from standard 3x4 pose matrix
-    #     rotation = pose[:,:3, :3]  # [B, 3, 3]
-    #     translation = pose[:,:3,3]  # [B, 3]
-
-    #     # Build 4x4 matrix compatible with PyTorch3D's se3_log_map
-    #     batch_size = rotation.shape[0]
-    #     transform = torch.eye(4, device=rotation.device).repeat(batch_size, 1, 1)
-    #     transform[:, :3, :3] = rotation  # Upper-left 3x3 = rotation
-    #     transform[:, :3, 3] = 0.0        # Zero-out 4th column (PyTorch3D requirement)
-    #     transform[:, 3, :3] = translation  # Translation in 4th row[:3]
-
-    #     # Convert to se3 parameters (translation + axis-angle)
-    #     return se3_log_map(transform)  # [B, 6]
-    
-    # # Convert back to 3x4 matrix format if needed
-    # def se3_to_pose(self,se3_pose):
-    #     """Convert pyproj.LieTensor to [B, 3, 4] pose matrix"""
-    #     transform = se3_exp_map(se3_pose)   # [B, 4, 4]
-    #     rotation = transform[:, :3, :3]
-    #     translation = transform[:, 3, :3]
-        
-    #     bottom_row = torch.tensor([0, 0, 0, 1], 
-    #                               device=rotation.device, dtype=rotation.dtype).repeat(rotation.shape[0], 1, 1)
-    #     mat = torch.cat([torch.cat([rotation, translation.unsqueeze(-1)], dim=-1), bottom_row], dim=1)
-    #     return mat  # [B, 4, 4]
 
     def get_cost_each(self, tgt_poseC2W, poseC2W, fmap, fmap_ref, depth, K, scale_factor):
         """
@@ -401,7 +431,7 @@ class midasConsNet(nn.Module):
                                     mode='bilinear', padding_mode='zeros', align_corners=True) # (b, c, h, w)
         
         cost = (fmap - fmap_warped)**2 * valid_mask.unsqueeze(1) #cost = (fmap * fmap_warped).sum(dim=1, keepdim=True) #try correlation
-        cost = cost.mean(dim=1, keepdim=True)
+        #cost = cost.mean(dim=1, keepdim=True)
 
         return {
             'cost': cost,
@@ -451,14 +481,9 @@ class midasConsNet(nn.Module):
     def forward(self, tgt_img, ref_imgs, tgt_ga_depth, ref_ga_depth, 
                 tgt_interp, ref_interp, tgt_pose, ref_pose, intrinsics):
         """
-        Refine metric depth given ground truth poses and target/reference images.
+        Refine metric depth scale and VIO poses and target/reference images.
         """
         #Step 1: Extract features using the base model
-        #tgt_input = self.preprocess_batch(tgt_img, tgt_ga_depth, keys=["image", "int_depth"], device=tgt_img.device)
-        # ref_inputs = [
-        #     self.preprocess_batch(ref_img, ref_depth, keys=["image", "ga_depth"], device=ref_img.device)
-        #     for ref_img, ref_depth in zip(ref_imgs, ref_ga_depth)
-        # ]
         ref_inputs = [
             self.preprocess_batch(ref_img, keys=["image"], device=ref_img.device)
             for ref_img in ref_imgs
@@ -469,22 +494,22 @@ class midasConsNet(nn.Module):
             keys=["image", "int_depth", "int_depth_c", "int_scales_c"], 
             device=tgt_img.device
         )
-        tgt_input, context_input = torch.split(processed_batch, [4, 2], dim=1) #[1,4,288,384]
-        init_metric_depth_inv = context_input[:, 0:1, :, :]
+        tgt_input, context_depth_input = torch.split(processed_batch, [4, 2], dim=1) #[1,4,288,384]
+        init_metric_depth_inv = context_depth_input[:, 0:1, :, :] #Ga_depth
         
         #test feat extraction only with the rgb image
         tgt_input = processed_batch[:, :3, :, :] # Shape: [1, 3, H, W]
         
         # Extract features using MidasNet #TODO: batch processing?
-        tgt_feats = self.FeatExtractor(tgt_input) #[1, 64, 120, 160]
-        ref_feats = [self.FeatExtractor(ref_input) for ref_input in ref_inputs] #[1, 64, 120, 160]
-        context_feats = self.contextLearner(context_input) #[1, 64, 144, 192]
+        tgt_feats = self.FeatExtractor(tgt_input) #[1, 32, 288, 384]
+        ref_feats = [self.FeatExtractor(ref_input) for ref_input in ref_inputs] #[1, 32, 288, 384]
+        context_feats = self.contextLearner(context_depth_input) #[1, 64, 144, 192]
         
         #step2: get the init scaled depth from the model
         #metric_depth_inv_tgt, _ = self.ScaleMapLearner(x, d)
         scale_factor =  tgt_img.permute(0,3,1,2).shape[2] / tgt_feats.shape[2]
         
-        # Step 3: Refine depth and pose
+        # Step 3: get initial depth and pose
         scale_map = self.scaleOutput(context_feats)
         delta_scales = F.relu(1.0 + scale_map)  # Ensure scale is positive
         inv_depth_pred = init_metric_depth_inv * delta_scales
@@ -496,156 +521,194 @@ class midasConsNet(nn.Module):
                 max=1.0 / self.min_pred
             )
             
-        refined_inv_depth = inv_depth_pred
-        # Make a copy of ref_pose so we can update them (target pose remains fixed)
-        #refined_target_pose = tgt_pose.clone()
-        #refined_ref_poses = [pose.clone() for pose in ref_pose]
+        refined_inv_depth = inv_depth_pred #[b, 1, 288, 384]
+        #fixed_tgt_pose = tgt_pose.detach().requires_grad_(False) #T_vio_cam2wld
+        #refined_rel_poses = [pose_to_se3(fixed_tgt_pose.inverse() @ ref_p) for ref_p in ref_pose] #T_relative 6D
+        # initial pose from VIO
+        pose_list_init = ref_pose
         
-        warping_vis = []
-        fixed_tgt_pose = tgt_pose.detach()
-        #fixed_target_pose = self.pose_to_se3(tgt_pose).detach() #cam2wld
-        # Convert to relative SE3
-        refined_rel_poses = [pose_to_se3(fixed_tgt_pose.inverse() @ ref_p) for ref_p in ref_pose]
-        
-        for i in range(self.iter_steps):
-            warped_feats_list = []
-                 
-            #process each reference view
-            for idx, (se3_ref, fmap_r) in enumerate(zip(refined_rel_poses, ref_feats)):
-                # Convert relative SE3 to absolute world pose
-                pose_ref = fixed_tgt_pose @ se3_to_pose(se3_ref)
+        if not self.UseConvGRU:
+            warping_vis = []
+            #fixed_tgt_pose = tgt_pose.detach()
+            #fixed_target_pose = self.pose_to_se3(tgt_pose).detach() #cam2wld
+            # Convert to relative SE3
+            #refined_rel_poses = [pose_to_se3(fixed_tgt_pose.inverse() @ ref_p) for ref_p in ref_pose]
+            
+            for i in range(self.iter_steps):
+                warped_feats_list = []
+                    
+                #process each reference view
+                for idx, (se3_ref, fmap_r) in enumerate(zip(refined_rel_poses, ref_feats)):
+                    # Convert relative SE3 to absolute world pose
+                    pose_ref = fixed_tgt_pose @ se3_to_pose(se3_ref)
 
-                result = self.get_cost_each(
-                    tgt_poseC2W=fixed_tgt_pose, 
-                    poseC2W=pose_ref, 
-                    fmap=tgt_feats, 
-                    fmap_ref=fmap_r, 
-                    depth=utils.inv2depth(refined_inv_depth), 
-                    K=intrinsics, 
-                    scale_factor=1.0/scale_factor
-                )
-                    
-                warped_feats_list.append(result['fmap_warped'])
-                    
-                if idx == 0 and self.is_train and i == 0:
-                    warping_vis.append({
-                        'src_feat': result['fmap'][0].detach(),
-                        'warped_feat': result['fmap_warped'][0].detach(),
-                        'valid_mask': result['valid_mask'][0].detach(),
-                        'cost': result['cost'][0].detach()
-                    })
-                    
-            aggregated_warped_feats = torch.cat(warped_feats_list, dim=1)
-            
-            # Predict refinements in relative space
-            delta_scale, delta_pose_ref = self.refine_net(tgt_feats, aggregated_warped_feats)
-            #print detal scale mean and delta_pose norm
-            #print("delta scale mean: ", delta_scale.mean().item())
-            
-            # Update reference poses (not global pose)
-            for ref_idx in range(len(refined_rel_poses)):
-                refined_rel_poses[ref_idx] = se3_update(
-                    refined_rel_poses[ref_idx], 
-                    delta_pose_ref[:, ref_idx, :]  # [B, 6] for this reference
-                )
-                    
-            # Update depth
-            refined_inv_depth = refined_inv_depth * delta_scale
-            
-            #clamp depth
-            if self.min_pred is not None and self.max_pred is not None:
-                refined_inv_depth = torch.clamp(
-                    refined_inv_depth, 
-                    min=1.0 / self.max_pred, 
-                    max=1.0 / self.min_pred
-                )                            
-            
-        refined_depth_inv = F.interpolate(
-            refined_inv_depth,
-            size=(tgt_img.shape[1], tgt_img.shape[2]),
-            mode='bicubic',
-            align_corners=False
-        )  # shape => [B, 1, 480, 640]
-        
-        # Convert final relative poses back to global coordinates
-        final_ref_poses = [
-            fixed_tgt_pose @ se3_to_pose(rel_pose) 
-            for rel_pose in refined_rel_poses
-        ]
-        
-        return refined_depth_inv, fixed_tgt_pose, final_ref_poses, warping_vis
-        
-        #pose_list = pose_list_init
-        inv_depth_predictions = [] #[metric_depth_inv_tgt] #to see the history of depth predictions
-        
-        # get optimization init
-        if self.iter_steps > 0:
-            context_feat = self.context_conv(context_feats) #to make the output dim = hidden_dim + cost_dim #[1,160,144,192]
-            hidden_d, inp_d = torch.split(context_feat, [self.hidden_dim, self.cost_dim], dim=1)
-            hidden_d = torch.tanh(hidden_d) #1,128,144,192
-            inp_d = torch.relu(inp_d) #1,32,144,192
-        
-        # step2 compute cost map and optimize depth scale iteratively
-        for itr in range(self.iter_steps):
-            print("Iter: {}".format(itr))
-            self.log_fn(f"Iter_{itr}/hidden_state_norm", hidden_d.norm().item(), on_step=True, logger=True)
-            self.log_fn(f"Iter_{itr}/input_state_norm", inp_d.norm().item(), on_step=True, logger=True)
-            
-            metric_depth_inv_tgt = metric_depth_inv_tgt.detach()
-            tgt_pose = tgt_pose.detach()
-            ref_pose = [pose.detach() for pose in ref_pose]
-            # --------------------------
-            # 1. Update scale with ConvGRU
-            # --------------------------
-            depth_cost_map_func = partial(self.depth_cost_calc, 
-                                        fmap=tgt_feats,
-                                        fmaps_ref=ref_feats,
-                                        pose_list=ref_pose,
-                                        tgt_pose=tgt_pose,
-                                        K=intrinsics,
-                                        scale_factor=1.0/scale_factor)
-            
-            #update depth
-            hidden_d, up_mask_seqs, inv_depth_seqs = self.update_block_depth(hidden_d, depth_cost_map_func,
-                                                                             metric_depth_inv_tgt, inp_d,
-                                                                             seq_len=5)
-            
-            #we won't supervise the intermediate predictions
-            up_mask_seqs, inv_depth_seqs = [up_mask_seqs[-1]], [inv_depth_seqs[-1]]
-            for up_mask_i, inv_depth_i in zip(up_mask_seqs, inv_depth_seqs):
-                refined_depth_inv = self.upsample_depth(
-                    inv_depth_i,  # input depth [B, 1, H/ratio, W/ratio]
-                    up_mask_i,    # upsample mask [B, 9*ratio*ratio, H/ratio, W/ratio]
-                    ratio=int(scale_factor),       # upsampling ratio
-                )
+                    result = self.get_cost_each(
+                        tgt_poseC2W=fixed_tgt_pose, 
+                        poseC2W=pose_ref, 
+                        fmap=tgt_feats, 
+                        fmap_ref=fmap_r, 
+                        depth=utils.inv2depth(refined_inv_depth), 
+                        K=intrinsics, 
+                        scale_factor=1.0/scale_factor
+                    )
+                        
+                    warped_feats_list.append(result['fmap_warped'])
+                        
+                    if idx == 0 and self.is_train and i == 0:
+                        warping_vis.append({
+                            'src_feat': result['fmap'][0].detach(),
+                            'warped_feat': result['fmap_warped'][0].detach(),
+                            'valid_mask': result['valid_mask'][0].detach(),
+                            'cost': result['cost'][0].detach()
+                        })
+                        
+                aggregated_warped_feats = torch.cat(warped_feats_list, dim=1)
                 
+                # Predict refinements in relative space
+                delta_scale, delta_pose_ref = self.refine_net(tgt_feats, aggregated_warped_feats)
+                #print detal scale mean and delta_pose norm
+                #print("delta scale mean: ", delta_scale.mean().item())
+                
+                # Update reference poses (not global pose)
+                for ref_idx in range(len(refined_rel_poses)):
+                    refined_rel_poses[ref_idx] = se3_update(
+                        refined_rel_poses[ref_idx], 
+                        delta_pose_ref[:, ref_idx, :]  # [B, 6] for this reference
+                    )
+                        
+                # Update depth
+                refined_inv_depth = refined_inv_depth * delta_scale
+                
+                #clamp depth
+                if self.min_pred is not None and self.max_pred is not None:
+                    refined_inv_depth = torch.clamp(
+                        refined_inv_depth, 
+                        min=1.0 / self.max_pred, 
+                        max=1.0 / self.min_pred
+                    )                          
+            refined_depth_inv = F.interpolate(
+                refined_inv_depth,
+                size=(tgt_img.shape[1], tgt_img.shape[2]),
+                mode='bicubic',
+                align_corners=False
+            )  # shape => [B, 1, 480, 640]
+            
+            # Convert final relative poses back to global coordinates
+            final_ref_poses = [
+                fixed_tgt_pose @ se3_to_pose(rel_pose) 
+                for rel_pose in refined_rel_poses
+            ]
+            
+            return refined_depth_inv, fixed_tgt_pose, final_ref_poses, warping_vis
+        
+        else:
+            # -------- ConvGRU-Based Iterative Refinement --------            
+            inv_depth_predictions = [inv_depth_pred] #[metric_depth_inv_tgt] #to see the history of depth predictions
+            pose_predictions = [[pose_to_se3((pose).clone()) for pose in pose_list_init]] #to see the history of pose predictions
+            
+            # get optimization init
+            if self.iter_steps > 0:
+                context_feat = self.context_conv(context_feats) #to make the output dim = hidden_dim + cost_dim #[1,160,144,192]
+                hidden_d, inp_d = torch.split(context_feat, [self.hidden_dim, self.cost_dim], dim=1)
+                hidden_d = torch.tanh(hidden_d) #1,128,144,192
+                inp_d = torch.relu(inp_d) #1,32,144,192
+                
+                img_pairs = []
+                for ref_img in ref_inputs:
+                    img_pairs.append(torch.cat([tgt_input, ref_img], dim=1))
+                cnet_pose_list = self.contextPose(img_pairs)
+                hidden_p_list, inp_p_list = [], []
+                for cnet_pose in cnet_pose_list:
+                    hidden_p, inp_p = torch.split(cnet_pose, [self.hidden_dim, self.cost_dim], dim=1)
+                    hidden_p_list.append(torch.tanh(hidden_p))
+                    inp_p_list.append(torch.relu(inp_p))
+            
+            pose_list = pose_list_init
+            
+            # Step2: compute cost map and optimize depth scale iteratively
+            for itr in range(self.iter_steps):
+                print("Iter: {}".format(itr))
+                self.log_fn(f"Iter_{itr}/hidden_state_norm", hidden_d.norm().item(), on_step=True, logger=True)
+                self.log_fn(f"Iter_{itr}/input_state_norm", inp_d.norm().item(), on_step=True, logger=True)
+                
+                refined_inv_depth = refined_inv_depth.detach()
+                #ref_abspose_list = [fixed_tgt_pose @ se3_to_pose(pose).detach() for pose in refined_rel_poses] #(1,6) (1,6)
+                rel_pose_list = [pose.detach() for pose in pose_list]
+                #refined_rel_poses = [pose.detach() for pose in refined_rel_poses] #relative pose
+                #ref_abspose_list = [fixed_tgt_pose @ se3_to_pose(pose) for pose in refined_rel_poses] #4x4 absolute poses
+                
+                pose_cost_func_list = []
+                for fmap_ref in ref_feats:
+                    pose_cost_func_list.append(partial(self.get_cost_each, tgt_poseC2W=None,fmap=tgt_feats, 
+                                                       fmap_ref=fmap_ref,
+                                                       depth=utils.inv2depth(refined_inv_depth),
+                                                       K=intrinsics, scale_factor=1.0/scale_factor))
+                # ----------------------------
+                # 1. Update scale with ConvGRU
+                # ----------------------------
+                depth_cost_map_func = partial(self.depth_cost_calc, 
+                                            fmap=tgt_feats,
+                                            fmaps_ref=ref_feats,
+                                            pose_list=rel_pose_list,
+                                            tgt_pose=None,
+                                            K=intrinsics,
+                                            scale_factor=1.0/scale_factor)
+                
+                #update depth #TODO: check and understand this function
+                hidden_d, up_mask_seqs, inv_depth_seqs = self.update_block_depth(hidden_d, depth_cost_map_func,
+                                                                                refined_inv_depth, inp_d,
+                                                                                seq_len=4)
+                
+                #we won't supervise the intermediate predictions
+                up_mask_seqs, inv_depth_seqs = [up_mask_seqs[-1]], [inv_depth_seqs[-1]]
+                
+                #upsample
+                # for up_mask_i, inv_depth_i in zip(up_mask_seqs, inv_depth_seqs):
+                #     refined_depth_inv = self.upsample_depth(
+                #         inv_depth_i,  # input depth [B, 1, H/ratio, W/ratio]
+                #         up_mask_i,    # upsample mask [B, 9*ratio*ratio, H/ratio, W/ratio]
+                #         ratio=int(scale_factor),       # upsampling ratio
+                #     )
+                    
                 refined_depth_inv = F.interpolate(
-                    refined_depth_inv,
+                    inv_depth_seqs[-1],
                     size=(tgt_img.shape[1], tgt_img.shape[2]),
                     mode='bicubic',
                     align_corners=False
                 )  # shape => [B, 1, 480, 640]
-                
+                    
                 inv_depth_predictions.append(refined_depth_inv)
 
                 if self.log_fn:
-                    self.log_fn(f"Iter_{itr}/depth_mean", refined_depth_inv.mean().item(), on_step=True, logger=True)
-                    self.log_fn(f"Iter_{itr}/depth_var", refined_depth_inv.var().item(), on_step=True, logger=True)
-                    
-            metric_depth_inv_tgt = inv_depth_seqs[-1]
-            
-            # --------------------------
-            # 2. Differentiable Pose Refinement
-            # --------------------------
-            # poses = self.gn_layer(
-            #     features=tgt_feats,
-            #     depth=utils.inv2depth(metric_depth_inv_tgt),
-            #     poses=poses,
-            #     K=intrinsics
-            # )
-
-        if self.is_train:
-            return inv_depth_predictions
-        else:
-            return inv_depth_predictions[-1]
+                        self.log_fn(f"Iter_{itr}/depth_mean", refined_depth_inv.mean().item(), on_step=True, logger=True)
+                        self.log_fn(f"Iter_{itr}/depth_var", refined_depth_inv.var().item(), on_step=True, logger=True)
+                        
+                refined_inv_depth = inv_depth_seqs[-1]
+                
+                #### update pose ####
+                pose_list_seqs = [None] * len(rel_pose_list)
+                for i, (ref_pose, hidden_p) in enumerate(zip(rel_pose_list, hidden_p_list)):
+                    hidden_p, pose_seqs = self.update_block_pose(hidden_p, pose_cost_func_list[i],
+                                                                 ref_pose, inp_p_list[i], seq_len=4)
+                    hidden_p_list[i] = hidden_p
+                    if not self.inter_sup:
+                        pose_seqs = [pose_seqs[-1]] #take final iteration
+                    pose_list_seqs[i] = pose_seqs
+                
+                for pose_list_i in zip(*pose_list_seqs):
+                    pose_predictions.append([pose_to_se3(pose.clone()) for pose in pose_list_i])
+                
+                # Convert updated poses to relative
+                pose_list = list(zip(*pose_predictions))[-1]
+                rel_pose_list = [se3_to_pose(pose) for pose in pose_list]
+                
+                #ref_abspose_list = list(zip(*pose_list_seqs))[-1]
+                #refined_rel_poses = [pose_to_se3(fixed_tgt_pose.inverse() @ ref_p) for ref_p in ref_abspose_list]
+                
+            if self.is_train:
+                return inv_depth_predictions, \
+                    torch.stack([torch.stack(poses_ref, dim=1) for poses_ref in pose_predictions], dim=2) #(b, n, iters, 6)
+            else:
+                return inv_depth_predictions[-1],\
+                        torch.stack(pose_predictions[-1], dim=1).view(tgt_img.shape[0], len(ref_imgs), 6) #(b, n, 6)
 

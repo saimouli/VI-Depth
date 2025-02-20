@@ -254,9 +254,76 @@ def test_cost_warping(K, poseC2W, tgt_poseC2W, depth, img_ref, tgt_img, scale_fa
         
     plt.tight_layout()
     plt.show()
-        
-        
+    
 
+def test_cost_warping_with_poses(K, tgt_poseC2W, ref_poseC2W, perturbed_tgt_poseC2W, 
+                                 perturbed_ref_poseC2W, depth, img_ref, tgt_img, scale_factor=1.0):
+    device = depth.device
+
+    def visualize_warp(cam, ref_cam, title):
+        # Reconstruct world points from target camera
+        world_points = cam.reconstruct(depth, frame='w')
+        # Project world points onto reference camera
+        ref_coords = ref_cam.project(world_points, frame='w', normalize=True)
+        
+        # Warp the reference image
+        warped_ref = F.grid_sample(img_ref.permute(0, 3, 1, 2), ref_coords, 
+                                   mode='bilinear', padding_mode='zeros', align_corners=True)
+        
+        # Convert to numpy for visualization
+        tgt_img_np = (tgt_img[0].cpu().numpy() * 255).astype(np.uint8)
+        warped_ref_np = (warped_ref.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        
+        # Convert to BGR for OpenCV operations
+        tgt_img_bgr = cv2.cvtColor(tgt_img_np, cv2.COLOR_RGB2BGR)
+        warped_ref_bgr = cv2.cvtColor(warped_ref_np, cv2.COLOR_RGB2BGR)
+        
+        overlay = cv2.addWeighted(tgt_img_bgr, 0.5, warped_ref_bgr, 0.5, 0)
+        
+        return tgt_img_bgr, warped_ref_bgr, overlay
+
+    # GT poses
+    cam_gt = Camera(K=K.float(), Twc=tgt_poseC2W).scaled(scale_factor).to(device)
+    ref_cam_gt = Camera(K=K.float(), Twc=ref_poseC2W).scaled(scale_factor).to(device)
+    tgt_img_bgr_gt, warped_ref_bgr_gt, overlay_gt = visualize_warp(cam_gt, ref_cam_gt, "GT Poses")
+
+    # Perturbed poses
+    cam_perturbed = Camera(K=K.float(), Twc=perturbed_tgt_poseC2W).scaled(scale_factor).to(device)
+    ref_cam_perturbed = Camera(K=K.float(), Twc=perturbed_ref_poseC2W).scaled(scale_factor).to(device)
+    tgt_img_bgr_perturbed, warped_ref_bgr_perturbed, overlay_perturbed = visualize_warp(cam_perturbed, ref_cam_perturbed, "Perturbed Poses")
+
+    # Visualize results
+    fig, axes = plt.subplots(2, 3, figsize=(20, 10))
+    
+    # GT Results
+    axes[0, 0].imshow(cv2.cvtColor(tgt_img_bgr_gt, cv2.COLOR_BGR2RGB))
+    axes[0, 0].set_title("Target Image (GT)")
+    axes[0, 0].axis("off")
+    
+    axes[0, 1].imshow(cv2.cvtColor(warped_ref_bgr_gt, cv2.COLOR_BGR2RGB))
+    axes[0, 1].set_title("Warped Ref Image (GT)")
+    axes[0, 1].axis("off")
+    
+    axes[0, 2].imshow(cv2.cvtColor(overlay_gt, cv2.COLOR_BGR2RGB))
+    axes[0, 2].set_title("Overlay (GT)")
+    axes[0, 2].axis("off")
+
+    # Perturbed Results
+    axes[1, 0].imshow(cv2.cvtColor(tgt_img_bgr_perturbed, cv2.COLOR_BGR2RGB))
+    axes[1, 0].set_title("Target Image (Perturbed)")
+    axes[1, 0].axis("off")
+    
+    axes[1, 1].imshow(cv2.cvtColor(warped_ref_bgr_perturbed, cv2.COLOR_BGR2RGB))
+    axes[1, 1].set_title("Warped Ref Image (Perturbed)")
+    axes[1, 1].axis("off")
+    
+    axes[1, 2].imshow(cv2.cvtColor(overlay_perturbed, cv2.COLOR_BGR2RGB))
+    axes[1, 2].set_title("Overlay (Perturbed)")
+    axes[1, 2].axis("off")
+
+    plt.tight_layout()
+    plt.show()
+        
 if __name__ == "__main__":
     # Define dataset
     dataset = SML_consistent_dataset(data_root='/media/saimouli/Data6T/datasets/VOID_150_small', mode='val')
@@ -298,7 +365,14 @@ if __name__ == "__main__":
         refined_rel_poses = [pose_to_se3(tgt_pose.inverse() @ ref_p) for ref_p in ref_poses]
         pose_ref = tgt_pose @ se3_to_pose(refined_rel_poses[0])
 
+        test_cost_warping_with_poses(intrinsics, tgt_pose, ref_poses[0], 
+                                     tgt_pose, ref_pose_perturbed[0], 
+                                     utils.inv2depth(tgt_gt_depth_inv), 
+                                     ref_img[0], tgt_img)
+        
         compute_reproj_loss(utils.inv2depth(tgt_gt_depth_inv), utils.inv2depth(tgt_gt_depth_inv),
                             tgt_pose_perturbed, tgt_pose,
                             ref_pose_perturbed, ref_poses, intrinsics,
                             ref_img)
+        
+    # test_trajectory(true_poses, perturbed_poses)
