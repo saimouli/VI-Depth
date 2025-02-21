@@ -12,8 +12,9 @@ import modules.midas.utils as utils
 from metrics import rmse, mae, absrel, inv_rmse, inv_mae, inv_absrel
 import metrics
 from sklearn.decomposition import PCA
-from utils.camera import Camera
+from utils.camera import Camera, se3_to_pose
 from pytorch3d.transforms import se3_exp_map, se3_log_map
+from utils.pose import Pose
 
 class midasNetConsistentModule(pl.LightningModule):
     def __init__(self, lr: float = 0.1, wd: float = 0.1, min_pred: float = 0.1, 
@@ -363,10 +364,94 @@ class midasNetConsistentModule(pl.LightningModule):
 
         return total_loss, loss_info
     
+    def calculate_grudepth_loss(self, inv_depths, gt_inv_depths):
+        """
+        Calculate the supervised loss.
+
+        Parameters
+        ----------
+        inv_depths : list of torch.Tensor [B,1,H,W]
+            List of predicted inverse depth maps
+        gt_inv_depths : list of torch.Tensor [B,1,H,W]
+            List of ground-truth inverse depth maps
+
+        Returns
+        -------
+        loss : torch.Tensor [1]
+            Average supervised loss for all scales
+        """
+        num_scales = len(inv_depths)
+        total_loss = 0
+        total_w = 0
+        gamma = 0.85
+        min_disp = self.min_depth
+        max_disp = self.max_depth
+        for i in range(num_scales):
+            w = gamma**(num_scales - i - 1)
+            total_w += w
+            
+            valid = ((gt_inv_depths > min_disp) & (gt_inv_depths < max_disp)).detach()
+            valid = valid.squeeze(1)
+
+            loss_depth = torch.mean(valid * torch.abs(gt_inv_depths - inv_depths[i]).squeeze(1))
+            loss_i = loss_depth
+            total_loss += w * loss_i
+        
+        return total_loss / total_w
+    
+    
+    def get_ref_coords(self, pose, K, depth, scale_factor, device):
+        if not isinstance(pose, Pose):
+            pose = Pose(pose)
+
+        cam = Camera(K=K.float()).scaled(scale_factor).to(device) # tcw = Identity
+        ref_cam = Camera(K=K.float(), Twc=pose).scaled(scale_factor).to(device)
+    
+        # Reconstruct world points from target_camera
+        world_points = cam.reconstruct(depth, frame='w')
+        # Project world points onto reference camera
+        ref_coords = ref_cam.project(world_points, frame='w', normalize=True) #(b, h, w,2)
+        valid_mask = (ref_coords >= -1) & (ref_coords <= 1)
+        return ref_coords, valid_mask
+    
+    def calc_pose_loss(self, pred_poses, gt_pose_context, gt_depth, K):
+        device = gt_pose_context[0].device
+        scale_factor = 1
+        MAX_ERROR = 1
+        total_loss = 0
+        w_totoal = 0
+        gamma = 0.85
+        iter = len(pred_poses[0])
+        
+        min_depth = self.min_depth
+        max_depth = self.max_depth / 4.0
+        
+        gt_depth_mask = (gt_depth > min_depth) & (gt_depth < max_depth)
+        gt_depth_mask = gt_depth_mask.permute(0, 2, 3 ,1)
+        for i in range(iter):
+            loss_it = 0
+            w = gamma**(iter - i - 1)
+            w_totoal += w
+                
+            for view_i, gt_pose_view in enumerate(gt_pose_context):
+                pred_pose_view = pred_poses[view_i][i]
+                
+                coords_gt, mask_gt = self.get_ref_coords(gt_pose_view, K, gt_depth, scale_factor, device)
+                coords_pred, mask_pred = self.get_ref_coords(pred_pose_view, K, gt_depth, scale_factor, device)
+                valid_mask = mask_gt * mask_pred * gt_depth_mask
+                reproj_diff = valid_mask * torch.abs(coords_pred - coords_gt).clamp(-MAX_ERROR, MAX_ERROR)
+                reporj_loss = torch.mean(reproj_diff)
+                loss_it += reporj_loss
+                
+            loss_it = loss_it / len(gt_pose_context) 
+            total_loss += loss_it * w
+        
+        return total_loss / w_totoal
+    
     def _common_step(self, batch, batch_idx, stage="train"):
         #input_sparse_depth, input_image, rel_depth_pred, depth_gt, validity_map = batch
         tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp,_, ref_imgs, \
-        ref_ga_depth, ref_interp, _, _, tgt_pose, ref_pose, intrinsics, \
+        ref_ga_depth, ref_interp, _, _, tgt_pose, ref_gt_pose, intrinsics, \
             tgt_pose_perturbed, ref_pose_perturbed = batch
         
         gt_depth = utils.inv2depth(tgt_gt_depth_inv)
@@ -390,18 +475,29 @@ class midasNetConsistentModule(pl.LightningModule):
         with torch.no_grad():
             ref_rel_poses = [tgt_pose.inverse() @ ref_p for ref_p in ref_pose_perturbed]
             
-        refined_depth_inv, refined_target_pose, refined_ref_poses, warping_vis = self.model(tgt_img, ref_imgs,
-                                                                                            tgt_ga_depth, ref_ga_depth, 
-                                                                                            tgt_interp, ref_interp, 
-                                                                                            tgt_pose, 
-                                                                                            ref_rel_poses, 
-                                                                                            intrinsics)
-            
+        # refined_depth_inv, refined_target_pose, refined_ref_poses, warping_vis = self.model(tgt_img, ref_imgs,
+        #                                                                                     tgt_ga_depth, ref_ga_depth, 
+        #                                                                                     tgt_interp, ref_interp, 
+        #                                                                                     tgt_pose, 
+        #                                                                                     ref_rel_poses, 
+        #                                                                                     intrinsics)
+        
+        #(b, n, iters, 6)    
+        refined_depth_inv, refined_ref_poses = self.model(tgt_img, ref_imgs,
+                                                        tgt_ga_depth, ref_ga_depth, 
+                                                        tgt_interp, ref_interp, 
+                                                        tgt_pose, 
+                                                        ref_rel_poses, 
+                                                        intrinsics)
         # 1. Depth L1 Loss
-        depth_loss,_ = self.compute_loss(utils.inv2depth(refined_depth_inv),
-                                gt_depth,
-                                log_variance=None,
-                                mask=None)
+        # depth_loss,_ = self.compute_loss(utils.inv2depth(refined_depth_inv),
+        #                         gt_depth,
+        #                         log_variance=None,
+        #                         mask=None)
+        
+        depth_loss = self.calculate_grudepth_loss(utils.inv2depth(refined_depth_inv), 
+                                            utils.inv2depth(tgt_gt_depth_inv))
+        
         #visualize flag
         if batch_idx %10 == 0:
             log_tb = True
@@ -409,17 +505,42 @@ class midasNetConsistentModule(pl.LightningModule):
             log_tb = False
         
         # 2. Reprojection loss
-        reproj_loss = self.compute_reproj_loss(
-            gt_depth, gt_depth,
-            refined_target_pose,  # Predicted target pose
-            tgt_pose,             # GT target pose
-            refined_ref_poses,    # Predicted reference poses
-            ref_pose,             # GT reference poses
-            intrinsics,
-            ref_imgs,
-            log_tb=log_tb,
-            mode=stage
-        )
+        # reproj_loss = self.compute_reproj_loss(
+        #     gt_depth, gt_depth,
+        #     tgt_pose,             # Predicted target pose
+        #     tgt_pose,             # GT target pose
+        #     refined_ref_poses,    # Predicted reference poses
+        #     ref_gt_pose,             # GT reference poses
+        #     intrinsics,
+        #     ref_imgs,
+        #     log_tb=log_tb,
+        #     mode=stage
+        # )
+        
+        # refined_ref_poses shape: (b, num_ref_views, num_iters, 6)
+        pred_poses = []
+        for ref_idx in range(refined_ref_poses.shape[1]):  # Iterate through reference views
+            view_poses = []
+            for iter_idx in range(refined_ref_poses.shape[2]):  # Iterate through refinement steps
+                # Extract pose vector [b, 6]
+                pose_vec = refined_ref_poses[:, ref_idx, iter_idx, :]
+                # Convert to Pose object
+                view_poses.append(se3_to_pose(pose_vec))
+            pred_poses.append(view_poses)  # shape: (num_ref_views, num_iters)
+
+        # Format ground truth poses ---------------------------------------------------
+        # Assuming ref_gt_pose is list of absolute poses: [pose_ref1, pose_ref2,...]
+        # Convert to relative poses if needed (based on your pose parametrization)
+        #refined_rel_poses = [pose_to_se3(fixed_tgt_pose.inverse() @ ref_p) for ref_p in ref_pose]
+        gt_rel_poses = []
+        tgt_pose_inv = tgt_pose.inverse()  # Assuming tgt_pose is fixed
+        for ref_pose in ref_gt_pose:
+            # Convert absolute pose to relative pose
+            rel_pose = tgt_pose_inv * ref_pose
+            gt_rel_poses.append(rel_pose)
+            
+        reproj_loss = self.calc_pose_loss(pred_poses, gt_rel_poses, 
+                                          gt_depth, intrinsics)
         
         #pose regularization
         # pose_reg = torch.norm(se3_log_map(refined_target_pose @ tgt_pose.inverse()))
@@ -439,51 +560,164 @@ class midasNetConsistentModule(pl.LightningModule):
         self.log(f"{stage}/total_loss", total_loss, on_step=True, on_epoch=True, sync_dist=True)
         
         with torch.no_grad():
-            if batch_idx % 10 == 0:
-                if len(warping_vis) > 0:
-                    self.log_warping(warping_vis, mode=stage)
-                self.log_img_tensorboard(tgt_img, gt_depth, utils.inv2depth(tgt_ga_depth).unsqueeze(0).permute(1,0,2,3), 
-                                         utils.inv2depth(refined_depth_inv), batch_idx, self.current_epoch, mode=stage)
+            self.log_refinement_progress(tgt_img, ref_imgs, gt_depth,
+                                        utils.inv2depth(refined_depth_inv), pred_poses,
+                                        gt_rel_poses, intrinsics, mode=stage)
+            
+            #if len(warping_vis) > 0:
+            #    self.log_warping(warping_vis, mode=stage)
+            # self.log_img_tensorboard(tgt_img, gt_depth, utils.inv2depth(tgt_ga_depth).unsqueeze(0).permute(1,0,2,3), 
+            #                          utils.inv2depth(refined_depth_inv), batch_idx, self.current_epoch, mode=stage)
         return {
             "loss": total_loss,
             "mode": stage,
-            "pred_depth": refined_depth_inv.detach(),
+            "pred_depth": refined_depth_inv[-1].detach(),
             "gt_depth": tgt_gt_depth_inv.detach(),
             "ga_depth": tgt_ga_depth.unsqueeze(0).permute(1,0,2,3).detach(),
-            "ref_gt_poses": ref_pose,
-            "ref_pred_poses": refined_ref_poses,
+            "ref_gt_poses": ref_gt_pose,
+            "ref_pred_poses": [view_poses[-1] for view_poses in pred_poses],
         }
         #TODO: compute loss for the pose as well
         
 
-    # @torch.no_grad()
-    # def log_img_tensorboard(self, images, depth_maps, batch_idx, epoch, mode="train"):
-    #     depth_maps = torch.clip(depth_maps, 0, 1)
-    #     img_vis = images[0].detach().cpu()
-    #     img_vis = torch.from_numpy((img_vis.numpy() * 255).astype('uint8')).permute(2, 0, 1) / 255.0  # Convert to CHW
-    #     processed_maps = []
-    #     for depth_map in depth_maps:
-    #         depth_map_np = depth_map.squeeze(0).detach().cpu().numpy()
-    #         depth_map_np = (depth_map_np - np.min(depth_map_np)) / (
-    #             np.max(depth_map_np) - np.min(depth_map_np)
-    #         )
-    #         colored_map = plt.get_cmap("jet")(depth_map_np)[ #blue low error, green to yellow medium error, red high error
-    #             :, :, :3
-    #         ]  # Apply colormap and remove alpha channel
-    #         colored_map_tensor = (
-    #             torch.from_numpy(colored_map).float().permute(
-    #                 2, 0, 1).unsqueeze(0)
-    #         )
-    #         processed_maps.append(colored_map_tensor)
-    #     all_maps = torch.cat(processed_maps, dim=0)
-    #     all_maps = torch.cat([img_vis.unsqueeze(0), all_maps], dim=0)
+    @torch.no_grad()
+    def log_refinement_progress(self, tgt_img, ref_imgs, gt_depth, 
+                                inv_depth_predictions, refined_ref_poses,
+                                ref_gt_pose, intrinsics,
+                                mode="train"):
+        """
+        Visualize refinement progress with:
+        - Depth predictions
+        - Depth errors
+        - Reprojection alignment using current poses vs GT poses
+        """
+        device = tgt_img.device
+        num_iters = len(inv_depth_predictions)
+        plot_iters = [0, num_iters//2, -1]  # First, middle, final
+        B, C, H, W = tgt_img.shape
+        
+        # Select first sample in batch
+        idx = 0
+        tgt_img = tgt_img[idx].unsqueeze(0).detach().cpu()
+        gt_depth = gt_depth[idx].detach().cpu()#.unsqueeze(0)
+        ref_img = ref_imgs[0][idx].unsqueeze(0).detach().cpu()  # First reference image
+        
+        # 1. Precompute GT projections --------------------------------------------
+        # Using GT depth and GT poses
+        gt_depth_metric = utils.inv2depth(gt_depth)
+        gt_proj, gt_valid = self.compute_reprojection(
+            depth=gt_depth_metric,
+            ref_pose=ref_gt_pose[0][0].unsqueeze(0),  # First reference view
+            K=intrinsics[0].unsqueeze(0)
+        )
+        
+        def apply_colormap(tensor, colormap="viridis", vmin=None, vmax=None):
 
-    #     self.logger.experiment.add_image(
-    #         mode,
-    #         torchvision.utils.make_grid(all_maps, nrow=4, padding=4),
-    #         global_step=self.global_step,
-    #         dataformats="CHW",
-    #     )
+            tensor_np = tensor.cpu().numpy()
+            # Use percentile-based normalization for better visualization
+            if vmin is None:
+                vmin = np.percentile(tensor_np, 2)  # Avoid extreme minimums
+            if vmax is None:
+                vmax = np.percentile(tensor_np, 98)  # Avoid extreme maximums
+            norm = (tensor_np - vmin) / (vmax - vmin + 1e-6)
+            norm = np.clip(norm, 0, 1)
+            cmap = plt.get_cmap(colormap)
+            colored = cmap(norm)[:, :, :3]  # Drop alpha channel
+
+            return torch.from_numpy(colored).squeeze(0).permute(2, 0, 1).float()
+        
+        # 2. Depth Visualization --------------------------------------------------
+        def depth_to_rgb(depth, cmap='viridis'):
+            depth_norm = (depth - depth.min()) / (depth.max() - depth.min() + 1e-6)
+            return apply_colormap(depth_norm, cmap)
+
+        depth_grid = [tgt_img.detach().cpu()]
+        error_grid = [depth_to_rgb(gt_depth.squeeze())]
+        reproj_grid = []
+
+        for iter_idx in plot_iters:
+            # Get current refinement results
+            pred_depth = utils.inv2depth(inv_depth_predictions[iter_idx][idx])
+            pred_pose = refined_ref_poses[0][iter_idx][0].unsqueeze(0)  # First ref view
+
+            # 3. Compute current predictions --------------------------------------
+            pred_proj, pred_valid = self.compute_reprojection(
+                depth=pred_depth,
+                ref_pose=pred_pose,
+                K=intrinsics[0].unsqueeze(0)
+            )
+            
+            # 4. Create reprojection visualization --------------------------------
+            reproj_img = self.visualize_reproj_pair(
+                ref_img=ref_img,
+                pred_proj=pred_proj,
+                gt_proj=gt_proj,
+                valid_mask=pred_valid.cpu() & gt_valid
+            )
+            
+            # Build grids
+            depth_grid.append(depth_to_rgb(pred_depth))
+            error = torch.abs(pred_depth.cpu() - gt_depth.squeeze())
+            error_grid.append(apply_colormap(error.squeeze(0), 'Reds'))
+            reproj_grid.append(reproj_img)
+
+        # 5. Combine all components -----------------------------------------------
+        depth_row = torch.cat(depth_grid, dim=-1)
+        error_row = torch.cat(error_grid, dim=-1)
+        reproj_row = torch.cat(reproj_grid, dim=-1)
+        
+        final_grid = torch.cat([depth_row, error_row, reproj_row], dim=1)
+
+        # Log to TensorBoard
+        self.logger.experiment.add_image(
+            f"{mode}_refinement",
+            final_grid,
+            global_step=self.global_step,
+            dataformats="CHW"
+        )
+
+    def compute_reprojection(self, depth, ref_pose, K):
+        """Compute projected coordinates in reference view"""
+        # Reconstruct 3D points in world coordinates
+        tgt_cam = Camera(K=K.float()).scaled(1.0).to(depth.device)
+        ref_cam = Camera(K=K.float(), Twc=ref_pose).scaled(1.0).to(depth.device)
+        
+        wld_points = tgt_cam.reconstruct(depth, frame='w')
+        # Project to reference view
+        proj = ref_cam.project(wld_points, frame='w', normalize=True)
+        
+        # Validate projections
+        valid = (proj.abs() <= 1.0).all(dim=-1, keepdim=True)
+        return proj, valid
+
+    def visualize_reproj_pair(self, ref_img, pred_proj, gt_proj, 
+                              valid_mask, num_points=200):
+        """Visualize predicted vs GT reprojections on reference image"""
+        # Convert to numpy
+        W, H = ref_img.shape[:2]
+        ref_np = ref_img.squeeze().permute(1,2,0).cpu().numpy()
+        pred_px = ((pred_proj.squeeze().cpu().numpy() + 1) * np.array([W/2, H/2])).astype(int)
+        gt_px = ((gt_proj.squeeze().cpu().numpy() + 1) * np.array([W/2, H/2])).astype(int)
+        valid = valid_mask.squeeze().cpu().numpy()
+        
+        # Random sample valid points
+        valid_idx = np.where(valid.flatten())[0]
+        if len(valid_idx) == 0:
+            return torch.zeros_like(ref_img)
+        sample_idx = np.random.choice(valid_idx, min(num_points, len(valid_idx)), False)
+        
+        # Draw correspondences
+        vis_img = (ref_np * 255).astype(np.uint8).copy()
+        W, H = ref_np.shape[:2]
+        for idx in sample_idx:
+            y, x = np.unravel_index(idx, (H, W))
+            cv2.circle(vis_img, tuple(gt_px[y,x]), 3, (0,255,0), -1)  # GT (green)
+            cv2.circle(vis_img, tuple(pred_px[y,x]), 3, (0,0,255), -1)  # Pred (red)
+            cv2.line(vis_img, tuple(gt_px[y,x]), tuple(pred_px[y,x]), (255,255,0), 1)
+        
+        # Convert back to tensor
+        vis_img = torch.from_numpy(vis_img).permute(2,0,1).float() / 255.0
+        return vis_img
 
     @torch.no_grad()
     def log_img_tensorboard(self, images, gt_depth, ga_depth, pred_depth, batch_idx, epoch, mode="train"):

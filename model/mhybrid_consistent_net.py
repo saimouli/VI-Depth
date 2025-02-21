@@ -272,7 +272,7 @@ class DepthPoseRefineNet(nn.Module):
             nn.Conv2d(96, 32, 1),
             nn.ReLU(True),
             nn.Conv2d(32, 1, 1),
-            nn.Tanh()() #nn.ReLU(True)  # Keep scale positive
+            nn.Tanh() #nn.ReLU(True)  # Keep scale positive
         )
         
         # Pose refinement head 
@@ -522,6 +522,14 @@ class midasConsNet(nn.Module):
             )
             
         refined_inv_depth = inv_depth_pred #[b, 1, 288, 384]
+        
+        depth_init_up = F.interpolate(
+                refined_inv_depth,
+                size=(tgt_img.shape[1], tgt_img.shape[2]),
+                mode='bicubic',
+                align_corners=False
+        )  # shape => [B, 1, 480, 640]
+        
         #fixed_tgt_pose = tgt_pose.detach().requires_grad_(False) #T_vio_cam2wld
         #refined_rel_poses = [pose_to_se3(fixed_tgt_pose.inverse() @ ref_p) for ref_p in ref_pose] #T_relative 6D
         # initial pose from VIO
@@ -603,7 +611,7 @@ class midasConsNet(nn.Module):
         
         else:
             # -------- ConvGRU-Based Iterative Refinement --------            
-            inv_depth_predictions = [inv_depth_pred] #[metric_depth_inv_tgt] #to see the history of depth predictions
+            inv_depth_predictions = [depth_init_up] #[metric_depth_inv_tgt] #to see the history of depth predictions
             pose_predictions = [[pose_to_se3((pose).clone()) for pose in pose_list_init]] #to see the history of pose predictions
             
             # get optimization init
@@ -633,10 +641,11 @@ class midasConsNet(nn.Module):
                 
                 refined_inv_depth = refined_inv_depth.detach()
                 #ref_abspose_list = [fixed_tgt_pose @ se3_to_pose(pose).detach() for pose in refined_rel_poses] #(1,6) (1,6)
-                rel_pose_list = [pose.detach() for pose in pose_list]
+                pose_list = [pose.detach() for pose in pose_list]
                 #refined_rel_poses = [pose.detach() for pose in refined_rel_poses] #relative pose
                 #ref_abspose_list = [fixed_tgt_pose @ se3_to_pose(pose) for pose in refined_rel_poses] #4x4 absolute poses
                 
+                # calc cost
                 pose_cost_func_list = []
                 for fmap_ref in ref_feats:
                     pose_cost_func_list.append(partial(self.get_cost_each, tgt_poseC2W=None,fmap=tgt_feats, 
@@ -649,7 +658,7 @@ class midasConsNet(nn.Module):
                 depth_cost_map_func = partial(self.depth_cost_calc, 
                                             fmap=tgt_feats,
                                             fmaps_ref=ref_feats,
-                                            pose_list=rel_pose_list,
+                                            pose_list=pose_list,
                                             tgt_pose=None,
                                             K=intrinsics,
                                             scale_factor=1.0/scale_factor)
@@ -686,8 +695,8 @@ class midasConsNet(nn.Module):
                 refined_inv_depth = inv_depth_seqs[-1]
                 
                 #### update pose ####
-                pose_list_seqs = [None] * len(rel_pose_list)
-                for i, (ref_pose, hidden_p) in enumerate(zip(rel_pose_list, hidden_p_list)):
+                pose_list_seqs = [None] * len(pose_list)
+                for i, (ref_pose, hidden_p) in enumerate(zip(pose_list, hidden_p_list)):
                     hidden_p, pose_seqs = self.update_block_pose(hidden_p, pose_cost_func_list[i],
                                                                  ref_pose, inp_p_list[i], seq_len=4)
                     hidden_p_list[i] = hidden_p
@@ -699,8 +708,8 @@ class midasConsNet(nn.Module):
                     pose_predictions.append([pose_to_se3(pose.clone()) for pose in pose_list_i])
                 
                 # Convert updated poses to relative
-                pose_list = list(zip(*pose_predictions))[-1]
-                rel_pose_list = [se3_to_pose(pose) for pose in pose_list]
+                pose_list = list(zip(*pose_list_seqs))[-1]
+                #pose_list = [se3_to_pose(pose) for pose in pose_list]
                 
                 #ref_abspose_list = list(zip(*pose_list_seqs))[-1]
                 #refined_rel_poses = [pose_to_se3(fixed_tgt_pose.inverse() @ ref_p) for ref_p in ref_abspose_list]
