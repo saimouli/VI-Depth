@@ -613,7 +613,7 @@ class midasNetConsistentModule(pl.LightningModule):
         
         def apply_colormap(tensor, colormap="viridis", vmin=None, vmax=None):
 
-            tensor_np = tensor.cpu().numpy()
+            tensor_np = tensor.squeeze(0).cpu().numpy()
             # Use percentile-based normalization for better visualization
             if vmin is None:
                 vmin = np.percentile(tensor_np, 2)  # Avoid extreme minimums
@@ -624,15 +624,17 @@ class midasNetConsistentModule(pl.LightningModule):
             cmap = plt.get_cmap(colormap)
             colored = cmap(norm)[:, :, :3]  # Drop alpha channel
 
-            return torch.from_numpy(colored).squeeze(0).permute(2, 0, 1).float()
+            return torch.from_numpy(colored).permute(2, 0, 1).float()
         
         # 2. Depth Visualization --------------------------------------------------
         def depth_to_rgb(depth, cmap='viridis'):
+            depth = depth.float()
             depth_norm = (depth - depth.min()) / (depth.max() - depth.min() + 1e-6)
             return apply_colormap(depth_norm, cmap)
 
-        depth_grid = [tgt_img.detach().cpu()]
-        error_grid = [depth_to_rgb(gt_depth.squeeze())]
+        depth_grid = []
+        gt_depth_grid = []
+        error_grid = []
         reproj_grid = []
 
         for iter_idx in plot_iters:
@@ -642,7 +644,7 @@ class midasNetConsistentModule(pl.LightningModule):
 
             # 3. Compute current predictions --------------------------------------
             pred_proj, pred_valid = self.compute_reprojection(
-                depth=pred_depth,
+                depth=gt_depth_metric,
                 ref_pose=pred_pose,
                 K=intrinsics[0].unsqueeze(0)
             )
@@ -652,22 +654,40 @@ class midasNetConsistentModule(pl.LightningModule):
                 ref_img=ref_img,
                 pred_proj=pred_proj,
                 gt_proj=gt_proj,
-                valid_mask=pred_valid.cpu() & gt_valid
+                valid_mask=pred_valid.cpu() & gt_valid if 'gt_valid' in locals() else pred_valid.cpu(),
+                iter_idx=iter_idx
             )
             
-            # Build grids
-            depth_grid.append(depth_to_rgb(pred_depth))
+            #convert predicted depth to rgb
+            pred_depth_rgb = depth_to_rgb(pred_depth).detach().cpu()
+            gt_depth_rgb = depth_to_rgb(gt_depth.squeeze()).detach().cpu()
+            
+            depth_grid.append(pred_depth_rgb.unsqueeze(0))  # (1, 3, H, W)
+            gt_depth_grid.append(gt_depth_rgb.unsqueeze(0))
+            
             error = torch.abs(pred_depth.cpu() - gt_depth.squeeze())
-            error_grid.append(apply_colormap(error.squeeze(0), 'Reds'))
-            reproj_grid.append(reproj_img)
+            error_rgb = apply_colormap(error.squeeze(0), 'Reds').detach().cpu()
+            error_grid.append(error_rgb.unsqueeze(0))  # (1, 3, H, W)
+            
+            reproj_grid.append(reproj_img.unsqueeze(0).detach().cpu()) 
 
+        # depth_grid.append(depth_to_rgb(pred_depth).unsqueeze(0).permute(0, 3, 1, 2))
+        # error = torch.abs(pred_depth.cpu() - gt_depth.squeeze())
+        # error_grid.append(apply_colormap(error.squeeze(0), 'Reds').unsqueeze(0).permute(0, 3, 1, 2))
+        # reproj_grid.append(reproj_img.unsqueeze(0).permute(0, 3, 1, 2))
+    
         # 5. Combine all components -----------------------------------------------
-        depth_row = torch.cat(depth_grid, dim=-1)
-        error_row = torch.cat(error_grid, dim=-1)
-        reproj_row = torch.cat(reproj_grid, dim=-1)
+        depth_row = torch.cat(depth_grid, dim=-1) if depth_grid else None
+        gt_depth_row = torch.cat(gt_depth_grid, dim=-1) if gt_depth_grid else None
+        error_row = torch.cat(error_grid, dim=-1) if error_grid else None
+        reproj_row = torch.cat(reproj_grid, dim=-1) if reproj_grid else None
         
-        final_grid = torch.cat([depth_row, error_row, reproj_row], dim=1)
-
+        final_grid = torch.cat(
+            [row for row in [depth_row, gt_depth_row, error_row, reproj_row] if row is not None], 
+            dim=2
+        ).squeeze(0)
+        final_grid = final_grid.to(dtype=torch.float32)
+        
         # Log to TensorBoard
         self.logger.experiment.add_image(
             f"{mode}_refinement",
@@ -691,32 +711,62 @@ class midasNetConsistentModule(pl.LightningModule):
         return proj, valid
 
     def visualize_reproj_pair(self, ref_img, pred_proj, gt_proj, 
-                              valid_mask, num_points=200):
+                              valid_mask, iter_idx, num_points=200):
         """Visualize predicted vs GT reprojections on reference image"""
-        # Convert to numpy
-        W, H = ref_img.shape[:2]
-        ref_np = ref_img.squeeze().permute(1,2,0).cpu().numpy()
-        pred_px = ((pred_proj.squeeze().cpu().numpy() + 1) * np.array([W/2, H/2])).astype(int)
-        gt_px = ((gt_proj.squeeze().cpu().numpy() + 1) * np.array([W/2, H/2])).astype(int)
-        valid = valid_mask.squeeze().cpu().numpy()
+        if isinstance(ref_img, torch.Tensor):
+            ref_img = ref_img.squeeze(0).cpu().numpy()
+        if isinstance(pred_proj, torch.Tensor):
+            pred_proj = pred_proj.cpu().numpy()
+        if isinstance(gt_proj, torch.Tensor):
+            gt_proj = gt_proj.cpu().numpy()
+        if isinstance(valid_mask, torch.Tensor):
+            valid_mask = valid_mask.squeeze(3).cpu().numpy()
         
-        # Random sample valid points
-        valid_idx = np.where(valid.flatten())[0]
-        if len(valid_idx) == 0:
-            return torch.zeros_like(ref_img)
-        sample_idx = np.random.choice(valid_idx, min(num_points, len(valid_idx)), False)
+        # print("tgt_img", ref_img.shape)
+        # print("pred_proj", pred_proj.shape)
+        # print("gt_proj", gt_proj.shape)
+        # print("valid_mask", valid_mask.shape)
+        
+        # Ensure target image is in [0, 255] range
+        if ref_img.max() <= 1.0:
+            ref_img = (ref_img * 255).astype(np.uint8)
+        vis_img = ref_img.copy()
+        #cv2.imshow("ref_img", ref_img)
+        # Sample random points for visualization
+        B, H, W = valid_mask.shape
+        y_coords, x_coords = np.meshgrid(np.arange(H), np.arange(W), indexing='ij')
+        y_coords = y_coords.flatten()
+        x_coords = x_coords.flatten()
+
+        # Randomly sample points
+        sample_indices = np.random.choice(H * W, size=num_points, replace=False)
+        y_samples = y_coords[sample_indices]
+        x_samples = x_coords[sample_indices]
+
+        valid_samples = valid_mask[0, y_samples, x_samples]
+        pred_samples = pred_proj[0, y_samples, x_samples][valid_samples == 1]
+        gt_samples = gt_proj[0, y_samples, x_samples][valid_samples == 1]
+
+        # Convert normalized coordinates to pixel coordinates
+        pred_px = (pred_samples + 1) * np.array([W, H]) / 2  # [-1, 1] → [0, W] and [0, H]
+        gt_px = (gt_samples + 1) * np.array([W, H]) / 2
         
         # Draw correspondences
-        vis_img = (ref_np * 255).astype(np.uint8).copy()
-        W, H = ref_np.shape[:2]
-        for idx in sample_idx:
-            y, x = np.unravel_index(idx, (H, W))
-            cv2.circle(vis_img, tuple(gt_px[y,x]), 3, (0,255,0), -1)  # GT (green)
-            cv2.circle(vis_img, tuple(pred_px[y,x]), 3, (0,0,255), -1)  # Pred (red)
-            cv2.line(vis_img, tuple(gt_px[y,x]), tuple(pred_px[y,x]), (255,255,0), 1)
+        for g, p in zip(gt_px, pred_px):
+            g_coord = (int(round(g[0])), int(round(g[1])))
+            p_coord = (int(round(p[0])), int(round(p[1])))
+            cv2.circle(vis_img, g_coord, 4, (0, 255, 0), -1)
+            cv2.circle(vis_img, p_coord, 4, (0, 0, 255), -1)
+            cv2.line(vis_img, g_coord, p_coord, (255, 255, 0), 2)
+
         
+        cv2.putText(vis_img, f"itr {iter_idx}", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
+        
+        # cv2.imshow("reproj_img", vis_img)
+        # cv2.waitKey(0)
         # Convert back to tensor
-        vis_img = torch.from_numpy(vis_img).permute(2,0,1).float() / 255.0
+        vis_img = torch.from_numpy(vis_img).permute(2,0,1).float() #/ 255.0
         return vis_img
 
     @torch.no_grad()
