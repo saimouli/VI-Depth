@@ -164,7 +164,7 @@ class BasicUpdateBlockDepth(nn.Module):
                 
         self.encoder = ProjectionInputDepth(cost_dim=cost_dim, hidden_dim=hidden_dim, out_chs=hidden_dim)
         self.depth_gru = SepConvGRU(hidden_dim=hidden_dim, input_dim=self.encoder.out_chs+context_dim)
-        self.depth_head = OutputScaleConv(features=128, groups=1, activation=nn.ReLU(False), non_negative=False)
+        self.depth_head = OutputScaleConv(features=hidden_dim, groups=1, activation=nn.ReLU(False), non_negative=False)
         self.mask = nn.Sequential(
             nn.Conv2d(hidden_dim, hidden_dim*2, 3, padding=1),
             nn.ReLU(inplace=True),
@@ -196,8 +196,8 @@ class BasicUpdateBlockDepth(nn.Module):
                 
             delta_scales = self.depth_head(hidden)
             delta_scales = 1.0 + 0.5 * torch.tanh(delta_scales)  # [0.5, 1.5] range #ensure positive scale
-            print(f"inv_depth mean step {i}: {inv_depth.mean().item()}")
-            print("delta_scales mean step", i, delta_scales.mean().item())
+            #print(f"inv_depth mean step {i}: {inv_depth.mean().item()}")
+            #print("delta_scales mean step", i, delta_scales.mean().item())
             
             if self.log_fn:
                 self.log_fn(f"UpdateBlock/Iteration_{i}/delta_scales_mean", delta_scales.mean().item(), on_step=True, logger=True)
@@ -354,9 +354,10 @@ class midasConsNet(nn.Module):
         )
         self.contextLearner.train()
     
-        self.hidden_dim = 128
+        self.hidden_dim = 96
         self.cost_dim = 32
         self.iter_steps = 3
+        self.seq_len = 4
         
         self.context_conv = nn.Conv2d(
             in_channels=64,
@@ -635,7 +636,7 @@ class midasConsNet(nn.Module):
             
             # Step2: compute cost map and optimize depth scale iteratively
             for itr in range(self.iter_steps):
-                print("Iter: {}".format(itr))
+                #print("Iter: {}".format(itr))
                 self.log_fn(f"Iter_{itr}/hidden_state_norm", hidden_d.norm().item(), on_step=True, logger=True)
                 self.log_fn(f"Iter_{itr}/input_state_norm", inp_d.norm().item(), on_step=True, logger=True)
                 
@@ -666,7 +667,7 @@ class midasConsNet(nn.Module):
                 #update depth #TODO: check and understand this function
                 hidden_d, up_mask_seqs, inv_depth_seqs = self.update_block_depth(hidden_d, depth_cost_map_func,
                                                                                 refined_inv_depth, inp_d,
-                                                                                seq_len=4)
+                                                                                seq_len=self.seq_len)
                 
                 #we won't supervise the intermediate predictions
                 up_mask_seqs, inv_depth_seqs = [up_mask_seqs[-1]], [inv_depth_seqs[-1]]
@@ -698,7 +699,7 @@ class midasConsNet(nn.Module):
                 pose_list_seqs = [None] * len(pose_list)
                 for i, (ref_pose, hidden_p) in enumerate(zip(pose_list, hidden_p_list)):
                     hidden_p, pose_seqs = self.update_block_pose(hidden_p, pose_cost_func_list[i],
-                                                                 ref_pose, inp_p_list[i], seq_len=4)
+                                                                 ref_pose, inp_p_list[i], seq_len=self.seq_len)
                     hidden_p_list[i] = hidden_p
                     if not self.inter_sup:
                         pose_seqs = [pose_seqs[-1]] #take final iteration
