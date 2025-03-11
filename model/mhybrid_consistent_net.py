@@ -257,7 +257,7 @@ class BasicUpdateBlockPose(nn.Module):
         self.pose_gru = SepConvGRU(hidden_dim=hidden_dim, input_dim=self.encoder.out_chs+context_dim)
         self.pose_head = PoseHead(hidden_dim, hidden_dim=hidden_dim)
         
-    def forward(self, hidden_p, cost_func, ref_pose, inp, seq_len=4):
+    def forward(self, hidden_p, cost_func, ref_pose, inp, seq_len=4, depth_only=False):
         pose_list = []
         #convert to ref_pose from 4x4 to 6x1
         ref_pose_init = pose_to_se3(ref_pose)
@@ -269,8 +269,11 @@ class BasicUpdateBlockPose(nn.Module):
                 
             hidden_p = self.pose_gru(hidden_p, inp_i)
             delta_pose = self.pose_head(hidden_p)
-                
-            pose = ref_pose @ se3_to_pose(delta_pose)
+            
+            if depth_only:
+                pose = ref_pose
+            else:
+                pose = ref_pose @ se3_to_pose(delta_pose)
             pose_list.append(pose)
         return hidden_p, pose_list
 class UpMaskNet(nn.Module):
@@ -349,12 +352,14 @@ class midasConsNet(nn.Module):
                                                             ratio=3, 
                                                             context_dim=self.cost_dim,
                                                             min_pred=self.min_pred,
-                                                            max_pred=self.max_pred)
+                                                            max_pred=self.max_pred,
+                                                            log_fn=self.log_fn)
             
             self.update_block_pose = BasicUpdateBlockPose(hidden_dim=self.hidden_dim,
                                                           cost_dim=self.cost_dim,
                                                           ratio=3,
-                                                          context_dim=self.cost_dim)
+                                                          context_dim=self.cost_dim,
+                                                          )
             self.inter_sup = False
             
         else:
@@ -363,7 +368,29 @@ class midasConsNet(nn.Module):
             
         self.scaleOutput = OutputScaleConv(features=self.hidden_dim + self.cost_dim, groups=1, 
                                             activation=nn.ReLU(False), non_negative=False)
-        
+
+    def freeze_pose_branch(self, freeze=True):
+        """
+        Freeze or unfreeze the pose refinement branch of the model
+        """
+        if freeze:
+            # Freeze pose update block and related components
+            for param in self.update_block_pose.parameters():
+                param.requires_grad = False
+            
+            # Also freeze contextPose if using ConvGRU
+            for param in self.contextPose.parameters():
+                param.requires_grad = False
+        else:
+            # Unfreeze pose update block and related components
+            for param in self.update_block_pose.parameters():
+                param.requires_grad = True
+            
+            # Also unfreeze contextPose if using ConvGRU
+            for param in self.contextPose.parameters():
+                param.requires_grad = True
+                
+                
     def upsample_depth(self, depth, mask, ratio):
         """ Upsample depth field [H/ratio, W/ratio, 2] -> [H, W, 2] using convex combination """
         N, _, H, W = depth.shape
@@ -456,7 +483,7 @@ class midasConsNet(nn.Module):
         return torch.stack(batch_inputs, dim=0)
     
     def forward(self, tgt_img, ref_imgs, tgt_ga_depth, ref_ga_depth, 
-                tgt_interp, ref_interp, tgt_pose, ref_pose, intrinsics):
+                tgt_interp, ref_interp, tgt_pose, ref_pose, intrinsics, depth_only=False):
         """
         Refine metric depth scale and VIO poses and target/reference images.
         """
@@ -542,8 +569,8 @@ class midasConsNet(nn.Module):
         # Step2: compute cost map and optimize depth scale iteratively
         for itr in range(self.iter_steps):
             #print("Iter: {}".format(itr))
-            self.log_fn(f"Iter_{itr}/hidden_state_norm", hidden_d.norm().item(), on_step=True, logger=True)
-            self.log_fn(f"Iter_{itr}/input_state_norm", inp_d.norm().item(), on_step=True, logger=True)
+            #self.log_fn(f"Iter_{itr}/hidden_state_norm", hidden_d.norm().item(), on_step=True, logger=True)
+            #self.log_fn(f"Iter_{itr}/input_state_norm", inp_d.norm().item(), on_step=True, logger=True)
                 
             # Detach tensors to avoid backprop through refinement history
             refined_inv_depth = refined_inv_depth.detach()
@@ -606,7 +633,8 @@ class midasConsNet(nn.Module):
             pose_list_seqs = [None] * len(pose_list)
             for i, (ref_pose, hidden_p) in enumerate(zip(pose_list, hidden_p_list)):
                 hidden_p, pose_seqs = self.update_block_pose(hidden_p, pose_cost_func_list[i],
-                                                                 ref_pose, inp_p_list[i], seq_len=self.seq_len)
+                                                            ref_pose, inp_p_list[i], seq_len=self.seq_len, 
+                                                            depth_only=depth_only)
                 hidden_p_list[i] = hidden_p
                 if not self.inter_sup:
                     pose_seqs = [pose_seqs[-1]] #take final iteration
