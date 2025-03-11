@@ -226,14 +226,53 @@ class SML_consistent_dataset(Dataset):
         ref_interp = [load_depth_image_from_npy(str(ref_interp)) for ref_interp in sample['ref_interp']]
         ref_gt_depth = [load_sparse_depth(str(ref_gt_depth), depth_scale=self.depth_scale) for ref_gt_depth in sample['ref_gt_depth']]
         ref_pose = [self.convert_to_4x4(np.loadtxt(pose)) for pose in sample['ref_pose']]
-        intrinsics = np.copy(sample['intrinsics'])
 
+        intrinsics = np.copy(sample['intrinsics'])
+        
+        # Get original image dimensions
+        h, w = tgt_img.shape[:2]
+        # crop_size = (384, 384)
+        
+        # # Calculate crop offsets for center crop
+        # top = (h - crop_size[0]) // 2
+        # left = (w - crop_size[1]) // 2
+        
+        # # Ensure non-negative offsets
+        # top = max(0, top)
+        # left = max(0, left)
+    
+        # # Apply crop to target image and depths
+        # tgt_img = tgt_img[top:top+crop_size[0], left:left+crop_size[1]]
+        # tgt_gt_depth = tgt_gt_depth[top:top+crop_size[0], left:left+crop_size[1]]
+        # tgt_sparse_depth = tgt_sparse_depth[top:top+crop_size[0], left:left+crop_size[1]]
+        # tgt_ga_depth = tgt_ga_depth[top:top+crop_size[0], left:left+crop_size[1]]
+        # tgt_interp = tgt_interp[top:top+crop_size[0], left:left+crop_size[1]]
+        
+        # # Apply crop to reference images and depths
+        # ref_img = [img[top:top+crop_size[0], left:left+crop_size[1]] for img in ref_img]
+        # ref_ga_depth = [depth[top:top+crop_size[0], left:left+crop_size[1]] for depth in ref_ga_depth]
+        # ref_sparse_depth = [depth[top:top+crop_size[0], left:left+crop_size[1]] for depth in ref_sparse_depth]
+        # ref_interp = [depth[top:top+crop_size[0], left:left+crop_size[1]] for depth in ref_interp]
+        # ref_gt_depth = [depth[top:top+crop_size[0], left:left+crop_size[1]] for depth in ref_gt_depth]
+        
+        # # Update intrinsics to account for cropping
+        # # intrinsics is typically [fx, fy, cx, cy] or a 3x3 matrix
+        # if intrinsics.shape == (4,):  # [fx, fy, cx, cy] format
+        #     # Adjust principal point
+        #     intrinsics[2] = intrinsics[2] - left  # cx
+        #     intrinsics[3] = intrinsics[3] - top   # cy
+        # elif intrinsics.shape == (3, 3):  # 3x3 matrix format
+        #     # Adjust principal point
+        #     intrinsics[0, 2] = intrinsics[0, 2] - left  # cx
+        #     intrinsics[1, 2] = intrinsics[1, 2] - top   # cy
+        
         mask = (tgt_gt_depth < 5.0)
         mask *= (tgt_gt_depth > 0.2)
         tgt_gt_depth[~mask] = np.inf
         tgt_gt_depth_inv = 1.0 / tgt_gt_depth
         tgt_gt_depth_inv[tgt_gt_depth_inv == float("inf")] = 0
         tgt_gt_depth_inv = torch.from_numpy(tgt_gt_depth_inv).unsqueeze(0)
+    
         
         tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_sparse_depth, tgt_interp, tgt_pose = [
             T.astype(np.float32) if isinstance(T, np.ndarray) else T for T in [
@@ -277,7 +316,7 @@ class SML_consistent_dataset(Dataset):
         
 # #       perturbed_pose = ref_pose[0].clone().detach().requires_grad_(True)
 # #       optimizer = torch.optim.Adam([perturbed_pose], lr=1e-3)
-#         ref_rel_poses = [tgt_pose.inverse() @ ref_p for ref_p in ref_pose_per]
+#         ref_rel_poses = [tgt_pose.inverse() @ ref_p for ref_p in ref_pose]
 #         cam = Camera(K=intrinsics.float()).scaled(scale_factor)
 #         ref_cam1 = Camera(K=intrinsics.float(), Twc=ref_rel_poses[0]).scaled(scale_factor)
 #         ref_cam2 = Camera(K=intrinsics.float(), Twc=ref_rel_poses[1]).scaled(scale_factor)
@@ -347,7 +386,7 @@ class SML_consistent_dataset(Dataset):
 #         axes[3].axis("off")
 
 #         plt.tight_layout()
-#         #plt.show()
+#         plt.show()
                 
 #         #ref_imgs_np = [ref_img.transpose(1, 2, 0).astype(np.uint8) for ref_img in ref_imgs]
 #         fig, axes = plt.subplots(1, len(ref_imgs) + 1, figsize=(15, 5))

@@ -633,6 +633,11 @@ class midasNetConsistentModule(pl.LightningModule):
             depth_norm = (depth - depth.min()) / (depth.max() - depth.min() + 1e-6)
             return apply_colormap(depth_norm, cmap)
 
+        def overlay_text_on_image(image, text, position=(10, 30), font_scale=0.5, color=(255, 255, 255)):
+            image_np = (image.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            cv2.putText(image_np, text, position, cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness=1, lineType=cv2.LINE_AA)
+            return torch.from_numpy(image_np).permute(2, 0, 1).float() / 255.0 
+    
         depth_grid = []
         gt_depth_grid = []
         error_grid = []
@@ -642,7 +647,23 @@ class midasNetConsistentModule(pl.LightningModule):
             # Get current refinement results
             pred_depth = utils.inv2depth(inv_depth_predictions[iter_idx][idx])
             pred_pose = refined_ref_poses[0][iter_idx][0].unsqueeze(0)  # First ref view
+            
+            # Depth error
+            error = torch.abs(pred_depth.cpu() - gt_depth.squeeze())
+            depth_error_rmse = torch.sqrt((error ** 2).mean()).item()
 
+            # 
+            gt_pose = ref_gt_pose[0][0].unsqueeze(0)
+            R_pred, T_pred = pred_pose[:, :3, :3], pred_pose[:, :3, 3]
+            R_gt, T_gt = gt_pose[:, :3, :3], gt_pose[:, :3, 3]
+            
+            R_diff = R_gt.transpose(1, 2) @ R_pred 
+            trace = R_diff.diagonal(dim1=-2, dim2=-1).sum(-1)
+            trace_clamped = torch.clamp((trace - 1) / 2, -1, 1)
+            
+            R_error = torch.acos(trace_clamped) * (180 / np.pi)
+            T_error = torch.norm(T_gt - T_pred, dim=-1).mean().item()
+            
             # 3. Compute current predictions --------------------------------------
             pred_proj, pred_valid = self.compute_reprojection(
                 depth=gt_depth_metric,
@@ -663,14 +684,21 @@ class midasNetConsistentModule(pl.LightningModule):
             pred_depth_rgb = depth_to_rgb(pred_depth).detach().cpu()
             gt_depth_rgb = depth_to_rgb(gt_depth.squeeze()).detach().cpu()
             
+            # Overlay error text
+            pred_depth_rgb = overlay_text_on_image(pred_depth_rgb, f"Depth RMSE: {depth_error_rmse:.3f}", position=(10, 20))
+            reproj_img = overlay_text_on_image(reproj_img/255.0, f"R: {R_error.item():.3f}°, T: {T_error:.3f}", position=(10, 20))
+            
             depth_grid.append(pred_depth_rgb.unsqueeze(0))  # (1, 3, H, W)
             gt_depth_grid.append(gt_depth_rgb.unsqueeze(0))
+            
             
             error = torch.abs(pred_depth.cpu() - gt_depth.squeeze())
             error_rgb = apply_colormap(error.squeeze(0), 'Reds').detach().cpu()
             error_grid.append(error_rgb.unsqueeze(0))  # (1, 3, H, W)
             
             reproj_grid.append(reproj_img.unsqueeze(0).detach().cpu()) 
+            
+            
 
         # depth_grid.append(depth_to_rgb(pred_depth).unsqueeze(0).permute(0, 3, 1, 2))
         # error = torch.abs(pred_depth.cpu() - gt_depth.squeeze())
