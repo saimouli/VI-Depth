@@ -184,7 +184,7 @@ class BasicUpdateBlockDepth(nn.Module):
     def forward(self, hidden, cost_func, inv_depth, context, seq_len=4):
         inv_depth_list = [] 
         mask_list = []
-        
+        cost_means = []
         for i in range(seq_len):
             cost, _ = cost_func(inv_depth)
             #print("cost {}: mean{}".format(i, cost.mean()))
@@ -196,7 +196,9 @@ class BasicUpdateBlockDepth(nn.Module):
                 inv_depth_low = inv_depth
                 
             if self.log_fn:
-                self.log_fn(f"UpdateBlock/Iteration_{i}/cost_mean", cost.mean().item(), on_step=True, logger=True)
+                with torch.no_grad():
+                    self.log_fn(f"UpdateBlock/Iteration_{i}/cost_mean", cost.mean().item(), on_step=True, logger=True)
+                    cost_means.append(cost.mean().item())
                 
             input_features = self.encoder(inv_depth_low, cost) #(b,1,72,96),(b,32,72,96) 
             inp_i = torch.cat([context, input_features], dim=1)#(2,32,72,96),(2,128,288,384) 
@@ -235,7 +237,7 @@ class BasicUpdateBlockDepth(nn.Module):
             inv_depth_list.append(inv_depth_pred)
             mask_list.append(mask)
             
-        return hidden, mask_list, inv_depth_list
+        return hidden, mask_list, inv_depth_list, cost_means
     
 class PoseHead(nn.Module):
     def __init__(self, input_dim=256, hidden_dim=128):
@@ -300,8 +302,8 @@ class midasConsNet(nn.Module):
         model_transforms = transforms.get_transforms("dpt_hybrid", "void", str(nsamples))
         self.ScaleMapLearner_transform = model_transforms["sml_model"]
 
-        self.hidden_dim = 96
-        self.cost_dim = 32
+        self.hidden_dim = 128 #96
+        self.cost_dim = 64 #32
         self.iter_steps = 3
         self.seq_len = 3
         
@@ -319,7 +321,7 @@ class midasConsNet(nn.Module):
         #     param.requires_grad = False
         # self.FeatExtractor.eval()
         
-        self.fnet = ResNetEncoder(out_chs=32, stride=4)
+        self.fnet = ResNetEncoder(out_chs=self.cost_dim, stride=4)
         self.cnet_depth = ResNetEncoder(out_chs=self.hidden_dim + self.cost_dim, stride=4, context_num=2, pretrained=False)
     
         # self.contextLearner = MidasNet_small_cons_videpth(
@@ -349,7 +351,8 @@ class midasConsNet(nn.Module):
                                                             ratio=3, 
                                                             context_dim=self.cost_dim,
                                                             min_pred=self.min_pred,
-                                                            max_pred=self.max_pred)
+                                                            max_pred=self.max_pred,
+                                                            log_fn=self.log_fn)
             
             self.update_block_pose = BasicUpdateBlockPose(hidden_dim=self.hidden_dim,
                                                           cost_dim=self.cost_dim,
@@ -542,8 +545,9 @@ class midasConsNet(nn.Module):
         # Step2: compute cost map and optimize depth scale iteratively
         for itr in range(self.iter_steps):
             #print("Iter: {}".format(itr))
-            self.log_fn(f"Iter_{itr}/hidden_state_norm", hidden_d.norm().item(), on_step=True, logger=True)
-            self.log_fn(f"Iter_{itr}/input_state_norm", inp_d.norm().item(), on_step=True, logger=True)
+            with torch.no_grad():
+                self.log_fn(f"Iter_{itr}/hidden_state_norm", hidden_d.norm().item(), on_step=True, logger=True)
+                self.log_fn(f"Iter_{itr}/input_state_norm", inp_d.norm().item(), on_step=True, logger=True)
                 
             # Detach tensors to avoid backprop through refinement history
             refined_inv_depth = refined_inv_depth.detach()
@@ -564,7 +568,7 @@ class midasConsNet(nn.Module):
                                         scale_factor=1.0/scale_factor)
                 
             #update depth #TODO: check and understand this function
-            hidden_d, up_mask_seqs, inv_depth_seqs = self.update_block_depth(hidden_d, depth_cost_map_func,
+            hidden_d, up_mask_seqs, inv_depth_seqs, cost_means = self.update_block_depth(hidden_d, depth_cost_map_func,
                                                                             refined_inv_depth, inp_d,
                                                                             seq_len=self.seq_len)
                 
@@ -589,8 +593,10 @@ class midasConsNet(nn.Module):
             inv_depth_predictions.append(refined_depth_inv)
 
             if self.log_fn:
-                self.log_fn(f"Iter_{itr}/depth_mean", refined_depth_inv.mean().item(), on_step=True, logger=True)
-                self.log_fn(f"Iter_{itr}/depth_var", refined_depth_inv.var().item(), on_step=True, logger=True)
+                with torch.no_grad():
+                    print(f"Iter {itr} cost progression: {cost_means}")
+                    self.log_fn(f"Iter_{itr}/depth_mean", refined_depth_inv.mean().item(), on_step=True, logger=True)
+                    self.log_fn(f"Iter_{itr}/depth_var", refined_depth_inv.var().item(), on_step=True, logger=True)
                         
             refined_inv_depth = inv_depth_seqs[-1]
                 

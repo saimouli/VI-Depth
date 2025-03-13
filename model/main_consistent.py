@@ -483,13 +483,23 @@ class midasNetConsistentModule(pl.LightningModule):
         #                                                                                     ref_rel_poses, 
         #                                                                                     intrinsics)
         
-        #(b, n, iters, 6)    
-        refined_depth_inv, refined_ref_poses = self.model(tgt_img, ref_imgs,
-                                                        tgt_ga_depth, ref_ga_depth, 
-                                                        tgt_interp, ref_interp, 
-                                                        tgt_pose, 
-                                                        ref_rel_poses, 
-                                                        intrinsics)
+        #(b, n, iters, 6) 
+        if self.current_epoch < 10: 
+            self.model.iter_steps=3  
+            refined_depth_inv, refined_ref_poses = self.model(tgt_img, ref_imgs,
+                                                            tgt_ga_depth, ref_ga_depth, 
+                                                            tgt_interp, ref_interp, 
+                                                            tgt_pose, 
+                                                            ref_rel_gtposes, 
+                                                            intrinsics)
+        elif self.current_epoch < 30:
+            self.model.iter_steps=3
+            refined_depth_inv, refined_ref_poses = self.model(tgt_img, ref_imgs,
+                                                            tgt_ga_depth, ref_ga_depth, 
+                                                            tgt_interp, ref_interp, 
+                                                            tgt_pose, 
+                                                            ref_rel_poses, 
+                                                            intrinsics)
         # 1. Depth L1 Loss
         # depth_loss,_ = self.compute_loss(utils.inv2depth(refined_depth_inv),
         #                         gt_depth,
@@ -558,7 +568,7 @@ class midasNetConsistentModule(pl.LightningModule):
         #self.log(f"{stage}/pose_reg_loss", pose_reg, on_step=True, on_epoch=True, sync_dist=True)
         self.log(f"{stage}/reproj_loss", reproj_loss, on_step=True, on_epoch=True, sync_dist=True)
         self.log(f"{stage}/l1_depth_loss", depth_loss, on_step=True, on_epoch=True, sync_dist=True)
-        self.log(f"{stage}/total_loss", total_loss, on_step=True, on_epoch=True, sync_dist=True)
+        self.log(f"{stage}/total_loss", total_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
         
         with torch.no_grad():
             self.log_refinement_progress(tgt_img, ref_imgs, gt_depth,
@@ -633,7 +643,7 @@ class midasNetConsistentModule(pl.LightningModule):
             depth_norm = (depth - depth.min()) / (depth.max() - depth.min() + 1e-6)
             return apply_colormap(depth_norm, cmap)
 
-        def overlay_text_on_image(image, text, position=(10, 30), font_scale=0.5, color=(255, 255, 255)):
+        def overlay_text_on_image(image, text, position=(10, 30), font_scale=0.5, color=(255, 0, 0)):
             image_np = (image.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
             cv2.putText(image_np, text, position, cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness=1, lineType=cv2.LINE_AA)
             return torch.from_numpy(image_np).permute(2, 0, 1).float() / 255.0 

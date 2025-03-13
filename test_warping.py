@@ -545,11 +545,13 @@ def tum_data():
 
 
 if __name__ == "__main__":
+    pass
     #run_sml(
     #    dataset_path="/media/saimouli/RPNG_FLASH_4/datasets/VOID_150/classroom6",
     #    depth_predictor="dpt_hybrid",
     #    nsamples=150,
     #    sml_model_path="/home/saimouli/Documents/github/VI_Depth_sai/weights/sml_model.dpredictor.dpt_hybrid.nsamples.150.ckpt")
 
-    test_sim()
+    #test_sim()
     #tum_data()
+    

@@ -21,3 +21,4 @@ dependencies:
     - kornia==0.6.7
     - jsonargparse[signatures]>=4.27.7
 #pip install torch-sparse -f https://data.pyg.org/whl/torch-1.13.0+cu117.html
+#pip install "git+https://github.com/facebookresearch/pytorch3d.git"
