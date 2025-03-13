@@ -13,11 +13,12 @@ from visualizer.ros_visualizer import PointCloudVisualizer
 from visualize_data import project_depth_vectorize
 import rospy
 from model.mhybrid_net import midasNet
+from model.main import midasNetModule
 from geometry_msgs.msg import Pose, Point
 import metrics
 import matplotlib.pyplot as plt
 
-ROS_VIZ = False; EVAL = True
+ROS_VIZ = True; EVAL = False
 
 min_depth, max_depth = 0.2, 5.0
 min_pred, max_pred = 0.1, 8.0
@@ -129,15 +130,15 @@ def plot_depth(tgt_img_cpu, tgt_gt_depth_inv_cpu, tgt_ga_depth_cpu, tgt_pred_dep
     
 #currently evaluating the GT depth consistency TODO: include valid mask for gt depth
 if __name__ == "__main__":
-    dataset = SML_consistent_dataset(data_root='/media/saimouli/Data6T/datasets/VOID_150_small', mode='val')
+    dataset = SML_consistent_dataset(data_root='/media/saimouli/Data6T/datasets/VOID_150_test', mode='val')
     dataloader = torch.utils.data.DataLoader(dataset)
     
-    #sml_model_path = "/home/saimouli/Documents/github/VI_Depth_sai/weights/sml_model.dpredictor.dpt_hybrid.nsamples.150.ckpt"
-    sml_model_path = "weights/sml_model.dpredictor.dpt_hybrid.nsamples.150.pretrained.ckpt" #tartanair
+    sml_model_path = "/home/saimouli/Documents/github/VI_Depth_sai/weights/sml_model.dpredictor.dpt_hybrid.nsamples.150.ckpt"
+    #sml_model_path = "weights/sml_model.dpredictor.dpt_hybrid.nsamples.150.pretrained.ckpt" #tartanair
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     #model = midasNet(min_pred, max_pred, min_depth, max_depth, 150, sml_model_path)
-    #model_transforms = transforms.get_transforms("dpt_hybrid", "void", str(150))
-    #ScaleMapLearner_transform = model_transforms["sml_model"]
+    model_transforms = transforms.get_transforms("dpt_hybrid", "void", str(150))
+    # ScaleMapLearner_transform = model_transforms["sml_model"]
     # ScaleMapLearner = MidasNet_small_videpth(
     #     path=sml_model_path,
     #     min_pred=min_pred,
@@ -146,10 +147,16 @@ if __name__ == "__main__":
     # ScaleMapLearner.eval()
     # ScaleMapLearner.to(device)
     
-    model = midasNetConsistentModule()
-    model.load_from_checkpoint("lightning_logs/ckpt/checkpoints/epoch=1-val/total_loss=0.150.ckpt")
-    model.eval()
-    model.to(device)
+    # model = midasNetModule()
+    # model.load_from_checkpoint("weights/total_loss=0.095.ckpt", map_location=device)
+    # model.eval()
+    # model.to(device)
+    
+    #model = midasNetConsistentModule()
+    #model = model.load_from_checkpoint("/home/saimouli/Documents/github/VI_Depth_sai/weights/withcostv/total_loss=0.088.ckpt")
+    #model = model.load_from_checkpoint("/home/saimouli/Documents/github/VI_Depth_sai/weights/without_costv/total_loss=0.086.ckpt")
+    #model.eval()
+    #model.to(device)
     
     first_frame = True
     threshold = 0.05  # Threshold for inlier correspondence
@@ -170,7 +177,7 @@ if __name__ == "__main__":
         )
         
         tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, tgt_sparse_depth, ref_img, \
-        ref_ga_depth, ref_interp, ref_gt_depth, ref_sparse_depth, tgt_pose, ref_pose, intrinsics = batch_data #dataset[idx] #Cam2Wld poses (R_ctoG, p_CinG)
+        ref_ga_depth, ref_interp, ref_gt_depth, ref_sparse_depth, tgt_pose, ref_pose, intrinsics,_,_ = batch_data #dataset[idx] #Cam2Wld poses (R_ctoG, p_CinG)
 
         _,H, W,_ = tgt_img.shape
         _,_, DH, DW = tgt_gt_depth_inv.shape
@@ -183,14 +190,17 @@ if __name__ == "__main__":
         filtered_gt_depth_inv = torch.zeros_like(tgt_gt_depth_inv)
         filtered_gt_depth_inv[valid_mask] = 1.0 / filtered_gt_depth[valid_mask]
         
-        sml_depth_inv = model(tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, ref_img, 
-                                      ref_ga_depth, ref_interp, ref_gt_depth, tgt_pose, ref_pose, intrinsics)
+        #compute consistent module
+        # sml_depth_inv = model(tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, ref_img, 
+        #                               ref_ga_depth, ref_interp, ref_gt_depth, tgt_pose, ref_pose, intrinsics)
         
-        sml_depth_inv = sml_depth_inv.detach().cpu()
+        # sml_depth_inv = sml_depth_inv.detach().cpu()
+        #sml_depth_inv, _ = model(tgt_sparse_depth, tgt_img, _, tgt_interp, tgt_ga_depth)
+        #sml_depth_inv = sml_depth_inv.detach().cpu()
         
         #plot rgb, gt depth, ga depth, sml depth
-        plot_depth(tgt_img[0].cpu().numpy(), utils.inv2depth(tgt_gt_depth_inv[0][0]).cpu().numpy(), 
-                   utils.inv2depth(tgt_ga_depth[0]).cpu().numpy(), utils.inv2depth(sml_depth_inv[0][0]).cpu().numpy())
+        # plot_depth(tgt_img[0].cpu().numpy(), utils.inv2depth(tgt_gt_depth_inv[0][0]).cpu().numpy(), 
+        #            utils.inv2depth(tgt_ga_depth[0]).cpu().numpy(), utils.inv2depth(sml_depth_inv[0][0]).cpu().numpy())
         
         
         #print(sml_depth_inv.shape)
@@ -216,11 +226,11 @@ if __name__ == "__main__":
         
         #TODO: use our cost here with GT depth
         #step1: downscale the depth and project
-        #cam_curr = Camera(K=intrinsics.float(), Twc=tgt_pose).scaled(scale_factor)
-        #pc2_gt = cam_curr.reconstruct(utils.inv2depth(filtered_gt_depth_inv), frame='w')[0].permute(1,2,0).view(-1, 3).cpu().numpy()
+        cam_curr = Camera(K=intrinsics.float(), Twc=tgt_pose).scaled(scale_factor)
+        pc2_gt = cam_curr.reconstruct(utils.inv2depth(filtered_gt_depth_inv), frame='w')[0].permute(1,2,0).view(-1, 3).cpu().numpy()
         #pc2_sml = cam_curr.reconstruct(utils.inv2depth(sml_depth_inv), frame='w')[0].permute(1,2,0).view(-1, 3).cpu().numpy()
         #pc_sparse = cam_curr.reconstruct(tgt_sparse_depth, frame='w')[0].permute(1,2,0).view(-1, 3).cpu().numpy()
-        #colors_gt = tgt_img[0].reshape(-1,3).cpu().numpy() * 255
+        colors_gt = tgt_img[0].reshape(-1,3).cpu().numpy() * 255
         
         #step2: downscale the ga_depth and project
         #step3: get features and calculate cost
@@ -261,16 +271,16 @@ if __name__ == "__main__":
             mask = valid_mask.squeeze(0).cpu().numpy()
             error_w_int_depth = metrics.ErrorMetrics()
             error_w_int_depth.compute(
-                estimate = tgt_ga_depth.cpu().numpy(), 
-                target = filtered_gt_depth_inv.cpu().squeeze(0).numpy(), 
+                estimate = tgt_ga_depth.cpu().detach().numpy(), 
+                target = filtered_gt_depth_inv.cpu().detach().squeeze(0).numpy(), 
                 valid = mask.astype(bool),
             )
 
             # # compute error metrics using SML output depth
             error_w_pred = metrics.ErrorMetrics()
             error_w_pred.compute(
-                estimate = sml_depth_inv.cpu().squeeze(0).numpy(), 
-                target = filtered_gt_depth_inv.cpu().squeeze(0).numpy(), 
+                estimate = sml_depth_inv.cpu().detach().squeeze(0).numpy(), 
+                target = filtered_gt_depth_inv.cpu().detach().squeeze(0).numpy(), 
                 valid = mask.astype(bool),
             )
             

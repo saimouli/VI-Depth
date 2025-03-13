@@ -34,6 +34,11 @@ def visualize_reproj_error(
     if isinstance(valid_mask, torch.Tensor):
         valid_mask = valid_mask.cpu().numpy()
 
+    print("tgt_img: ", tgt_img.shape)
+    print("proj_pred: ", proj_pred.shape)
+    print("proj_gt: ", proj_gt.shape)
+    print("valid_mask: ", valid_mask.shape)
+    
     # Ensure target image is in [0, 255] range
     if tgt_img.max() <= 1.0:
         tgt_img = (tgt_img * 255).astype(np.uint8)
@@ -50,9 +55,9 @@ def visualize_reproj_error(
     x_samples = x_coords[sample_indices]
 
     # Plot the target image
-    plt.figure(figsize=(10, 5))
-    plt.imshow(tgt_img)
-    plt.title("Reprojection Error Visualization")
+    # plt.figure(figsize=(10, 5))
+    # plt.imshow(tgt_img)
+    # plt.title("Reprojection Error Visualization")
 
     # Plot GT and predicted points for each reference view
     #for ref_idx in range(1):
@@ -365,10 +370,10 @@ if __name__ == "__main__":
         refined_rel_poses = [pose_to_se3(tgt_pose.inverse() @ ref_p) for ref_p in ref_poses]
         pose_ref = tgt_pose @ se3_to_pose(refined_rel_poses[0])
 
-        test_cost_warping_with_poses(intrinsics, tgt_pose, ref_poses[0], 
-                                     tgt_pose, ref_pose_perturbed[0], 
-                                     utils.inv2depth(tgt_gt_depth_inv), 
-                                     ref_img[0], tgt_img)
+        # test_cost_warping_with_poses(intrinsics, tgt_pose, ref_poses[0], 
+        #                              tgt_pose, ref_pose_perturbed[0], 
+        #                              utils.inv2depth(tgt_gt_depth_inv), 
+        #                              ref_img[0], tgt_img)
         
         compute_reproj_loss(utils.inv2depth(tgt_gt_depth_inv), utils.inv2depth(tgt_gt_depth_inv),
                             tgt_pose_perturbed, tgt_pose,

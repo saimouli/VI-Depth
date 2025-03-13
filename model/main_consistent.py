@@ -456,87 +456,88 @@ class midasNetConsistentModule(pl.LightningModule):
         
         gt_depth = utils.inv2depth(tgt_gt_depth_inv)
         
+        # if self.useConvGRU:
+        #     metric_depth_inv_pred = self.model(tgt_img, ref_imgs, tgt_ga_depth, ref_ga_depth, 
+        #                                     tgt_interp, ref_interp,
+        #                                     tgt_pose, ref_pose, intrinsics)
+            
+        #     # Compute depth loss with depth uncertainty
+        #     # loss, loss_info = self.compute_loss(utils.inv2depth(metric_depth_inv_pred), 
+        #     #                                    utils.inv2depth(tgt_gt_depth_inv),
+        #     #                                    log_variance=None)
+            
+        #     metric_depth_pred = utils.inv2depth(metric_depth_inv_pred)
+        #     total_loss = self.compute_exp_weighted_l1loss(metric_depth_pred, 
+        #                                             gt_depth)
+        # else:
+        
+        #convert to relative poses making the target pose identity
         with torch.no_grad():
             ref_rel_poses = [tgt_pose.inverse() @ ref_p for ref_p in ref_pose_perturbed]
-            ref_rel_gt_poses = [tgt_pose.inverse() @ ref_p for ref_p in ref_gt_pose]
+            ref_rel_gtposes = [tgt_pose.inverse() @ ref_p for ref_p in ref_gt_pose]
+            
+        # refined_depth_inv, refined_target_pose, refined_ref_poses, warping_vis = self.model(tgt_img, ref_imgs,
+        #                                                                                     tgt_ga_depth, ref_ga_depth, 
+        #                                                                                     tgt_interp, ref_interp, 
+        #                                                                                     tgt_pose, 
+        #                                                                                     ref_rel_poses, 
+        #                                                                                     intrinsics)
         
+        #(b, n, iters, 6) 
         if self.current_epoch < 10: 
-            
-            # Set model to depth-only mode
-            self.model.freeze_pose_branch(True)
-            
-            # Forward pass with GT poses for perfect correlation
-            refined_depth_inv, refined_ref_poses = self.model( #note the refined poses should be exactly as the gt poses
-                tgt_img, ref_imgs,
-                tgt_ga_depth, ref_ga_depth, 
-                tgt_interp, ref_interp,
-                tgt_pose,
-                ref_rel_gt_poses,  # Using GT poses
-                intrinsics,
-                depth_only=True
-            )
-            
-            pred_poses = []
-            for ref_idx in range(refined_ref_poses.shape[1]):  # Iterate through reference views
-                view_poses = []
-                for iter_idx in range(refined_ref_poses.shape[2]):  # Iterate through refinement steps
-                    # Extract pose vector [b, 6]
-                    pose_vec = refined_ref_poses[:, ref_idx, iter_idx, :]
-                    # Convert to Pose object
-                    view_poses.append(se3_to_pose(pose_vec))
-                pred_poses.append(view_poses)  # shape: (num_ref_views, num_iters)
-                
-            depth_loss = self.calculate_grudepth_loss(
-                utils.inv2depth(refined_depth_inv[-1]),  # Final prediction
-                utils.inv2depth(tgt_gt_depth_inv)
-            )
-            
-            total_loss = depth_loss
-            print(f"Depth-only training: Loss = {total_loss}")
-            
-        else:
-            #convert to relative poses making the target pose identity
-            self.model.freeze_pose_branch(False)
-            
-            #(b, n, iters, 6)    
+            self.model.iter_steps=3  
+            refined_depth_inv, refined_ref_poses = self.model(tgt_img, ref_imgs,
+                                                            tgt_ga_depth, ref_ga_depth, 
+                                                            tgt_interp, ref_interp, 
+                                                            tgt_pose, 
+                                                            ref_rel_gtposes, 
+                                                            intrinsics)
+        elif self.current_epoch < 30:
+            self.model.iter_steps=3
             refined_depth_inv, refined_ref_poses = self.model(tgt_img, ref_imgs,
                                                             tgt_ga_depth, ref_ga_depth, 
                                                             tgt_interp, ref_interp, 
                                                             tgt_pose, 
                                                             ref_rel_poses, 
                                                             intrinsics)
-            # 1. Depth L1 Loss
-            # depth_loss,_ = self.compute_loss(utils.inv2depth(refined_depth_inv),
-            #                         gt_depth,
-            #                         log_variance=None,
-            #                         mask=None)
-            
-            depth_loss = self.calculate_grudepth_loss(utils.inv2depth(refined_depth_inv), 
-                                                utils.inv2depth(tgt_gt_depth_inv))
-            
-            # 2. Reprojection loss
-            # reproj_loss = self.compute_reproj_loss(
-            #     gt_depth, gt_depth,
-            #     tgt_pose,             # Predicted target pose
-            #     tgt_pose,             # GT target pose
-            #     refined_ref_poses,    # Predicted reference poses
-            #     ref_gt_pose,             # GT reference poses
-            #     intrinsics,
-            #     ref_imgs,
-            #     log_tb=log_tb,
-            #     mode=stage
-            # )
-            
-            # refined_ref_poses shape: (b, num_ref_views, num_iters, 6)
-            pred_poses = []
-            for ref_idx in range(refined_ref_poses.shape[1]):  # Iterate through reference views
-                view_poses = []
-                for iter_idx in range(refined_ref_poses.shape[2]):  # Iterate through refinement steps
-                    # Extract pose vector [b, 6]
-                    pose_vec = refined_ref_poses[:, ref_idx, iter_idx, :]
-                    # Convert to Pose object
-                    view_poses.append(se3_to_pose(pose_vec))
-                pred_poses.append(view_poses)  # shape: (num_ref_views, num_iters)
+        # 1. Depth L1 Loss
+        # depth_loss,_ = self.compute_loss(utils.inv2depth(refined_depth_inv),
+        #                         gt_depth,
+        #                         log_variance=None,
+        #                         mask=None)
+        
+        depth_loss = self.calculate_grudepth_loss(utils.inv2depth(refined_depth_inv), 
+                                            utils.inv2depth(tgt_gt_depth_inv))
+        
+        #visualize flag
+        if batch_idx %10 == 0:
+            log_tb = True
+        else:
+            log_tb = False
+        
+        # 2. Reprojection loss
+        # reproj_loss = self.compute_reproj_loss(
+        #     gt_depth, gt_depth,
+        #     tgt_pose,             # Predicted target pose
+        #     tgt_pose,             # GT target pose
+        #     refined_ref_poses,    # Predicted reference poses
+        #     ref_gt_pose,             # GT reference poses
+        #     intrinsics,
+        #     ref_imgs,
+        #     log_tb=log_tb,
+        #     mode=stage
+        # )
+        
+        # refined_ref_poses shape: (b, num_ref_views, num_iters, 6)
+        pred_poses = []
+        for ref_idx in range(refined_ref_poses.shape[1]):  # Iterate through reference views
+            view_poses = []
+            for iter_idx in range(refined_ref_poses.shape[2]):  # Iterate through refinement steps
+                # Extract pose vector [b, 6]
+                pose_vec = refined_ref_poses[:, ref_idx, iter_idx, :]
+                # Convert to Pose object
+                view_poses.append(se3_to_pose(pose_vec))
+            pred_poses.append(view_poses)  # shape: (num_ref_views, num_iters)
 
             # Format ground truth poses ---------------------------------------------------
             # Assuming ref_gt_pose is list of absolute poses: [pose_ref1, pose_ref2,...]
@@ -568,7 +569,7 @@ class midasNetConsistentModule(pl.LightningModule):
         #self.logger.experiment.add_scalar(f"{stage}_loss", loss, self.global_step)
         #self.log(f"{stage}/pose_reg_loss", pose_reg, on_step=True, on_epoch=True, sync_dist=True)
         self.log(f"{stage}/l1_depth_loss", depth_loss, on_step=True, on_epoch=True, sync_dist=True)
-        self.log(f"{stage}/total_loss", total_loss, on_step=True, on_epoch=True, sync_dist=True)
+        self.log(f"{stage}/total_loss", total_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
         
         with torch.no_grad():
             self.log_refinement_progress(tgt_img, ref_imgs, gt_depth,
@@ -643,7 +644,7 @@ class midasNetConsistentModule(pl.LightningModule):
             depth_norm = (depth - depth.min()) / (depth.max() - depth.min() + 1e-6)
             return apply_colormap(depth_norm, cmap)
 
-        def overlay_text_on_image(image, text, position=(10, 30), font_scale=0.5, color=(255, 255, 255)):
+        def overlay_text_on_image(image, text, position=(10, 30), font_scale=0.5, color=(255, 0, 0)):
             image_np = (image.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
             cv2.putText(image_np, text, position, cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness=1, lineType=cv2.LINE_AA)
             return torch.from_numpy(image_np).permute(2, 0, 1).float() / 255.0 
