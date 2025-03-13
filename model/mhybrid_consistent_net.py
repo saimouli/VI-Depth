@@ -356,8 +356,6 @@ class midasConsNet(nn.Module):
                                                             min_pred=self.min_pred,
                                                             max_pred=self.max_pred,
                                                             log_fn=self.log_fn)
-                                                            max_pred=self.max_pred,
-                                                            log_fn=self.log_fn)
             
             self.update_block_pose = BasicUpdateBlockPose(hidden_dim=self.hidden_dim,
                                                           cost_dim=self.cost_dim,

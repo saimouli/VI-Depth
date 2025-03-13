@@ -484,22 +484,32 @@ class midasNetConsistentModule(pl.LightningModule):
         #                                                                                     intrinsics)
         
         #(b, n, iters, 6) 
-        if self.current_epoch < 10: 
-            self.model.iter_steps=3  
+        if self.current_epoch < 10:
+            self.model.iter_steps=0   
             refined_depth_inv, refined_ref_poses = self.model(tgt_img, ref_imgs,
                                                             tgt_ga_depth, ref_ga_depth, 
                                                             tgt_interp, ref_interp, 
                                                             tgt_pose, 
                                                             ref_rel_gtposes, 
                                                             intrinsics)
+            
         elif self.current_epoch < 30:
             self.model.iter_steps=3
             refined_depth_inv, refined_ref_poses = self.model(tgt_img, ref_imgs,
                                                             tgt_ga_depth, ref_ga_depth, 
                                                             tgt_interp, ref_interp, 
                                                             tgt_pose, 
-                                                            ref_rel_poses, 
+                                                            ref_rel_gtposes, 
                                                             intrinsics)
+        
+        # else:
+        #     self.model.iter_steps=3
+        #     refined_depth_inv, refined_ref_poses = self.model(tgt_img, ref_imgs,
+        #                                                     tgt_ga_depth, ref_ga_depth, 
+        #                                                     tgt_interp, ref_interp, 
+        #                                                     tgt_pose, 
+        #                                                     ref_rel_poses, 
+        #                                                     intrinsics)
         # 1. Depth L1 Loss
         # depth_loss,_ = self.compute_loss(utils.inv2depth(refined_depth_inv),
         #                         gt_depth,
@@ -539,42 +549,41 @@ class midasNetConsistentModule(pl.LightningModule):
                 view_poses.append(se3_to_pose(pose_vec))
             pred_poses.append(view_poses)  # shape: (num_ref_views, num_iters)
 
-            # Format ground truth poses ---------------------------------------------------
-            # Assuming ref_gt_pose is list of absolute poses: [pose_ref1, pose_ref2,...]
-            # Convert to relative poses if needed (based on your pose parametrization)
-            #refined_rel_poses = [pose_to_se3(fixed_tgt_pose.inverse() @ ref_p) for ref_p in ref_pose]
-            # gt_rel_poses = []
-            # tgt_pose_inv = tgt_pose.inverse()  # Assuming tgt_pose is fixed
-            # for ref_pose in ref_gt_pose:
-            #     # Convert absolute pose to relative pose
-            #     rel_pose = tgt_pose_inv * ref_pose
-            #     gt_rel_poses.append(rel_pose)
-                
-            reproj_loss = self.calc_pose_loss(pred_poses, ref_rel_gt_poses, 
-                                            gt_depth, intrinsics)
+        # Format ground truth poses ---------------------------------------------------
+        # Assuming ref_gt_pose is list of absolute poses: [pose_ref1, pose_ref2,...]
+        # Convert to relative poses if needed (based on your pose parametrization)
+        #refined_rel_poses = [pose_to_se3(fixed_tgt_pose.inverse() @ ref_p) for ref_p in ref_pose]
+        # gt_rel_poses = []
+        # tgt_pose_inv = tgt_pose.inverse()  # Assuming tgt_pose is fixed
+        # for ref_pose in ref_gt_pose:
+        #     # Convert absolute pose to relative pose
+        #     rel_pose = tgt_pose_inv * ref_pose
+        #     gt_rel_poses.append(rel_pose)
             
-            #pose regularization
-            # pose_reg = torch.norm(se3_log_map(refined_target_pose @ tgt_pose.inverse()))
-            # for refined_pose, gt_pose in zip(refined_ref_poses, ref_pose):
-            #     pose_reg += torch.norm(se3_log_map(refined_pose @ gt_pose.inverse()))
+        reproj_loss = self.calc_pose_loss(pred_poses, ref_rel_gtposes, 
+                                          gt_depth, intrinsics)
         
-            #total_loss = loss
-            #if self.current_epoch < 0:
-            #   total_loss = depth_loss
-            #else:
-            total_loss = depth_loss + 1.0 * reproj_loss #+ 0.01 * pose_reg
-            print(f"Joint training: Loss = {total_loss}")
-            self.log(f"{stage}/reproj_loss", reproj_loss, on_step=True, on_epoch=True, sync_dist=True)
+        #pose regularization
+        # pose_reg = torch.norm(se3_log_map(refined_target_pose @ tgt_pose.inverse()))
+        # for refined_pose, gt_pose in zip(refined_ref_poses, ref_pose):
+        #     pose_reg += torch.norm(se3_log_map(refined_pose @ gt_pose.inverse()))
+    
+        #total_loss = loss
+        #if self.current_epoch < 0:
+        #   total_loss = depth_loss
+        #else:
+        total_loss = depth_loss + 1.0 * reproj_loss #+ 0.01 * pose_reg
         
         #self.logger.experiment.add_scalar(f"{stage}_loss", loss, self.global_step)
         #self.log(f"{stage}/pose_reg_loss", pose_reg, on_step=True, on_epoch=True, sync_dist=True)
+        self.log(f"{stage}/reproj_loss", reproj_loss, on_step=True, on_epoch=True, sync_dist=True)
         self.log(f"{stage}/l1_depth_loss", depth_loss, on_step=True, on_epoch=True, sync_dist=True)
         self.log(f"{stage}/total_loss", total_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
         
         with torch.no_grad():
             self.log_refinement_progress(tgt_img, ref_imgs, gt_depth,
                                         utils.inv2depth(refined_depth_inv), pred_poses,
-                                        ref_rel_gt_poses, intrinsics, mode=stage)
+                                        ref_rel_gtposes, intrinsics, mode=stage)
             
             #if len(warping_vis) > 0:
             #    self.log_warping(warping_vis, mode=stage)
@@ -586,7 +595,7 @@ class midasNetConsistentModule(pl.LightningModule):
             "pred_depth": refined_depth_inv[-1].detach(),
             "gt_depth": tgt_gt_depth_inv.detach(),
             "ga_depth": tgt_ga_depth.unsqueeze(0).permute(1,0,2,3).detach(),
-            "ref_gt_poses": ref_rel_gt_poses,
+            "ref_gt_poses": ref_rel_gtposes,
             "ref_pred_poses": [view_poses[-1] for view_poses in pred_poses],
         }
         #TODO: compute loss for the pose as well
