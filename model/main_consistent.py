@@ -20,11 +20,11 @@ class midasNetConsistentModule(pl.LightningModule):
     def __init__(self, lr: float = 0.1, wd: float = 0.1, min_pred: float = 0.1, 
                  max_pred: float = 8.0, min_depth: float = 0.2, 
                  max_depth: float = 5.0, nsamples: int = 150, img_h=480, 
-                 img_w=640, sml_model_path: str = None, useConvGRU: bool = False,
+                 img_w=640, sml_model_path: str = None, useConvGRU: bool = True, is_train: bool = False,
                  *args: Any, **kwargs: Any) -> None:
         super(midasNetConsistentModule, self).__init__(*args, **kwargs)
         self.model = midasConsNet(min_pred, max_pred, min_depth, max_depth, nsamples, 
-                                  sml_model_path, log_fn=self.log, isConvGRU=useConvGRU)
+                                  sml_model_path, is_train=is_train, log_fn=self.log, isConvGRU=useConvGRU)
         #print model params
         print("Model Parameters: ", sum(p.numel() for p in self.model.parameters() if p.requires_grad))
         self.lr = lr
@@ -51,12 +51,18 @@ class midasNetConsistentModule(pl.LightningModule):
         state_dict = torch.load(file_path, map_location=self.device)
         self.load_state_dict(state_dict)
     
-    def forward(self, tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, ref_imgs,
-                ref_ga_depth, ref_interp, ref_gt_depth, tgt_pose, ref_pose, intrinsics):
-        _, pred_inv_depth,_ =  self.model(tgt_img, ref_imgs, tgt_ga_depth, ref_ga_depth, tgt_interp,
-                          ref_interp, tgt_pose, ref_pose, intrinsics)
+    def forward(self, tgt_img, ref_img,tgt_ga_depth, 
+                ref_ga_depth, tgt_interp, 
+                ref_interp, tgt_pose, 
+                ref_pose, intrinsics):
+        refined_depth_inv, refined_ref_poses = self.model(tgt_img, ref_img,
+                                                            tgt_ga_depth, ref_ga_depth, 
+                                                            tgt_interp, ref_interp, 
+                                                            tgt_pose, 
+                                                            ref_pose, 
+                                                            intrinsics)
 
-        return pred_inv_depth
+        return refined_depth_inv,refined_ref_poses 
     
     def training_step(self, batch, batch_idx):
         loss = self._common_step(batch, batch_idx)

@@ -92,6 +92,11 @@ class SML_consistent_dataset(Dataset):
             frame_index = [int(index) for index in open(scene / 'frame_index.txt')]
             imgs = [imgs[d] for d in frame_index]
 
+            #load tgt target depth
+            depth_pred_path = scene / 'depth_infer_dpt'
+            depth_pred = sorted(depth_pred_path.glob('*.npy'))
+            depth_pred = [depth_pred[d] for d in frame_index]
+            
             # Load ga depth inverse
             ga_depth_inv_path = scene / 'ga_depth_inv'
             ga_depth_inv = sorted(ga_depth_inv_path.glob('*.npy'))
@@ -126,6 +131,7 @@ class SML_consistent_dataset(Dataset):
             for sample_index in sample_index_list:
                 sample = {'intrinsics': intrinsics,
                           'tgt_img': imgs[sample_index['tgt_idx']]}
+                sample['tgt_depth_pred'] = depth_pred[sample_index['tgt_idx']]
                 sample['tgt_ga_depth'] = ga_depth_inv[sample_index['tgt_idx']]
                 sample['tgt_gt_depth'] = gt_depth[sample_index['tgt_idx']]
                 sample['tgt_pose'] = poses[sample_index['tgt_idx']]
@@ -219,6 +225,7 @@ class SML_consistent_dataset(Dataset):
         tgt_ga_depth = load_depth_image_from_npy(str(sample['tgt_ga_depth']))
         tgt_interp = load_depth_image_from_npy(str(sample['tgt_interp']))
         tgt_pose = self.convert_to_4x4(np.loadtxt(str(sample['tgt_pose'])))
+        tgt_depth_pred = load_depth_image_from_npy(str(sample['tgt_depth_pred']))
 
         ref_img = [load_input_image(str(ref_img)) for ref_img in sample['ref_imgs']]
         ref_ga_depth = [load_depth_image_from_npy(str(ref_ga_depth)) for ref_ga_depth in sample['ref_ga_depth']]
@@ -293,7 +300,7 @@ class SML_consistent_dataset(Dataset):
         #img, gt_depth, ga_depth, interp_scale
         return tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, tgt_sparse_depth, ref_img, \
             ref_ga_depth, ref_interp, ref_gt_depth, ref_sparse_depth, tgt_pose, ref_pose, intrinsics, \
-            tgt_pose_perturbed, ref_pose_perturbed
+            tgt_pose_perturbed, ref_pose_perturbed, tgt_depth_pred
     
     def __len__(self):
         return len(self.samples)
