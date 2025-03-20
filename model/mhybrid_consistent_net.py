@@ -170,7 +170,7 @@ class BasicUpdateBlockDepth(nn.Module):
     def __init__(self, hidden_dim=128, cost_dim=64, ratio=3, context_dim=64, min_pred=None, max_pred=None, log_fn=None):
         super(BasicUpdateBlockDepth, self).__init__()
                 
-        self.encoder = ProjectionInputDepth(cost_dim=cost_dim, hidden_dim=hidden_dim, out_chs=hidden_dim, downsample_ratio=1)
+        self.encoder = ProjectionInputDepth(cost_dim=1, hidden_dim=hidden_dim, out_chs=hidden_dim, downsample_ratio=1)
         self.depth_gru = SepConvGRU(hidden_dim=hidden_dim, input_dim=self.encoder.out_chs+context_dim)
         self.depth_head = OutputScaleConv(features=hidden_dim, groups=1, activation=nn.ReLU(False), non_negative=False)
         self.mask = nn.Sequential(
@@ -255,7 +255,7 @@ class PoseHead(nn.Module):
 class BasicUpdateBlockPose(nn.Module):
     def __init__(self, hidden_dim=128, cost_dim=64, ratio=3, context_dim=64, log_fn=None):
         super(BasicUpdateBlockPose, self).__init__()
-        self.encoder = ProjectionInputPose(cost_dim=cost_dim, hidden_dim=hidden_dim, out_chs=hidden_dim, downsample_ratio=2)
+        self.encoder = ProjectionInputPose(cost_dim=1, hidden_dim=hidden_dim, out_chs=hidden_dim, downsample_ratio=2)
         self.pose_gru = SepConvGRU(hidden_dim=hidden_dim, input_dim=self.encoder.out_chs+context_dim)
         self.pose_head = PoseHead(hidden_dim, hidden_dim=hidden_dim)
         
@@ -436,8 +436,12 @@ class midasConsNet(nn.Module):
         fmap_warped = F.grid_sample(fmap_ref, ref_coords, 
                                     mode='bilinear', padding_mode='zeros', align_corners=True) # (b, c, h, w)
         
-        cost = (fmap - fmap_warped)**2 * valid_mask.unsqueeze(1) #cost = (fmap * fmap_warped).sum(dim=1, keepdim=True) #try correlation
+        #cost = (fmap - fmap_warped)**2 * valid_mask.unsqueeze(1) #cost = (fmap * fmap_warped).sum(dim=1, keepdim=True) #try correlation
         #cost = cost.mean(dim=1, keepdim=True)
+        fmap_norm = F.normalize(fmap, p=2, dim=1)
+        fmap_warped_norm = F.normalize(fmap_warped, p=2, dim=1)
+        correlation = (fmap_norm * fmap_warped_norm).sum(dim=1, keepdim=True)
+        cost = (1.0 - correlation) * valid_mask.unsqueeze(1)
 
         return {
             'cost': cost,
