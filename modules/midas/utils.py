@@ -292,3 +292,22 @@ def normalize_unit_range(data):
         raise ValueError("cannot normalize array, max-min range is 0")
     
     return normalized
+
+def compute_normals(depth_image):
+    depth_image_ = depth_image.astype(np.float32)
+    rows, cols = depth_image_.shape
+    x, y = np.meshgrid(np.arange(cols), np.arange(rows))
+    x = x.astype(np.float32)
+    y = y.astype(np.float32)
+
+    # Calculate the partial derivatives of depth with respect to x and y
+    blurred_image = cv2.GaussianBlur(depth_image_, (5, 5), 0)
+    dx = cv2.Sobel(blurred_image, cv2.CV_32F, 1, 0)
+    dy = cv2.Sobel(blurred_image, cv2.CV_32F, 0, 1)
+
+    #compute normal vector for each pixel
+    normal = np.dstack((-dx, -dy, np.ones((rows, cols))))
+    norm = np.sqrt(np.sum(normal**2, axis=2, keepdims=True))
+    normal = np.divide(normal, norm, out=np.zeros_like(normal), where=norm != 0)
+
+    return normal

@@ -18,6 +18,88 @@ from functools import partial
 import torchvision
 #from modules.midas.blocks import OutputConv
 
+#propagate scale based on normals
+class AffinityPropagation(nn.Module):
+    def __init__(self, feature_dim, hidden_dim=64):
+        super().__init__()
+        #mlp to predict initial scale map
+        self.initial_scale_mlp = nn.Sequential(
+            nn.Conv2d(feature_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim, 1, kernel_size=1)  # Initial scale map
+        )
+        
+        #transoformer layer for depth point features
+        self.transformer_layer = nn.MultiheadAttention(embed_dim=feature_dim, num_heads=8)
+        # Projection for affinity computation
+        self.query_proj = nn.Conv2d(feature_dim, feature_dim // 8, kernel_size=1)
+        self.key_proj = nn.Conv2d(feature_dim, feature_dim // 8, kernel_size=1)
+        self.value_proj = nn.Conv2d(feature_dim, feature_dim, kernel_size=1)
+        self.softmax = nn.Softmax(dim=-1)
+        
+    def forward(self, features, sparse_points, sparse_scales, normals=None):
+        B, C, H, W = features.shape
+        N = len(sparse_points)
+        
+        #step1 predict initial scale map (scaffolding)
+        initial_scale = self.initial_scale_mlp(features)  # [B, 1, H', W']
+        
+        # Step 2: Generate features for sparse points
+        pos_embeddings = self._get_positional_embeddings(H, W, C, device=features.device)  # [H', W', C]
+        pos_embeddings = pos_embeddings.permute(2, 0, 1).unsqueeze(0)  # [1, C, H', W']
+        features_with_pos = features + pos_embeddings
+        
+        #sample features at sparse point locations
+        sparse_coords = torch.tensor(sparse_points, device=features.device, dtype=torch.float32)  # [N, 2]
+        sparse_coords = sparse_coords.view(1, N, 1, 2)  # [1, N, 1, 2]
+        sparse_coords = sparse_coords / torch.tensor([W, H], device=features.device) * 2 - 1  # Normalize to [-1, 1]
+        sparse_features = F.grid_sample(features_with_pos, sparse_coords, align_corners=False)  # [1, C, N, 1]
+        sparse_features = sparse_features.squeeze(-1).permute(0, 2, 1)  # [1, N, C]
+        
+        # Apply transformer layer
+        sparse_features, _ = self.transformer_layer(sparse_features, sparse_features, sparse_features)  # [1, N, C]
+        
+        #step3 compute affinity 
+        pixel_features = features.view(B, C, H * W).permute(0, 2, 1)  # [B, H'*W', C]
+        q = self.query_proj(features).view(B, -1, H * W).permute(0, 2, 1)  # [B, H'*W', C//8]
+        k = self.key_proj(features_with_pos).view(B, -1, H * W).permute(0, 2, 1)  # [B, H'*W', C//8]
+        v = self.value_proj(features_with_pos).view(B, -1, H * W).permute(0, 2, 1)  # [B, H'*W', C]
+        
+        # Incorporate normal similarity into affinity (optional)
+        if normals is not None:
+            normal_features = normals.view(B, 3, H * W).permute(0, 2, 1)  # [B, H'*W', 3]
+            sparse_normals = F.grid_sample(normals, sparse_coords, align_corners=False)  # [1, 3, N, 1]
+            sparse_normals = sparse_normals.squeeze(-1).permute(0, 2, 1)  # [1, N, 3]
+            normal_dot = torch.einsum("bnc,bmc->bnm", normal_features, sparse_normals)  # [B, H'*W', N]
+            normal_weight = torch.exp(5 * (normal_dot - 1))  # Encourage similarity
+        else:
+            normal_weight = 1.0
+        
+        # Cross-attention to compute affinities
+        affinities = torch.einsum("bnc,bmc->bnm", q, sparse_features)  # [B, H'*W', N]
+        affinities = affinities * normal_weight if normals is not None else affinities
+        affinities = self.softmax(affinities)  # [B, H'*W', N]
+
+        # Step 4: Align initial scale with sparse scales
+        sparse_scales = torch.tensor(sparse_scales, device=features.device).view(1, 1, N)  # [1, 1, N]
+        scale_correction = torch.einsum("bnm,bmn->bnhw", affinities, sparse_scales - initial_scale.view(B, 1, H * W))  # [B, 1, H'*W']
+        scale_correction = scale_correction.view(B, 1, H, W)
+        aligned_scale = initial_scale + scale_correction  # [B, 1, H', W']
+        
+        # Step 5: Fuse aligned scale back into features
+        aligned_features = torch.cat([features, aligned_scale], dim=1)  # [B, C+1, H', W']
+        return aligned_features, aligned_scale
+    
+    def _get_positional_embeddings(self, H, W, C, device):
+        # Simple sinusoidal positional embeddings
+        coords = torch.stack(torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij'), dim=-1)
+        coords = coords.float() / max(H, W)
+        embeddings = []
+        for i in range(C // 2):
+            embeddings.append(torch.sin(coords * (2 ** i)))
+            embeddings.append(torch.cos(coords * (2 ** i)))
+        return torch.cat(embeddings, dim=-1)[:C]
+        
 class Conv3x3(nn.Module):
     """Layer to pad and convolve input
     """
@@ -307,8 +389,10 @@ class midasConsNet(nn.Module):
 
         self.hidden_dim = 128 #96
         self.cost_dim = 64 #32
-        self.iter_steps = 3
-        self.seq_len = 3
+        self.iter_steps = 0
+        self.seq_len = 0
+        
+        self.ap = AffinityPropagation(feature_dim=32, hidden_dim=64)
         
         # Feature extractor (frozen)
         # self.FeatExtractor = MidasNet_small_cons_videpth(
@@ -431,13 +515,20 @@ class midasConsNet(nn.Module):
         # Project world points onto reference camera
         ref_coords = ref_cam.project(world_points, frame='w', normalize=True) #(b, h, w,2)
         with torch.no_grad():
-           valid_mask = (ref_coords.abs().max(dim=-1)[0] <= 1).float()  # [B, H, W]
+           coord_valid = (ref_coords.abs().max(dim=-1)[0] <= 1)  # [B, H, W]
+           #depth_valid = (world_points[..., 2] > 0.1) & (world_points[..., 2] < 5.0)
+           valid_mask = coord_valid #(coord_valid & depth_valid).float()
            
         fmap_warped = F.grid_sample(fmap_ref, ref_coords, 
                                     mode='bilinear', padding_mode='zeros', align_corners=True) # (b, c, h, w)
         
         cost = (fmap - fmap_warped)**2 * valid_mask.unsqueeze(1) #cost = (fmap * fmap_warped).sum(dim=1, keepdim=True) #try correlation
         #cost = cost.mean(dim=1, keepdim=True)
+        
+        # fmap_norm = F.normalize(fmap, p=2, dim=1)
+        # fmap_warped_norm = F.normalize(fmap_warped, p=2, dim=1)
+        # correlation = (fmap_norm * fmap_warped_norm).sum(dim=1, keepdim=True)
+        # cost = (1.0 - correlation) * valid_mask.unsqueeze(1)
 
         return {
             'cost': cost,
@@ -485,23 +576,38 @@ class midasConsNet(nn.Module):
         return torch.stack(batch_inputs, dim=0)
     
     def forward(self, tgt_img, ref_imgs, tgt_ga_depth, ref_ga_depth, 
-                tgt_interp, ref_interp, tgt_pose, ref_pose, intrinsics, depth_only=False):
+                tgt_interp, tgt_sparse_depth, ref_interp, tgt_pose, 
+                ref_pose, intrinsics, tgt_normals, depth_only=False):
         """
         Refine metric depth scale and VIO poses and target/reference images.
         """
+        # Step 1: Compute sparse scales and valid mask
+        valid_mask = (tgt_sparse_depth > 0).float()  # [B, 1, H, W]
+        sparse_scales = torch.zeros_like(tgt_sparse_depth)  # [B, 1, H, W]
+        sparse_scales[valid_mask > 0] = tgt_sparse_depth[valid_mask > 0] / (pred_inv_depth[valid_mask > 0] + 1e-6)
+        
+        # Extract sparse points and values
+        sparse_points = [(y.item(), x.item()) for y, x in torch.where(valid_mask[0, 0] > 0)]
+        sparse_scales_values = sparse_scales[0, 0][valid_mask[0, 0] > 0].cpu().numpy()
+    
         #Step 1: Extract features using the base model
         ref_inputs = [
             self.preprocess_batch(ref_img, keys=["image"], device=ref_img.device)
             for ref_img in ref_imgs
         ]
         
+        # processed_batch = self.preprocess_batch(
+        #     tgt_img, tgt_ga_depth, tgt_ga_depth, tgt_interp, 
+        #     keys=["image", "int_depth", "int_depth_c", "int_scales_c"], 
+        #     device=tgt_img.device
+        # )
         processed_batch = self.preprocess_batch(
-            tgt_img, tgt_ga_depth, tgt_ga_depth, tgt_interp, 
-            keys=["image", "int_depth", "int_depth_c", "int_scales_c"], 
+            tgt_img, tgt_ga_depth, pred_inv_depth, sparse_scales, valid_mask,
+            keys=["image", "int_depth", "pred_inv_depth", "sparse_scales", "valid_mask"],
             device=tgt_img.device
         )
-        tgt_input, context_depth_input = torch.split(processed_batch, [4, 2], dim=1) #[1,4,288,384]
-        init_metric_depth_inv = context_depth_input[:, 0:1, :, :] #Ga_depth
+        tgt_input, context_depth_input = torch.split(processed_batch, [7, 3], dim=1) #[1,4,288,384]
+        init_metric_depth_inv = context_depth_input[:, 0:1, :, :]  # pred_inv_depth
         
         #test feat extraction only with the rgb image
         tgt_input = processed_batch[:, :3, :, :] # Shape: [1, 3, H, W]
@@ -514,13 +620,17 @@ class midasConsNet(nn.Module):
         tgt_feats, ref_feats = fmaps[0], fmaps[1:] #[1,32,384/4,384/4]
         
         #context_feats = self.contextLearner(context_depth_input) #[1, 64, 144, 192] ga_depth + interp_scale
-        context_feats = self.cnet_depth(context_depth_input) # (1, 128, 72, 96)
+        #context_feats = self.cnet_depth(context_depth_input) # (1, 128, 72, 96)
+        context_feats = self.cnet_depth(context_depth_input) 
+        aligned_feats, aligned_scale = self.ap(context_feats, sparse_points, sparse_scales_values, 
+                                                normals=tgt_input[:, 4:7, :, :])
         #step2: get the init scaled depth from the model
         #metric_depth_inv_tgt, _ = self.ScaleMapLearner(x, d)
         scale_factor =  tgt_img.permute(0,3,1,2).shape[2] / tgt_feats.shape[2]
         
         # Step 3: get initial depth and pose
-        scale_map = self.scaleOutput(context_feats)
+        scale_map, conf_map = self.scaleOutput(aligned_feats)
+        #scale_map = self.scaleOutput(context_feats)
         delta_scales = F.relu(1.0 + scale_map)  # Ensure scale is positive
         inv_depth_pred = init_metric_depth_inv * delta_scales
             

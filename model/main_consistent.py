@@ -456,9 +456,9 @@ class midasNetConsistentModule(pl.LightningModule):
     
     def _common_step(self, batch, batch_idx, stage="train"):
         #input_sparse_depth, input_image, rel_depth_pred, depth_gt, validity_map = batch
-        tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp,_, ref_imgs, \
+        tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, tgt_sparse_depth, ref_imgs, \
         ref_ga_depth, ref_interp, _, _, tgt_pose, ref_gt_pose, intrinsics, \
-            tgt_pose_perturbed, ref_pose_perturbed = batch
+            tgt_pose_perturbed, ref_pose_perturbed, tgt_depth_pred, tgt_normal = batch
         
         gt_depth = utils.inv2depth(tgt_gt_depth_inv)
         
@@ -494,19 +494,21 @@ class midasNetConsistentModule(pl.LightningModule):
             self.model.iter_steps=0   
             refined_depth_inv, refined_ref_poses = self.model(tgt_img, ref_imgs,
                                                             tgt_ga_depth, ref_ga_depth, 
-                                                            tgt_interp, ref_interp, 
+                                                            tgt_interp, tgt_sparse_depth,
+                                                            ref_interp, 
                                                             tgt_pose, 
                                                             ref_rel_gtposes, 
-                                                            intrinsics)
+                                                            intrinsics,
+                                                            tgt_normal)
             
-        elif self.current_epoch < 30:
-            self.model.iter_steps=3
-            refined_depth_inv, refined_ref_poses = self.model(tgt_img, ref_imgs,
-                                                            tgt_ga_depth, ref_ga_depth, 
-                                                            tgt_interp, ref_interp, 
-                                                            tgt_pose, 
-                                                            ref_rel_gtposes, 
-                                                            intrinsics)
+        # elif self.current_epoch < 30:
+        #     self.model.iter_steps=3
+        #     refined_depth_inv, refined_ref_poses = self.model(tgt_img, ref_imgs,
+        #                                                     tgt_ga_depth, ref_ga_depth, 
+        #                                                     tgt_interp, ref_interp, 
+        #                                                     tgt_pose, 
+        #                                                     ref_rel_gtposes, 
+        #                                                     intrinsics)
         
         # else:
         #     self.model.iter_steps=3

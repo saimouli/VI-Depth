@@ -131,7 +131,7 @@ def plot_depth(tgt_img_cpu, tgt_gt_depth_inv_cpu, tgt_ga_depth_cpu, tgt_pred_dep
     
 #currently evaluating the GT depth consistency TODO: include valid mask for gt depth
 if __name__ == "__main__":
-    dataset = SML_consistent_dataset(data_root='/home/sai/Documents/void_small', mode='val')
+    dataset = SML_consistent_dataset(data_root='/media/saimouli/Data6T/datasets/VOID_150', mode='val')
     dataloader = torch.utils.data.DataLoader(dataset)
     
     sml_model_path = "weights/sml_model.dpredictor.dpt_hybrid.nsamples.150.ckpt"
@@ -154,7 +154,7 @@ if __name__ == "__main__":
     # model.to(device)
     
     model = midasNetConsistentModule(sml_model_path=sml_model_path, useConvGRU=True, is_train=False)
-    model = model.load_from_checkpoint("/home/sai/Downloads/v1_gru_pose_depth/total_loss=0.086.ckpt")
+    model = model.load_from_checkpoint("/home/saimouli/Desktop/version_15/red90_model/total_loss=0.089.ckpt")
     #model = model.load_from_checkpoint("/home/saimouli/Documents/github/VI_Depth_sai/weights/withcostv/total_loss=0.088.ckpt")
     #model = model.load_from_checkpoint("/home/saimouli/Documents/github/VI_Depth_sai/weights/without_costv/total_loss=0.086.ckpt")
     model.eval()
@@ -187,10 +187,10 @@ if __name__ == "__main__":
         ref_ga_depth, ref_interp, ref_gt_depth, ref_sparse_depth, tgt_pose, ref_gt_pose, intrinsics, _, ref_pose_perturbed, tgt_depth_pred = batch_data #dataset[idx] #Cam2Wld poses (R_ctoG, p_CinG)
         
         ##########################################################################
-        #reduce tgt sparse depth and try interpolating again and then pass
+        ###reduce tgt sparse depth and try interpolating again and then pass
         validity_map = (tgt_sparse_depth > 0).squeeze().cpu().numpy().astype(np.uint8)
         print("Before Pts: ", np.count_nonzero(validity_map))
-        reduce_pts = int(np.count_nonzero(validity_map) * 0.95)
+        reduce_pts = int(np.count_nonzero(validity_map) * 0.90)
         nonzero_indices = np.argwhere(validity_map == 1)
         remove_indices = np.random.choice(len(nonzero_indices), size=reduce_pts, replace=False)
         points_to_remove = nonzero_indices[remove_indices]
@@ -239,7 +239,7 @@ if __name__ == "__main__":
                                                     tgt_ga_depth, ref_ga_depth, 
                                                     tgt_interp, ref_interp, 
                                                     tgt_pose, 
-                                                    ref_rel_poses, 
+                                                    ref_rel_gtposes, 
                                                     intrinsics)
         #compute consistent module
         # sml_depth_inv = model(tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, ref_img, 
@@ -330,7 +330,7 @@ if __name__ == "__main__":
             # # compute error metrics using SML output depth
             error_w_pred = metrics.ErrorMetrics()
             error_w_pred.compute(
-                estimate = refined_depth_inv[-1].cpu().detach().squeeze(0).numpy(), 
+                estimate = refined_depth_inv[-1].cpu().detach().numpy(), 
                 target = filtered_gt_depth_inv.cpu().detach().squeeze(0).numpy(), 
                 valid = mask.astype(bool),
             )

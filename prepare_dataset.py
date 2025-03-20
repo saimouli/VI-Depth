@@ -70,7 +70,7 @@ def save_priors(data_dir):
         sparse_folder = os.path.join(data_dir, folder, "sparse_depth")
         sprase_depth_path = [os.path.join(sparse_folder, f) for f in images]
 
-        min_depth, max_depth = 0.1, 8.0
+        min_depth, max_depth = 0.1, 5.0
         min_pred, max_pred = 0.1, 8.0
 
         # Instantiate method
@@ -182,12 +182,46 @@ def create_frame_index(data_dir):
         print(len(images), len(frame_names))
         np.savetxt(os.path.join(data_dir, folder, "frame_index.txt"), index, fmt='%d', delimiter='\n')
 
+def save_normals(data_dir):
+    import os
+    folders = [f for f in os.listdir(data_dir) if not f.endswith('.txt')]
+    print("Folder length: ", len(folders))
+    
+    for folder in folders:
+        print("Folder: ", folder)
+
+        depth_folder = os.path.join(data_dir, folder, "depth_infer_dpt")
+        depth_path = [os.path.join(depth_folder, f) for f in os.listdir(depth_folder) if f.endswith('.npy')]
+        
+        save_folder = os.path.join(data_dir, folder)
+        save_folder = os.path.join(save_folder, "dpt_normals")
+        os.makedirs(save_folder, exist_ok=True)
+        
+        for i in tqdm(range(len(depth_path))):
+            dpt_depth = load_depth_image_from_npy(depth_path[i])
+            
+            normals_cam = utils.compute_normals(dpt_depth)
+            save_image_path = os.path.join(data_dir, folder, "dpt_normals", os.path.basename(depth_path[i]))
+            save_depth_image_as_npy(normals_cam, save_image_path)
+            
 
 
 
 if __name__ == "__main__":
-    data_dir = "/media/saimouli/Data6T/datasets/VOID_150_test/training" #"/media/saimouli/RPNG_FLASH_4/datasets/VOID_150/training"
+    data_dir = "/media/saimouli/Data6T/datasets/VOID_150_small/training" #"/media/saimouli/RPNG_FLASH_4/datasets/VOID_150/training"
     # save_priors(data_dir)
-
-    create_frame_index(data_dir)
+    #save_normals(data_dir)
+    #create_frame_index(data_dir)
+    # import matplotlib.pyplot as plt
+    # normals = np.load("/media/saimouli/Data6T/datasets/VOID_150_small/testing/copyroom4/dpt_normals/1552625608.9718.npy")
+    # img = utils.read_image("/media/saimouli/Data6T/datasets/VOID_150_small/testing/copyroom4/image/1552625608.9718.png")
+    # plt.imshow(img)
+    # ax = plt.gca()
+    # for y in range(0, normals.shape[0], 10):
+    #     for x in range(0, normals.shape[1], 10):
+    #         if np.isnan(normals[y, x]).any():
+    #             continue
+    #         ax.arrow(x, y, normals[y, x, 0] * 5, normals[y, x, 1] * 5,
+    #                  head_width=2, head_length=2, fc='r', ec='r')
+    # plt.show()
 
