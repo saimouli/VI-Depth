@@ -22,76 +22,119 @@ import torchvision
 class AffinityPropagation(nn.Module):
     def __init__(self, feature_dim, hidden_dim=64):
         super().__init__()
-        #mlp to predict initial scale map
+        # MLP to predict initial scale map
         self.initial_scale_mlp = nn.Sequential(
             nn.Conv2d(feature_dim, hidden_dim, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(hidden_dim, 1, kernel_size=1)  # Initial scale map
         )
         
-        #transoformer layer for depth point features
+        # Transformer layer for sparse point features
         self.transformer_layer = nn.MultiheadAttention(embed_dim=feature_dim, num_heads=8)
-        # Projection for affinity computation
-        self.query_proj = nn.Conv2d(feature_dim, feature_dim // 8, kernel_size=1)
-        self.key_proj = nn.Conv2d(feature_dim, feature_dim // 8, kernel_size=1)
-        self.value_proj = nn.Conv2d(feature_dim, feature_dim, kernel_size=1)
+        
+        # Projection for feature-based affinity
+        self.feature_query_proj = nn.Conv2d(feature_dim, feature_dim // 8, kernel_size=1)
+        self.feature_key_proj = nn.Conv2d(feature_dim, feature_dim // 8, kernel_size=1)
+        
+        # Projection for normal-based affinity
+        self.normal_query_proj = nn.Conv2d(3, feature_dim // 8, kernel_size=1)
+        self.normal_key_proj = nn.Conv2d(3, feature_dim // 8, kernel_size=1)
+        
+        # Fusion layer for combining feature and normal affinities
+        self.fusion_conv = nn.Conv2d(2, 1, kernel_size=1)  # Input: 2 channels (feature + normal affinities)
+        
+        # Softmax for affinity normalization
         self.softmax = nn.Softmax(dim=-1)
         
-    def forward(self, features, sparse_points, sparse_scales, normals=None):
+    def forward(self, features, sparse_points, sparse_scales, relative_normals):
+        """
+        Args:
+            features: Feature map from decoder stage [B, C, H, W]
+            sparse_points: List of lists of (y, x) coordinates of sparse points [B]
+            sparse_scales: List of tensors of sparse scale values [B]
+            relative_normals: Relative normals from MiDaS [B, 3, H_full, W_full]
+        
+        Returns:
+            aligned_features: Updated feature map with aligned scale information [B, C+1, H, W]
+            aligned_scale: Predicted scale map [B, 1, H, W]
+        """
         B, C, H, W = features.shape
-        N = len(sparse_points)
-        
-        #step1 predict initial scale map (scaffolding)
-        initial_scale = self.initial_scale_mlp(features)  # [B, 1, H', W']
-        
-        # Step 2: Generate features for sparse points
-        pos_embeddings = self._get_positional_embeddings(H, W, C, device=features.device)  # [H', W', C]
-        pos_embeddings = pos_embeddings.permute(2, 0, 1).unsqueeze(0)  # [1, C, H', W']
-        features_with_pos = features + pos_embeddings
-        
-        #sample features at sparse point locations
-        sparse_coords = torch.tensor(sparse_points, device=features.device, dtype=torch.float32)  # [N, 2]
-        sparse_coords = sparse_coords.view(1, N, 1, 2)  # [1, N, 1, 2]
-        sparse_coords = sparse_coords / torch.tensor([W, H], device=features.device) * 2 - 1  # Normalize to [-1, 1]
-        sparse_features = F.grid_sample(features_with_pos, sparse_coords, align_corners=False)  # [1, C, N, 1]
-        sparse_features = sparse_features.squeeze(-1).permute(0, 2, 1)  # [1, N, C]
-        
-        # Apply transformer layer
-        sparse_features, _ = self.transformer_layer(sparse_features, sparse_features, sparse_features)  # [1, N, C]
-        
-        #step3 compute affinity 
-        pixel_features = features.view(B, C, H * W).permute(0, 2, 1)  # [B, H'*W', C]
-        q = self.query_proj(features).view(B, -1, H * W).permute(0, 2, 1)  # [B, H'*W', C//8]
-        k = self.key_proj(features_with_pos).view(B, -1, H * W).permute(0, 2, 1)  # [B, H'*W', C//8]
-        v = self.value_proj(features_with_pos).view(B, -1, H * W).permute(0, 2, 1)  # [B, H'*W', C]
-        
-        # Incorporate normal similarity into affinity (optional)
-        if normals is not None:
-            normal_features = normals.view(B, 3, H * W).permute(0, 2, 1)  # [B, H'*W', 3]
-            sparse_normals = F.grid_sample(normals, sparse_coords, align_corners=False)  # [1, 3, N, 1]
-            sparse_normals = sparse_normals.squeeze(-1).permute(0, 2, 1)  # [1, N, 3]
-            normal_dot = torch.einsum("bnc,bmc->bnm", normal_features, sparse_normals)  # [B, H'*W', N]
-            normal_weight = torch.exp(5 * (normal_dot - 1))  # Encourage similarity
-        else:
-            normal_weight = 1.0
-        
-        # Cross-attention to compute affinities
-        affinities = torch.einsum("bnc,bmc->bnm", q, sparse_features)  # [B, H'*W', N]
-        affinities = affinities * normal_weight if normals is not None else affinities
-        affinities = self.softmax(affinities)  # [B, H'*W', N]
+        device = features.device
 
-        # Step 4: Align initial scale with sparse scales
-        sparse_scales = torch.tensor(sparse_scales, device=features.device).view(1, 1, N)  # [1, 1, N]
-        scale_correction = torch.einsum("bnm,bmn->bnhw", affinities, sparse_scales - initial_scale.view(B, 1, H * W))  # [B, 1, H'*W']
-        scale_correction = scale_correction.view(B, 1, H, W)
-        aligned_scale = initial_scale + scale_correction  # [B, 1, H', W']
+        # Step 1: Predict initial scale map
+        initial_scale = self.initial_scale_mlp(features)  # [B, 1, H, W]
+
+        # Step 2: Generate features for sparse points
+        pos_embeddings = self._get_positional_embeddings(H, W, C, device)  # [H, W, C]
+        pos_embeddings = pos_embeddings.permute(2, 0, 1).unsqueeze(0)  # [1, C, H, W]
+        features_with_pos = features + pos_embeddings  # [B, C, H, W]
+
+        # Pad sparse points to the maximum number of points across the batch
+        N_max = max(len(points) for points in sparse_points)
+        sparse_coords = []
+        for b in range(B):
+            points = sparse_points[b]
+            N = len(points)
+            if N == 0:
+                coords = torch.zeros(1, N_max, 1, 2, device=device)
+            else:
+                coords = torch.tensor(points, device=device, dtype=torch.float32)  # [N, 2]
+                coords = coords / torch.tensor([W, H], device=device) * 2 - 1  # Normalize to [-1, 1]
+                coords = coords.view(1, N, 1, 2)
+                # Pad to N_max
+                padding = torch.zeros(1, N_max - N, 1, 2, device=device)
+                coords = torch.cat([coords, padding], dim=1)  # [1, N_max, 1, 2]
+            sparse_coords.append(coords)
+        sparse_coords = torch.cat(sparse_coords, dim=0)  # [B, N_max, 1, 2]
+
+        # Sample features at sparse point locations
+        sparse_features = F.grid_sample(features_with_pos, sparse_coords, align_corners=False)  # [B, C, N_max, 1]
+        sparse_features = sparse_features.squeeze(-1).permute(0, 2, 1)  # [B, N_max, C]
+
+        # Apply transformer layer
+        sparse_features, _ = self.transformer_layer(
+            sparse_features.permute(1, 0, 2),  # [N_max, B, C]
+            sparse_features.permute(1, 0, 2),
+            sparse_features.permute(1, 0, 2)
+        )
+        sparse_features = sparse_features.permute(1, 0, 2)  # [B, N_max, C]
+
+        # Step 3: Compute feature-based affinities
+        q_features = self.feature_query_proj(features).view(B, -1, H * W).permute(0, 2, 1)  # [B, H*W, C//8]
+        k_features = self.feature_key_proj(sparse_features.permute(0, 2, 1)).view(B, -1, N_max).permute(0, 2, 1)  # [B, N_max, C//8]
+        feature_affinities = torch.einsum("bnc,bmc->bnm", q_features, k_features)  # [B, H*W, N_max]
+
+        # Step 4: Compute normal-based affinities
+        # Resize normals to match feature resolution
+        relative_normals = F.interpolate(relative_normals, size=(H, W), mode='bilinear', align_corners=False)  # [B, 3, H, W]
+        q_normals = self.normal_query_proj(relative_normals).view(B, -1, H * W).permute(0, 2, 1)  # [B, H*W, C//8]
+        sparse_normals = F.grid_sample(relative_normals, sparse_coords, align_corners=False)  # [B, 3, N_max, 1]
+        sparse_normals = sparse_normals.squeeze(-1).permute(0, 2, 1)  # [B, N_max, 3]
+        k_normals = self.normal_key_proj(sparse_normals.permute(0, 2, 1)).view(B, -1, N_max).permute(0, 2, 1)  # [B, N_max, C//8]
+        normal_affinities = torch.einsum("bnc,bmc->bnm", q_normals, k_normals)  # [B, H*W, N_max]
+
+        # Step 5: Fuse feature and normal affinities
+        combined_affinities = torch.stack([feature_affinities, normal_affinities], dim=1)  # [B, 2, H*W, N_max]
+        combined_affinities = self.fusion_conv(combined_affinities).squeeze(1)  # [B, H*W, N_max]
+        combined_affinities = self.softmax(combined_affinities)  # [B, H*W, N_max]
+
+        # Step 6: Align initial scale with sparse scales
+        scale_correction = torch.zeros(B, 1, H, W, device=device)
+        for b in range(B):
+            N = len(sparse_points[b])
+            if N == 0:
+                continue
+            scales = sparse_scales[b].view(1, 1, N)
+            correction = torch.einsum("bnm,bmn->bnhw", combined_affinities[b:b+1, :, :N], scales - initial_scale[b:b+1].view(1, 1, H * W))
+            scale_correction[b] = correction.view(1, 1, H, W)
         
-        # Step 5: Fuse aligned scale back into features
-        aligned_features = torch.cat([features, aligned_scale], dim=1)  # [B, C+1, H', W']
+        aligned_scale = initial_scale + scale_correction  # [B, 1, H, W]
+
+        # Step 7: Fuse aligned scale back into features
+        aligned_features = torch.cat([features, aligned_scale], dim=1)  # [B, C+1, H, W]
         return aligned_features, aligned_scale
-    
+
     def _get_positional_embeddings(self, H, W, C, device):
-        # Simple sinusoidal positional embeddings
         coords = torch.stack(torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij'), dim=-1)
         coords = coords.float() / max(H, W)
         embeddings = []
@@ -392,7 +435,7 @@ class midasConsNet(nn.Module):
         self.iter_steps = 0
         self.seq_len = 0
         
-        self.ap = AffinityPropagation(feature_dim=32, hidden_dim=64)
+        self.ap = AffinityPropagation(feature_dim=self.cost_dim, hidden_dim=self.hidden_dim)
         
         # Feature extractor (frozen)
         # self.FeatExtractor = MidasNet_small_cons_videpth(
@@ -577,19 +620,27 @@ class midasConsNet(nn.Module):
     
     def forward(self, tgt_img, ref_imgs, tgt_ga_depth, ref_ga_depth, 
                 tgt_interp, tgt_sparse_depth, ref_interp, tgt_pose, 
-                ref_pose, intrinsics, tgt_normals, depth_only=False):
+                ref_pose, intrinsics, tgt_normals, tgt_depth_pred_inv, depth_only=False):
         """
         Refine metric depth scale and VIO poses and target/reference images.
         """
         # Step 1: Compute sparse scales and valid mask
-        valid_mask = (tgt_sparse_depth > 0).float()  # [B, 1, H, W]
-        sparse_scales = torch.zeros_like(tgt_sparse_depth)  # [B, 1, H, W]
-        sparse_scales[valid_mask > 0] = tgt_sparse_depth[valid_mask > 0] / (pred_inv_depth[valid_mask > 0] + 1e-6)
-        
-        # Extract sparse points and values
-        sparse_points = [(y.item(), x.item()) for y, x in torch.where(valid_mask[0, 0] > 0)]
-        sparse_scales_values = sparse_scales[0, 0][valid_mask[0, 0] > 0].cpu().numpy()
-    
+        tgt_sparse_depth_inv = utils.depth2inv(tgt_sparse_depth)  # [B, 1, H, W]
+        valid_mask = (tgt_sparse_depth_inv > 0).float()  # [B, 1, H, W]
+        sparse_scales = torch.zeros_like(tgt_sparse_depth_inv)  # [B, 1, H, W]
+        sparse_scales[valid_mask > 0] = tgt_sparse_depth_inv[valid_mask > 0] / (tgt_ga_depth[valid_mask > 0] + 1e-6)
+
+        # Extract sparse points and values for each sample in the batch
+        B, _, H, W = tgt_ga_depth.shape
+        sparse_points = []
+        sparse_scales_values = []
+        for b in range(B):
+            indices = torch.where(valid_mask[b, 0] > 0)
+            points = [(y.item(), x.item()) for y, x in zip(indices[0], indices[1])]
+            scales = sparse_scales[b, 0][indices].detach()
+            sparse_points.append(points)
+            sparse_scales_values.append(scales)
+            
         #Step 1: Extract features using the base model
         ref_inputs = [
             self.preprocess_batch(ref_img, keys=["image"], device=ref_img.device)
@@ -602,11 +653,11 @@ class midasConsNet(nn.Module):
         #     device=tgt_img.device
         # )
         processed_batch = self.preprocess_batch(
-            tgt_img, tgt_ga_depth, pred_inv_depth, sparse_scales, valid_mask,
-            keys=["image", "int_depth", "pred_inv_depth", "sparse_scales", "valid_mask"],
+            tgt_img, tgt_ga_depth, tgt_ga_depth, sparse_scales, valid_mask,
+            keys=["image", "int_depth", "int_depth_c", "sparse_scales", "valid_mask"],
             device=tgt_img.device
         )
-        tgt_input, context_depth_input = torch.split(processed_batch, [7, 3], dim=1) #[1,4,288,384]
+        tgt_input, context_depth_input = torch.split(processed_batch, [4, 3], dim=1) #[1,4,288,384]
         init_metric_depth_inv = context_depth_input[:, 0:1, :, :]  # pred_inv_depth
         
         #test feat extraction only with the rgb image
@@ -623,10 +674,10 @@ class midasConsNet(nn.Module):
         #context_feats = self.cnet_depth(context_depth_input) # (1, 128, 72, 96)
         context_feats = self.cnet_depth(context_depth_input) 
         aligned_feats, aligned_scale = self.ap(context_feats, sparse_points, sparse_scales_values, 
-                                                normals=tgt_input[:, 4:7, :, :])
+                                                normals=tgt_normals)
         #step2: get the init scaled depth from the model
         #metric_depth_inv_tgt, _ = self.ScaleMapLearner(x, d)
-        scale_factor =  tgt_img.permute(0,3,1,2).shape[2] / tgt_feats.shape[2]
+        #scale_factor =  tgt_img.permute(0,3,1,2).shape[2] / tgt_feats.shape[2]
         
         # Step 3: get initial depth and pose
         scale_map, conf_map = self.scaleOutput(aligned_feats)

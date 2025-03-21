@@ -499,7 +499,8 @@ class midasNetConsistentModule(pl.LightningModule):
                                                             tgt_pose, 
                                                             ref_rel_gtposes, 
                                                             intrinsics,
-                                                            tgt_normal)
+                                                            tgt_normal,
+                                                            tgt_depth_pred)
             
         # elif self.current_epoch < 30:
         #     self.model.iter_steps=3
