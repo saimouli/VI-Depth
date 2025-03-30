@@ -16,53 +16,158 @@ from utils.pose import Pose
 from functools import partial
 #from pytorch3d.transforms import se3_exp_map, se3_log_map
 import torchvision
+import math
+from scipy.interpolate import griddata
 #from modules.midas.blocks import OutputConv
+
+#Implement multi-scale affinity propagation
+class MultiScaleAffinityPropagation(nn.Module):
+    def __init__(self, feature_dim=32, scales=[1,2,4], num_layers=18):
+        super().__init__()
+        self.scales = scales
+        
+        self.fnet = ResNetEncoder(
+            num_layers=num_layers, 
+            num_input_images=1, 
+            pretrained=True, 
+            out_chs=feature_dim, 
+            stride=4  # Set to smallest stride to get highest resolution features
+        )
+        
+        # Create projection layers to unify feature dimensions from different levels
+        self.proj_s4 = nn.Conv2d(64, feature_dim, kernel_size=1)  # For level 1 features
+        self.proj_s8 = nn.Conv2d(128, feature_dim, kernel_size=1)  # For level 2 features
+        self.proj_s16 = nn.Conv2d(256, feature_dim, kernel_size=1)  # For level 3 features
+        
+        # Affinity modules for each level
+        self.affinity_s4 = AffinityPropagation(feature_dim=feature_dim, chunk_size=2048)
+        self.affinity_s8 = AffinityPropagation(feature_dim=feature_dim, chunk_size=1024)
+        self.affinity_s16 = AffinityPropagation(feature_dim=feature_dim, chunk_size=512)
+        
+        # Fusion layer 
+        self.fusion = nn.Conv2d(3, 1, kernel_size=1, bias=False)
+        nn.init.constant_(self.fusion.weight, 1/3)
+    
+    def forward(self, image, sparse_depth_inv, normals=None):
+        #image: Input RGB image [B, 3, H, W]
+        #return coarse depth: coarse propagated depth [B, 1, H, W]
+        B, _, H, W = sparse_depth_inv.shape
+        # Extract multi-level features using your ResNetEncoder
+        _ = self.fnet(image)  # This should return the final features
+        
+        feats_s4 = self.proj_s4(self.fnet.layer1_features)  # From layer1 #: [B, 32, 72, 96]
+        feats_s8 = self.proj_s8(self.fnet.layer2_features)  # From layer2 #[B, 32, 36, 48]
+        feats_s16 = self.proj_s16(self.fnet.layer3_features)  # From layer3 #[B, 32, 18, 24]
+        
+        #multi-scale depth
+        depth_s4 = F.interpolate(sparse_depth_inv, size=(H//4, W//4), mode='nearest')
+        depth_s8 = F.interpolate(sparse_depth_inv, size=(H//8, W//8), mode='nearest')
+        depth_s16 = F.interpolate(sparse_depth_inv, size=(H//16, W//16), mode='nearest')
+        
+        #Extract sparse points at each resolution
+        sparse_points_s4 = self._extract_sparse_points(depth_s4)
+        sparse_points_s8 = self._extract_sparse_points(depth_s8)
+        sparse_points_s16 = self._extract_sparse_points(depth_s16)
+        
+        #Compute affinity and propagate at each scale
+        prop_depth_s4 = self._propagate_level(feats_s4, sparse_points_s4, (H, W))
+        prop_depth_s8 = self._propagate_level(feats_s8, sparse_points_s8, (H, W))
+        prop_depth_s16 = self._propagate_level(feats_s16, sparse_points_s16, (H, W))
+        
+        #upsample all to the highest resolution
+        prop_depth_s8_up = F.interpolate(prop_depth_s8, size=(H//4, W//4), mode='bilinear', align_corners=False)
+        prop_depth_s16_up = F.interpolate(prop_depth_s16, size=(H//4, W//4), mode='bilinear', align_corners=False)
+        
+        stacked_depths = torch.cat([prop_depth_s4, prop_depth_s8_up, prop_depth_s16_up], dim=1)
+        combined_depth = self.fusion(stacked_depths)
+        propagated_depth = F.interpolate(combined_depth, size=(H, W), mode='bilinear', align_corners=False)
+        
+        return propagated_depth
+    
+    def _extract_sparse_points(self, depth):
+        B, _, H, W = depth.shape
+        valid_mask = (depth > 0).float()
+        sparse_points_idx = []
+        sparse_depth_values = []
+        
+        for b in range(B):
+            indices = torch.where(valid_mask[b, 0] > 0)
+            points = [(y.item(), x.item()) for y, x in zip(indices[0], indices[1])]
+            depths = depth[b, 0][indices].detach()
+            sparse_points_idx.append(points)
+            sparse_depth_values.append(depths)
+        
+        return (sparse_points_idx, sparse_depth_values)
+    
+    def _propagate_level(self, features, sparse_points, size):
+        sparse_points_idx, sparse_depth_values = sparse_points
+        B, C, H, W = features.shape
+        
+        if H == size[0]//4:  # s4 features
+            affinity_module = self.affinity_s4
+        elif H == size[0]//8:  # s8 features
+            affinity_module = self.affinity_s8
+        else:  # s16 features
+            affinity_module = self.affinity_s16
+        # Compute affinity
+        affinity_map = affinity_module(features, sparse_points_idx, sparse_depth_values, None, full_res=size)
+        
+        # Prepare depth_at_points
+        N_max = max([len(points) for points in sparse_points_idx] or [0])
+        if N_max == 0:  # No valid points
+            return torch.zeros(B, 1, size[0], size[1], device=features.device)
+        
+        depth_at_points = torch.zeros(B, N_max, 1, device=features.device)
+        for b in range(B):
+            num_points = len(sparse_depth_values[b])
+            if num_points > 0:
+                depth_at_points[b, :num_points, 0] = sparse_depth_values[b]
+        
+        #propagate depth
+        propagated_depth = torch.bmm(affinity_map, depth_at_points).squeeze(-1)
+        propagated_depth = propagated_depth.view(B, 1, H, W)
+        
+        return propagated_depth
 
 #propagate scale based on normals
 class AffinityPropagation(nn.Module):
-    def __init__(self, feature_dim, hidden_dim=64):
+    def __init__(self, feature_dim, hidden_dim=64, chunk_size=1024):
         super().__init__()
-        # MLP to predict initial scale map
-        self.initial_scale_mlp = nn.Sequential(
-            nn.Conv2d(feature_dim, hidden_dim, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_dim, 1, kernel_size=1)  # Initial scale map
-        )
+        self.chunk_size = chunk_size
+        self.scale = math.sqrt(feature_dim // 2)
         
         # Transformer layer for sparse point features
-        self.transformer_layer = nn.MultiheadAttention(embed_dim=feature_dim, num_heads=8)
+        self.transformer_layer = nn.MultiheadAttention(embed_dim=feature_dim, num_heads=2)
         
         # Projection for feature-based affinity
-        self.feature_query_proj = nn.Conv2d(feature_dim, feature_dim // 8, kernel_size=1)
-        self.feature_key_proj = nn.Conv2d(feature_dim, feature_dim // 8, kernel_size=1)
+        self.feature_query_proj = nn.Conv2d(feature_dim, feature_dim // 2, kernel_size=1)
+        self.feature_key_proj = nn.Linear(feature_dim, feature_dim // 2) #for sparse features
         
         # Projection for normal-based affinity
-        self.normal_query_proj = nn.Conv2d(3, feature_dim // 8, kernel_size=1)
-        self.normal_key_proj = nn.Conv2d(3, feature_dim // 8, kernel_size=1)
+        self.normal_query_proj = nn.Conv2d(3, feature_dim // 2, kernel_size=1)
+        self.normal_key_proj = nn.Linear(3, feature_dim // 2) #for sparse normals
         
         # Fusion layer for combining feature and normal affinities
-        self.fusion_conv = nn.Conv2d(2, 1, kernel_size=1)  # Input: 2 channels (feature + normal affinities)
+        self.fusion_conv = nn.Conv2d(2, 1, kernel_size=1) # Input: 2 channels (feature + normal affinities)
         
         # Softmax for affinity normalization
         self.softmax = nn.Softmax(dim=-1)
         
-    def forward(self, features, sparse_points, sparse_scales, relative_normals):
+    def forward(self, features, sparse_points_idx, sparse_scales, relative_normals, full_res=(288, 384)):
         """
         Args:
             features: Feature map from decoder stage [B, C, H, W]
-            sparse_points: List of lists of (y, x) coordinates of sparse points [B]
+            sparse_points_idx: List of lists of (y, x) coordinates of sparse points [B]
             sparse_scales: List of tensors of sparse scale values [B]
-            relative_normals: Relative normals from MiDaS [B, 3, H_full, W_full]
+            relative_normals: Relative normals from MiDaS [B, 3, H, W]
+            full_res: Tuple (H_full, W_full) indicating the full resolution of sparse points and normals
         
         Returns:
-            aligned_features: Updated feature map with aligned scale information [B, C+1, H, W]
-            aligned_scale: Predicted scale map [B, 1, H, W]
+            affinity_map: Affinity weights [B, H*W, N_max]
         """
         B, C, H, W = features.shape
+        H_full, W_full = full_res
         device = features.device
-
-        # Step 1: Predict initial scale map
-        initial_scale = self.initial_scale_mlp(features)  # [B, 1, H, W]
 
         # Step 2: Generate features for sparse points
         pos_embeddings = self._get_positional_embeddings(H, W, C, device)  # [H, W, C]
@@ -70,18 +175,22 @@ class AffinityPropagation(nn.Module):
         features_with_pos = features + pos_embeddings  # [B, C, H, W]
 
         # Pad sparse points to the maximum number of points across the batch
-        N_max = max(len(points) for points in sparse_points)
+        N_max = max(len(points) for points in sparse_points_idx)
         sparse_coords = []
+        valid_mask = torch.zeros(B, N_max, device=device, dtype=torch.bool)  # Mask for valid sparse points
         for b in range(B):
-            points = sparse_points[b]
-            N = len(points)
+            points_idx = sparse_points_idx[b]
+            N = len(points_idx)
+            valid_mask[b, :N] = 1
             if N == 0:
                 coords = torch.zeros(1, N_max, 1, 2, device=device)
             else:
-                coords = torch.tensor(points, device=device, dtype=torch.float32)  # [N, 2]
+                coords = torch.tensor(points_idx, device=device, dtype=torch.float32)  # [N, 2]
+                # Scale coordinates to feature resolution
+                coords[:, 0] = coords[:, 0] * (H / H_full)  # y-coordinate
+                coords[:, 1] = coords[:, 1] * (W / W_full)  # x-coordinate
                 coords = coords / torch.tensor([W, H], device=device) * 2 - 1  # Normalize to [-1, 1]
                 coords = coords.view(1, N, 1, 2)
-                # Pad to N_max
                 padding = torch.zeros(1, N_max - N, 1, 2, device=device)
                 coords = torch.cat([coords, padding], dim=1)  # [1, N_max, 1, 2]
             sparse_coords.append(coords)
@@ -91,58 +200,62 @@ class AffinityPropagation(nn.Module):
         sparse_features = F.grid_sample(features_with_pos, sparse_coords, align_corners=False)  # [B, C, N_max, 1]
         sparse_features = sparse_features.squeeze(-1).permute(0, 2, 1)  # [B, N_max, C]
 
-        # Apply transformer layer
-        sparse_features, _ = self.transformer_layer(
-            sparse_features.permute(1, 0, 2),  # [N_max, B, C]
-            sparse_features.permute(1, 0, 2),
-            sparse_features.permute(1, 0, 2)
-        )
-        sparse_features = sparse_features.permute(1, 0, 2)  # [B, N_max, C]
+        # Step 4: Apply transformer layer (self-attention)
+        # sparse_features, _ = self.transformer_layer(
+        #     sparse_features.permute(1, 0, 2),  # [N_max, B, C]
+        #     sparse_features.permute(1, 0, 2),
+        #     sparse_features.permute(1, 0, 2)
+        # )
+        sparse_features = sparse_features #.permute(1, 0, 2)  # [B, N_max, C]
 
-        # Step 3: Compute feature-based affinities
-        q_features = self.feature_query_proj(features).view(B, -1, H * W).permute(0, 2, 1)  # [B, H*W, C//8]
-        k_features = self.feature_key_proj(sparse_features.permute(0, 2, 1)).view(B, -1, N_max).permute(0, 2, 1)  # [B, N_max, C//8]
-        feature_affinities = torch.einsum("bnc,bmc->bnm", q_features, k_features)  # [B, H*W, N_max]
-
-        # Step 4: Compute normal-based affinities
+        # Step 5: Compute feature-based affinities in chunks
+        q_features = self.feature_query_proj(features).view(B, -1, H * W).permute(0, 2, 1)  # [B, H*W, C//2]
+        k_features = self.feature_key_proj(sparse_features)  # [B, N_max, feature_dim//2]
+        feature_affinities = torch.zeros(B, H * W, N_max, device=device)
+        for i in range(0, H * W, self.chunk_size):
+            end = min(i + self.chunk_size, H * W)
+            q_chunk = q_features[:, i:end, :]  # [B, chunk_size, C//4]
+            feature_affinities[:, i:end, :] = torch.einsum("bnc,bmc->bnm", q_chunk, k_features)
+            
+        # Step 6: Compute normal-based affinities in chunks
         # Resize normals to match feature resolution
-        relative_normals = F.interpolate(relative_normals, size=(H, W), mode='bilinear', align_corners=False)  # [B, 3, H, W]
-        q_normals = self.normal_query_proj(relative_normals).view(B, -1, H * W).permute(0, 2, 1)  # [B, H*W, C//8]
-        sparse_normals = F.grid_sample(relative_normals, sparse_coords, align_corners=False)  # [B, 3, N_max, 1]
-        sparse_normals = sparse_normals.squeeze(-1).permute(0, 2, 1)  # [B, N_max, 3]
-        k_normals = self.normal_key_proj(sparse_normals.permute(0, 2, 1)).view(B, -1, N_max).permute(0, 2, 1)  # [B, N_max, C//8]
-        normal_affinities = torch.einsum("bnc,bmc->bnm", q_normals, k_normals)  # [B, H*W, N_max]
-
-        # Step 5: Fuse feature and normal affinities
-        combined_affinities = torch.stack([feature_affinities, normal_affinities], dim=1)  # [B, 2, H*W, N_max]
-        combined_affinities = self.fusion_conv(combined_affinities).squeeze(1)  # [B, H*W, N_max]
-        combined_affinities = self.softmax(combined_affinities)  # [B, H*W, N_max]
-
-        # Step 6: Align initial scale with sparse scales
-        scale_correction = torch.zeros(B, 1, H, W, device=device)
-        for b in range(B):
-            N = len(sparse_points[b])
-            if N == 0:
-                continue
-            scales = sparse_scales[b].view(1, 1, N)
-            correction = torch.einsum("bnm,bmn->bnhw", combined_affinities[b:b+1, :, :N], scales - initial_scale[b:b+1].view(1, 1, H * W))
-            scale_correction[b] = correction.view(1, 1, H, W)
+        # relative_normals = F.interpolate(relative_normals, size=(H, W), mode='bilinear', align_corners=False) #TODO: should we pass normals to a encoder?
+        # q_normals = self.normal_query_proj(relative_normals).view(B, -1, H * W).permute(0, 2, 1)  # [B, H*W, C//2]
+        # sparse_normals = F.grid_sample(relative_normals, sparse_coords, align_corners=False) # [B, 3, N_max, 1]
+        # sparse_normals = sparse_normals.squeeze(-1).permute(0, 2, 1)  # [B, N_max, 3]
+        # k_normals = self.normal_key_proj(sparse_normals)  # [B, N_max, C//2]
+        # normal_affinities = torch.zeros(B, H * W, N_max, device=device)
+        # for i in range(0, H * W, self.chunk_size):
+        #     end = min(i + self.chunk_size, H * W)
+        #     q_chunk = q_normals[:, i:end, :]  # [B, chunk_size, C//2]
+        #     normal_affinities[:, i:end, :] = torch.einsum("bnc,bmc->bnm", q_chunk, k_normals)
+            
+        # Step 7: Fuse feature and normal affinities
+        #combined_affinities = torch.stack([feature_affinities, normal_affinities], dim=1)  # [B, 2, H*W, N_max]
+        #combined_affinities = self.fusion_conv(combined_affinities).squeeze(1)  # [B, H*W, N_max]
+        affinity_map = self.softmax(feature_affinities/ self.scale)  # [B, H*W, N_max]
         
-        aligned_scale = initial_scale + scale_correction  # [B, 1, H, W]
-
-        # Step 7: Fuse aligned scale back into features
-        aligned_features = torch.cat([features, aligned_scale], dim=1)  # [B, C+1, H, W]
-        return aligned_features, aligned_scale
+        return affinity_map
 
     def _get_positional_embeddings(self, H, W, C, device):
-        coords = torch.stack(torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij'), dim=-1)
-        coords = coords.float() / max(H, W)
-        embeddings = []
-        for i in range(C // 2):
-            embeddings.append(torch.sin(coords * (2 ** i)))
-            embeddings.append(torch.cos(coords * (2 ** i)))
-        return torch.cat(embeddings, dim=-1)[:C]
+        #generate pose embeddings for each position in the feature map
+        y_position = torch.linspace(0,1,H, device=device).unsqueeze(1).expand(-1,W)
+        x_position = torch.linspace(0,1,W, device=device).unsqueeze(0).expand(H,-1)
         
+        #stack y and x corrd.
+        coords = torch.stack((y_position, x_position), dim=-1) #[H, W, 2]
+        
+        #compute since and cosine embeddings
+        embeddings = torch.zeros(H, W, C, device=device)
+        freq_bands = torch.arange(0, C//4, 1, device=device).float()
+        freq_bands = 2.0 ** freq_bands
+        
+        for i in range(2): #for y and x coord.
+            for j, freq in enumerate(freq_bands):
+                embeddings[:,:,j*4 + i*2] = torch.sin(coords[:,:,i] * freq * torch.pi)
+                embeddings[:,:,j*4 + i *2 + 1] = torch.cos(coords[:,:,i] * freq * torch.pi)
+        
+        return embeddings
 class Conv3x3(nn.Module):
     """Layer to pad and convolve input
     """
@@ -431,46 +544,29 @@ class midasConsNet(nn.Module):
         self.ScaleMapLearner_transform = model_transforms["sml_model"]
 
         self.hidden_dim = 128 #96
-        self.cost_dim = 64 #32
+        self.cost_dim = 32 #64 
         self.iter_steps = 0
         self.seq_len = 0
         
-        self.ap = AffinityPropagation(feature_dim=self.cost_dim, hidden_dim=self.hidden_dim)
+        #self.ap = AffinityPropagation(feature_dim=self.cost_dim, hidden_dim=self.hidden_dim)
+        self.depth_prop = MultiScaleAffinityPropagation(feature_dim=self.cost_dim)
         
-        # Feature extractor (frozen)
-        # self.FeatExtractor = MidasNet_small_cons_videpth(
-        #     path=sml_model_path,
-        #     in_channels=3,
-        #     features=32,
-        #     min_pred=self.min_pred,
-        #     max_pred=self.max_pred,
-        #     output_downsample=True,
-        #     backbone="efficientnet_lite3",
-        # )
-        # for param in self.FeatExtractor.parameters():
-        #     param.requires_grad = False
-        # self.FeatExtractor.eval()
-        
-        self.fnet = ResNetEncoder(out_chs=self.cost_dim, stride=4)
+        #self.fnet = ResNetEncoder(out_chs=self.cost_dim, stride=4)
+        #self.fnet_midas = MidasNet_small_cons_videpth(features=32, in_channels=3)
+        #self.cnet_depth_affinity = ResNetEncoder(out_chs=self.hidden_dim + self.cost_dim-1, stride=4, context_num=1, pretrained=False)
         self.cnet_depth = ResNetEncoder(out_chs=self.hidden_dim + self.cost_dim, stride=4, context_num=2, pretrained=False)
-    
-        # self.contextLearner = MidasNet_small_cons_videpth(
-        #     in_channels=2,
-        #     features=64,
-        #     path=sml_model_path,
-        #     min_pred=self.min_pred,
-        #     max_pred=self.max_pred,
-        #     output_downsample=False,
-        #     backbone="efficientnet_lite3",
-        # )
-        # self.contextLearner.train()
         
-        # self.context_conv = nn.Conv2d(
-        #     in_channels=64,
-        #     out_channels=self.hidden_dim + self.cost_dim, 
-        #     kernel_size=3, stride=1, padding=1
+        #self.upsample_1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        
+        # self.up = nn.Sequential(
+        #     nn.ConvTranspose2d(self.hidden_dim + self.cost_dim-1, self.hidden_dim + self.cost_dim-1, kernel_size=4, stride=2, padding=1),
+        #     nn.BatchNorm2d(self.hidden_dim + self.cost_dim-1),
+        #     nn.ReLU(inplace=True),
+
+        #     nn.ConvTranspose2d(self.hidden_dim + self.cost_dim-1, self.hidden_dim + self.cost_dim-1, kernel_size=4, stride=2, padding=1),
+        #     nn.BatchNorm2d(self.hidden_dim + self.cost_dim-1),
+        #     nn.ReLU(inplace=True),
         # )
-        #self.refine_net = DepthPoseRefineNet(hidden_dim=self.hidden_dim)
         
         if self.UseConvGRU:
             self.contextPose = ResNetEncoder(out_chs=self.hidden_dim+self.cost_dim, 
@@ -498,28 +594,6 @@ class midasConsNet(nn.Module):
         self.scaleOutput = OutputScaleConv(features=self.hidden_dim + self.cost_dim, groups=1, 
                                             activation=nn.ReLU(False), non_negative=False)
 
-    def freeze_pose_branch(self, freeze=True):
-        """
-        Freeze or unfreeze the pose refinement branch of the model
-        """
-        if freeze:
-            # Freeze pose update block and related components
-            for param in self.update_block_pose.parameters():
-                param.requires_grad = False
-            
-            # Also freeze contextPose if using ConvGRU
-            for param in self.contextPose.parameters():
-                param.requires_grad = False
-        else:
-            # Unfreeze pose update block and related components
-            for param in self.update_block_pose.parameters():
-                param.requires_grad = True
-            
-            # Also unfreeze contextPose if using ConvGRU
-            for param in self.contextPose.parameters():
-                param.requires_grad = True
-                
-                
     def upsample_depth(self, depth, mask, ratio):
         """ Upsample depth field [H/ratio, W/ratio, 2] -> [H, W, 2] using convex combination """
         N, _, H, W = depth.shape
@@ -618,81 +692,371 @@ class midasConsNet(nn.Module):
         
         return torch.stack(batch_inputs, dim=0)
     
+    def visualize_sparse_scales(self, sparse_scales, valid_mask, tgt_interp, sparse_scales_pre, valid_mask_pre, int_interp_pre):
+        """
+        Visualize and compare sparse scales before and after preprocessing, including interpolated values.
+        
+        Args:
+            sparse_scales: Original sparse scales [B, H, W]
+            valid_mask: Original valid mask [B, H, W]
+            tgt_interp: Original interpolated values [B, H, W] or [B, 1, H, W]
+            sparse_scales_pre: Preprocessed sparse scales [B, 1, H, W]
+            valid_mask_pre: Preprocessed valid mask [B, 1, H, W]
+            int_interp_pre: Preprocessed interpolated values [B, 1, H, W]
+        """
+        import matplotlib.pyplot as plt
+        import numpy as np
+        
+        # Convert to numpy for visualization
+        batch_idx = 0  # Visualize first batch
+        
+        # Original scales at valid locations
+        orig_scales = sparse_scales[batch_idx][valid_mask[batch_idx] > 0].detach().cpu().numpy()
+        
+        # Preprocessed scales at valid locations
+        pre_scales = sparse_scales_pre[batch_idx, 0][valid_mask_pre[batch_idx, 0] > 0].detach().cpu().numpy()
+        
+        # Check if tgt_interp is already batched with channel dimension
+        if len(tgt_interp.shape) == 3:  # [B, H, W]
+            orig_interp = tgt_interp[batch_idx].detach().cpu().numpy()
+        else:  # [B, C, H, W]
+            orig_interp = tgt_interp[batch_idx, 0].detach().cpu().numpy()
+        
+        # Preprocessed interpolated values
+        pre_interp = int_interp_pre[batch_idx, 0].detach().cpu().numpy()
+        
+        # Create figure with multiple subplots - 2x3 grid
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        
+        # 1. Histogram of original scales
+        if len(orig_scales) > 0:
+            axes[0, 0].hist(orig_scales, bins=50, alpha=0.7, color='blue')
+            axes[0, 0].set_title('Original Sparse Scales Distribution')
+            axes[0, 0].set_xlabel('Scale Value')
+            axes[0, 0].set_ylabel('Frequency')
+            
+            # Add stats text
+            stats_text = f"Mean: {orig_scales.mean():.4f}\nStd: {orig_scales.std():.4f}\n"
+            stats_text += f"Min: {orig_scales.min():.4f}\nMax: {orig_scales.max():.4f}\n"
+            stats_text += f"Valid points: {len(orig_scales)}"
+            
+            axes[0, 0].text(0.05, 0.95, stats_text, transform=axes[0, 0].transAxes,
+                            fontsize=9, verticalalignment='top',
+                            bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+        else:
+            axes[0, 0].text(0.5, 0.5, "No valid original scales", ha='center', va='center')
+            axes[0, 0].set_title('Original Sparse Scales (Empty)')
+        
+        # 2. Histogram of preprocessed scales
+        if len(pre_scales) > 0:
+            axes[0, 1].hist(pre_scales, bins=50, alpha=0.7, color='green')
+            axes[0, 1].set_title('Preprocessed Sparse Scales Distribution')
+            axes[0, 1].set_xlabel('Scale Value')
+            axes[0, 1].set_ylabel('Frequency')
+            
+            # Add stats text
+            stats_text = f"Mean: {pre_scales.mean():.4f}\nStd: {pre_scales.std():.4f}\n"
+            stats_text += f"Min: {pre_scales.min():.4f}\nMax: {pre_scales.max():.4f}\n"
+            stats_text += f"Valid points: {len(pre_scales)}"
+            
+            axes[0, 1].text(0.05, 0.95, stats_text, transform=axes[0, 1].transAxes,
+                            fontsize=9, verticalalignment='top',
+                            bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+        else:
+            axes[0, 1].text(0.5, 0.5, "No valid preprocessed scales", ha='center', va='center')
+            axes[0, 1].set_title('Preprocessed Sparse Scales (Empty)')
+        
+        # 3. Original sparse scales visualization
+        orig_vis = np.zeros((sparse_scales.shape[1], sparse_scales.shape[2]))
+        if len(orig_scales) > 0:
+            orig_vis[valid_mask[batch_idx].detach().cpu().numpy() > 0] = orig_scales
+        im0 = axes[1, 0].imshow(orig_vis, cmap='viridis')
+        axes[1, 0].set_title('Original Sparse Scales (Valid Locations)')
+        plt.colorbar(im0, ax=axes[1, 0])
+        
+        # 4. Preprocessed sparse scales visualization
+        pre_vis = np.zeros((sparse_scales_pre.shape[2], sparse_scales_pre.shape[3]))
+        if len(pre_scales) > 0:
+            pre_vis[valid_mask_pre[batch_idx, 0].detach().cpu().numpy() > 0] = pre_scales
+        im1 = axes[1, 1].imshow(pre_vis, cmap='viridis')
+        axes[1, 1].set_title('Preprocessed Sparse Scales (Valid Locations)')
+        plt.colorbar(im1, ax=axes[1, 1])
+        
+        # 5. Original interpolated values (dense map)
+        im2 = axes[0, 2].imshow(orig_interp, cmap='plasma')
+        axes[0, 2].set_title('Original Interpolated Scale Map')
+        plt.colorbar(im2, ax=axes[0, 2])
+        
+        # Add stats text for original interp
+        stats_text = f"Mean: {orig_interp.mean():.4f}\nStd: {orig_interp.std():.4f}\n"
+        stats_text += f"Min: {orig_interp.min():.4f}\nMax: {orig_interp.max():.4f}"
+        
+        axes[0, 2].text(0.05, 0.95, stats_text, transform=axes[0, 2].transAxes,
+                        fontsize=9, verticalalignment='top',
+                        bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+        
+        # 6. Preprocessed interpolated values (dense map)
+        im3 = axes[1, 2].imshow(pre_interp, cmap='plasma')
+        axes[1, 2].set_title('Preprocessed Interpolated Scale Map')
+        plt.colorbar(im3, ax=axes[1, 2])
+        
+        # Add stats text for preprocessed interp
+        stats_text = f"Mean: {pre_interp.mean():.4f}\nStd: {pre_interp.std():.4f}\n"
+        stats_text += f"Min: {pre_interp.min():.4f}\nMax: {pre_interp.max():.4f}"
+        
+        axes[1, 2].text(0.05, 0.95, stats_text, transform=axes[1, 2].transAxes,
+                        fontsize=9, verticalalignment='top',
+                        bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+        
+        # Add global title
+        plt.suptitle("Sparse Scales and Interpolation Comparison", fontsize=16)
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # Print additional statistics
+        print("\n===== Scale Statistics =====")
+        
+        # Count of valid points
+        print(f"Original valid points: {(valid_mask[batch_idx]>0).sum().item()}")
+        print(f"Preprocessed valid points: {(valid_mask_pre[batch_idx, 0]>0).sum().item()}")
+        
+        # Stats for sparse scales
+        if len(orig_scales) > 0:
+            print(f"\nOriginal Sparse Scales - Mean: {orig_scales.mean():.4f}, Std: {orig_scales.std():.4f}, Min: {orig_scales.min():.4f}, Max: {orig_scales.max():.4f}")
+        else:
+            print("\nOriginal Sparse Scales - No valid data")
+        
+        if len(pre_scales) > 0:
+            print(f"Preprocessed Sparse Scales - Mean: {pre_scales.mean():.4f}, Std: {pre_scales.std():.4f}, Min: {pre_scales.min():.4f}, Max: {pre_scales.max():.4f}")
+        else:
+            print("Preprocessed Sparse Scales - No valid data")
+        
+        # Stats for interpolated maps
+        print(f"\nOriginal Interpolated Map - Mean: {orig_interp.mean():.4f}, Std: {orig_interp.std():.4f}, Min: {orig_interp.min():.4f}, Max: {orig_interp.max():.4f}")
+        print(f"Preprocessed Interpolated Map - Mean: {pre_interp.mean():.4f}, Std: {pre_interp.std():.4f}, Min: {pre_interp.min():.4f}, Max: {pre_interp.max():.4f}")
+        
+    def batch_interpolate_scale_maps(self, pred_inv_depth, sparse_depth, valid_mask, interpolate_method='linear', normalize=True):
+        """
+        Batch-friendly interpolation of scale maps for sparse depth points.
+        
+        Args:
+            pred_inv_depth: tensor of shape [B, H, W] - predicted inverse depth
+            sparse_depth: tensor of shape [B, H, W] - sparse depth measurements
+            valid_mask: tensor of shape [B, H, W] - binary mask where depth measurements exist
+            interpolate_method: interpolation method ('linear', 'cubic', 'nearest')
+            normalize: whether to normalize the output scale maps to [0, 1]
+            
+        Returns:
+            interpolated_scale_maps: tensor of shape [B, H, W]
+        """
+        batch_size, height, width = pred_inv_depth.shape
+        device = pred_inv_depth.device
+        
+        # Convert sparse depth to inverse depth
+        sparse_depth_inv = torch.zeros_like(sparse_depth)
+        valid_indices = valid_mask > 0
+        sparse_depth_inv[valid_indices] = 1.0 / (sparse_depth[valid_indices] + 1e-6)
+        
+        # Calculate raw scale factors
+        scale_factors = torch.zeros_like(sparse_depth_inv)
+        valid_idx = valid_mask > 0
+        scale_factors[valid_idx] = sparse_depth_inv[valid_idx] / (pred_inv_depth[valid_idx] + 1e-6)
+        
+        # Process each item in the batch
+        interpolated_maps = []
+        
+        for b in range(batch_size):
+            # Extract the data for this batch item
+            current_valid = valid_mask[b].cpu().numpy().astype(bool)
+            current_scales = scale_factors[b].cpu().numpy()
+            
+            if np.sum(current_valid) == 0:
+                # No valid points in this batch item
+                interpolated_maps.append(torch.ones(height, width, device=device))
+                continue
+                
+            # Get coordinates of valid points
+            y_coords, x_coords = np.nonzero(current_valid)
+            knot_coords = np.stack([x_coords, y_coords], axis=1)
+            knot_values = current_scales[current_valid]
+            
+            # Create a grid for interpolation
+            grid_y, grid_x = np.mgrid[0:height, 0:width]
+            grid_points = np.stack([grid_x.flatten(), grid_y.flatten()], axis=1)
+            
+            # Perform interpolation
+            interpolated_values = griddata(
+                points=knot_coords,
+                values=knot_values,
+                xi=grid_points,
+                method=interpolate_method,
+                fill_value=1.0
+            )
+            
+            interpolated_map = interpolated_values.reshape(height, width)
+            
+            # Convert back to tensor
+            interpolated_map_tensor = torch.from_numpy(interpolated_map).float().to(device)
+            
+            # Optional normalization to [0, 1] range
+            if normalize and torch.sum(current_valid) > 0:
+                min_val = torch.min(scale_factors[b][valid_idx[b]])
+                max_val = torch.max(scale_factors[b][valid_idx[b]])
+                if max_val > min_val:
+                    interpolated_map_tensor = (interpolated_map_tensor - min_val) / (max_val - min_val + 1e-6)
+            
+            interpolated_maps.append(interpolated_map_tensor)
+        
+        # Stack the results
+        return torch.stack(interpolated_maps, dim=0)
+
+
+    def normalize_unit_range(self, tensor):
+        """Normalize tensor to [0, 1] range for each item in batch"""
+        batch_size = tensor.shape[0]
+        normalized = torch.zeros_like(tensor)
+        
+        for b in range(batch_size):
+            min_val = tensor[b].min()
+            max_val = tensor[b].max()
+            if max_val > min_val:
+                normalized[b] = (tensor[b] - min_val) / (max_val - min_val + 1e-6)
+            else:
+                normalized[b] = torch.zeros_like(tensor[b])
+        
+        return normalized
+
     def forward(self, tgt_img, ref_imgs, tgt_ga_depth, ref_ga_depth, 
                 tgt_interp, tgt_sparse_depth, ref_interp, tgt_pose, 
-                ref_pose, intrinsics, tgt_normals, tgt_depth_pred_inv, depth_only=False):
+                ref_pose, intrinsics, tgt_normals, tgt_depth_pred_inv, global_step, depth_only=False):
         """
         Refine metric depth scale and VIO poses and target/reference images.
-        """
-        # Step 1: Compute sparse scales and valid mask
-        tgt_sparse_depth_inv = utils.depth2inv(tgt_sparse_depth)  # [B, 1, H, W]
-        valid_mask = (tgt_sparse_depth_inv > 0).float()  # [B, 1, H, W]
-        sparse_scales = torch.zeros_like(tgt_sparse_depth_inv)  # [B, 1, H, W]
-        sparse_scales[valid_mask > 0] = tgt_sparse_depth_inv[valid_mask > 0] / (tgt_ga_depth[valid_mask > 0] + 1e-6)
-
-        # Extract sparse points and values for each sample in the batch
-        B, _, H, W = tgt_ga_depth.shape
-        sparse_points = []
-        sparse_scales_values = []
-        for b in range(B):
-            indices = torch.where(valid_mask[b, 0] > 0)
-            points = [(y.item(), x.item()) for y, x in zip(indices[0], indices[1])]
-            scales = sparse_scales[b, 0][indices].detach()
-            sparse_points.append(points)
-            sparse_scales_values.append(scales)
-            
-        #Step 1: Extract features using the base model
+        """ 
+        #Step: Extract features using the base model
         ref_inputs = [
             self.preprocess_batch(ref_img, keys=["image"], device=ref_img.device)
             for ref_img in ref_imgs
         ]
         
-        # processed_batch = self.preprocess_batch(
-        #     tgt_img, tgt_ga_depth, tgt_ga_depth, tgt_interp, 
-        #     keys=["image", "int_depth", "int_depth_c", "int_scales_c"], 
-        #     device=tgt_img.device
-        # )
+        # Step: Compute sparse scales and valid mask
+        tgt_sparse_depth_inv = utils.depth2inv(tgt_sparse_depth)  # [B, H, W]
+        valid_mask = (tgt_sparse_depth_inv > 0).float()  # [B, H, W]
+        sparse_scales = torch.zeros_like(tgt_sparse_depth_inv)  # [B, H, W]
+        sparse_scales[valid_mask > 0] = tgt_sparse_depth_inv[valid_mask > 0] / (tgt_ga_depth[valid_mask > 0] + 1e-6)
+        
+        #normalize the sparse_scales
+        orig_min = sparse_scales[valid_mask > 0].min()
+        orig_max = sparse_scales[valid_mask > 0].max()
+        sparse_scales[valid_mask > 0] = (sparse_scales[valid_mask > 0] - orig_min) / (orig_max - orig_min + 1e-6)
+        
         processed_batch = self.preprocess_batch(
-            tgt_img, tgt_ga_depth, tgt_ga_depth, sparse_scales, valid_mask,
-            keys=["image", "int_depth", "int_depth_c", "sparse_scales", "valid_mask"],
+            tgt_img, tgt_ga_depth, tgt_ga_depth, sparse_scales, valid_mask, tgt_interp,
+            keys=["image", "int_depth", "int_depth_c", "int_scales_c", "mask", "int_scales_c"],
             device=tgt_img.device
         )
-        tgt_input, context_depth_input = torch.split(processed_batch, [4, 3], dim=1) #[1,4,288,384]
+        tgt_input, context_depth_input = torch.split(processed_batch, [4, 4], dim=1) #[1,4,288,384]
         init_metric_depth_inv = context_depth_input[:, 0:1, :, :]  # pred_inv_depth
-        
+
         #test feat extraction only with the rgb image
-        tgt_input = processed_batch[:, :3, :, :] # Shape: [1, 3, H, W]
+        tgt_input = processed_batch[:, :3, :, :] # Shape: [1, 3, 288, 384]
         
-        # Extract features using MidasNet #TODO: batch processing?
-        #tgt_feats = self.FeatExtractor(tgt_input) #[1, 32, 288, 384]
-        #ref_feats = [self.FeatExtractor(ref_input) for ref_input in ref_inputs] #[1, 32, 288, 384]
-        fmaps = self.fnet(torch.cat([tgt_input] + ref_inputs, dim=0))
-        fmaps = torch.split(fmaps, [tgt_input.shape[0]] * (1 + len(ref_inputs)), dim=0)
-        tgt_feats, ref_feats = fmaps[0], fmaps[1:] #[1,32,384/4,384/4]
+        int_depth_pre = context_depth_input[:,0:1, :,:] #shape: [1,1,288,384]
+        sparse_scales_pre = context_depth_input[:, 1:2, :, :] # Shape: [1, 1, 288, 384]
+        valid_mask_pre = context_depth_input[:, 2:3, :, :] # Shape: [1, 1, 288, 384]
+        tgt_normals_pre = F.interpolate(tgt_normals.permute(0, 3, 1, 2), 
+                                        size=(288, 384), mode='bilinear', align_corners=False) #1, 3, 288, 384
+        int_interp_pre = context_depth_input[:,3:4,:,:]
+
+        tgt_sparse_depth_inv_resized = F.interpolate(
+            tgt_sparse_depth_inv.unsqueeze(1),  
+            size=(tgt_input.shape[2], tgt_input.shape[3]),  
+            mode='nearest',   
+            align_corners=None  
+        )
+        #valid_mask_pre = (tgt_sparse_depth_inv_resized > 0).float()
         
-        #context_feats = self.contextLearner(context_depth_input) #[1, 64, 144, 192] ga_depth + interp_scale
-        #context_feats = self.cnet_depth(context_depth_input) # (1, 128, 72, 96)
-        context_feats = self.cnet_depth(context_depth_input) 
-        aligned_feats, aligned_scale = self.ap(context_feats, sparse_points, sparse_scales_values, 
-                                                normals=tgt_normals)
-        #step2: get the init scaled depth from the model
-        #metric_depth_inv_tgt, _ = self.ScaleMapLearner(x, d)
-        #scale_factor =  tgt_img.permute(0,3,1,2).shape[2] / tgt_feats.shape[2]
+        ##Visualize the sparse scales
+        # self.visualize_sparse_scales(
+        #     tgt_sparse_depth_inv,         # Original sparse scales [B, H, W]
+        #     valid_mask,            # Original valid mask [B, H, W],
+        #     tgt_interp,
+        #     tgt_sparse_depth_inv_resized,     # Preprocessed sparse scales [B, 1, H, W]
+        #     valid_mask_pre,         # Preprocessed valid mask [B, 1, H, W]
+        #     int_interp_pre
+        # )
         
-        # Step 3: get initial depth and pose
-        scale_map, conf_map = self.scaleOutput(aligned_feats)
-        #scale_map = self.scaleOutput(context_feats)
-        delta_scales = F.relu(1.0 + scale_map)  # Ensure scale is positive
-        inv_depth_pred = init_metric_depth_inv * delta_scales
+        propagated_depth_inv = self.depth_prop(tgt_input, tgt_sparse_depth_inv_resized)
+        refined_inv_depth = propagated_depth_inv
+        
+        #get scale scaffolding from the propagated_depth
+        coarse_scales = torch.ones_like(propagated_depth_inv)
+        valid_mask_prop = (propagated_depth_inv > 0)
+        coarse_scales = torch.where(valid_mask_prop, propagated_depth_inv / (int_depth_pre + 1e-6), coarse_scales)
+        coarse_scales = (coarse_scales - coarse_scales.min()) / (coarse_scales.max() - coarse_scales.min() + 1e-6)
+        #normalize corase_scales
+        
+        #coarse_scales[valid_mask] = propagated_depth_inv[valid_mask] / (tgt_ga_depth[valid_mask] + 1e-6)
+        #coarse_scales = (coarse_scales - coarse_scales.min()) / (coarse_scales.max() - coarse_scales.min() + 1e-6)
+        scale_scaffolding = coarse_scales
+        
+        # # Extract features using MidasNet #TODO: batch processing?
+        # #tgt_feats = self.FeatExtractor(tgt_input) #[1, 32, 288, 384]
+        # #ref_feats = [self.FeatExtractor(ref_input) for ref_input in ref_inputs] #[1, 32, 288, 384]
+        # fmaps = self.fnet(torch.cat([tgt_input] + ref_inputs, dim=0))
+        # fmaps = torch.split(fmaps, [tgt_input.shape[0]] * (1 + len(ref_inputs)), dim=0)
+        # tgt_feats, ref_feats = fmaps[0], fmaps[1:] #[1,32,288/4,384/4]
+        # tgt_larg_feat = self.fnet_midas(tgt_input) #[B, 32, 144, 192]
+        # #context_feats = self.contextLearner(context_depth_input) #[1, 64, 144, 192] ga_depth + interp_scale
+        # #context_feats = self.cnet_depth(context_depth_input) # (1, 128, 72, 96)
+        # #context_feats = self.cnet_depth(context_depth_input)
+        # # Extract sparse points and values for each sample in the batch
+        # B, _, H, W = init_metric_depth_inv.shape
+        # sparse_points_idx = []
+        # sparse_scales_values = []
+        # for b in range(B):
+        #     indices = torch.where(valid_mask_pre[b,0] > 0)
+        #     points = [(y.item(), x.item()) for y, x in zip(indices[0], indices[1])]
+        #     scales = sparse_scales_pre[b,0][indices].detach()
+        #     sparse_points_idx.append(points)
+        #     sparse_scales_values.append(scales)
+             
+        # affinity_map = self.ap(tgt_larg_feat, sparse_points_idx, sparse_scales_values, 
+        #                                         tgt_normals_pre, full_res=(H, W))
+        
+        # # Step 4: Prepare scale_at_points
+        # N_max = max(len(points) for points in sparse_points_idx)
+        # scale_at_points = torch.zeros(B, N_max, 1, device=tgt_larg_feat.device)
+        # for b in range(B):
+        #     num_points = len(sparse_scales_values[b])
+        #     if num_points > 0:
+        #         scale_at_points[b, :num_points, 0] = sparse_scales_values[b]
+        
+        # # Step 5: Propagate scales using affinity map 
+        # H_down, W_down = tgt_larg_feat.shape[2], tgt_larg_feat.shape[3]
+        # scale_scaffolding = torch.bmm(affinity_map, scale_at_points).squeeze(-1)  # [B, H_down*W_down]
+        # scale_scaffolding = scale_scaffolding.view(B, 1, H_down, W_down)  # [B, 1, H_down, W_down]
+        
+        #
+        # Step 6: Predict delta scales and confidence
+        #ga_depth_feat = self.cnet_depth_affinity(int_depth_pre)
+        #ga_depth_feat = self.upsample_1(ga_depth_feat)
+        #context_test = torch.cat([ga_depth_feat, scale_scaffolding], dim=1)
+        
+        # context = torch.cat([int_depth_pre, scale_scaffolding], dim=1)
+        # context = self.cnet_depth(context)
+        # scale_map = self.scaleOutput(context)
+        # delta_scales = F.relu(1.0 + scale_map)  # Ensure scale is positive
+        # inv_depth_pred = init_metric_depth_inv * delta_scales
             
-        if self.min_pred is not None and self.max_pred is not None:
-            inv_depth_pred = torch.clamp(
-                inv_depth_pred, 
-                min=1.0 / self.max_pred, 
-                max=1.0 / self.min_pred
-            )
+        # if self.min_pred is not None and self.max_pred is not None:
+        #     inv_depth_pred = torch.clamp(
+        #         inv_depth_pred, 
+        #         min=1.0 / self.max_pred, 
+        #         max=1.0 / self.min_pred
+        #     )
             
-        refined_inv_depth = inv_depth_pred #[b, 1, 288, 384]
+        #refined_inv_depth = inv_depth_pred #[b, 1, 288, 384]
         
         depth_init_up = F.interpolate(
                 refined_inv_depth,
@@ -815,10 +1179,11 @@ class midasConsNet(nn.Module):
                 
             #ref_abspose_list = list(zip(*pose_list_seqs))[-1]
              #refined_rel_poses = [pose_to_se3(fixed_tgt_pose.inverse() @ ref_p) for ref_p in ref_abspose_list]
-                
+        
         if self.is_train:
             return inv_depth_predictions, \
-                torch.stack([torch.stack(poses_ref, dim=1) for poses_ref in pose_predictions], dim=2) #(b, n, iters, 6)
+                torch.stack([torch.stack(poses_ref, dim=1) for poses_ref in pose_predictions], dim=2), \
+                    scale_scaffolding #(b, n, iters, 6)
         else:
             return inv_depth_predictions[-1],\
                 torch.stack(pose_predictions[-1], dim=1).view(tgt_img.shape[0], len(ref_imgs), 6) #(b, n, 6)

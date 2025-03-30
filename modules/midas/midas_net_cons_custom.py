@@ -217,11 +217,16 @@ class ResNetEncoder(models.ResNet):
         x = self.maxpool(x)
 
         x = self.layer1(x)
+        self.layer1_features = x # Store layer1 features
         feats["s4"] = x
+        
         x = self.layer2(x)
+        self.layer2_features = x  # Store layer2 features
         feats["s8"] = x
+        
         x = self.layer3(x)
-
+        self.layer3_features = x  # Store layer3 features
+        
         if self.stride == 8:
             x = F.interpolate(x, scale_factor=2, mode=self.upsample_mode)
             x = self.upconv1(x)

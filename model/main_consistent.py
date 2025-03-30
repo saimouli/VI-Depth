@@ -20,11 +20,11 @@ class midasNetConsistentModule(pl.LightningModule):
     def __init__(self, lr: float = 0.1, wd: float = 0.1, min_pred: float = 0.1, 
                  max_pred: float = 8.0, min_depth: float = 0.2, 
                  max_depth: float = 5.0, nsamples: int = 150, img_h=480, 
-                 img_w=640, sml_model_path: str = None, useConvGRU: bool = True, is_train: bool = False,
+                 img_w=640, sml_model_path: str = None, useConvGRU: bool = True, is_train: bool = True,
                  *args: Any, **kwargs: Any) -> None:
         super(midasNetConsistentModule, self).__init__(*args, **kwargs)
         self.model = midasConsNet(min_pred, max_pred, min_depth, max_depth, nsamples, 
-                                  sml_model_path, is_train=is_train, log_fn=self.log, isConvGRU=useConvGRU)
+                                  sml_model_path, is_train=is_train, log_fn=self.logger, isConvGRU=useConvGRU)
         #print model params
         print("Model Parameters: ", sum(p.numel() for p in self.model.parameters() if p.requires_grad))
         self.lr = lr
@@ -490,9 +490,9 @@ class midasNetConsistentModule(pl.LightningModule):
         #                                                                                     intrinsics)
         
         #(b, n, iters, 6) 
-        if self.current_epoch < 10:
-            self.model.iter_steps=0   
-            refined_depth_inv, refined_ref_poses = self.model(tgt_img, ref_imgs,
+        #if self.current_epoch < 60:
+        self.model.iter_steps=0   
+        refined_depth_inv, refined_ref_poses, scale_scaffolding = self.model(tgt_img, ref_imgs,
                                                             tgt_ga_depth, ref_ga_depth, 
                                                             tgt_interp, tgt_sparse_depth,
                                                             ref_interp, 
@@ -500,7 +500,8 @@ class midasNetConsistentModule(pl.LightningModule):
                                                             ref_rel_gtposes, 
                                                             intrinsics,
                                                             tgt_normal,
-                                                            tgt_depth_pred)
+                                                            tgt_depth_pred,
+                                                            self.global_step)
             
         # elif self.current_epoch < 30:
         #     self.model.iter_steps=3
@@ -594,6 +595,12 @@ class midasNetConsistentModule(pl.LightningModule):
                                         utils.inv2depth(refined_depth_inv), pred_poses,
                                         ref_rel_gtposes, intrinsics, mode=stage)
             
+            # self.visualize_affinity_propagation(tgt_img=tgt_img,sparse_scales=None,
+            #                                     sparse_scales_pre=None,valid_mask_pre=valid_mask_pre,
+            #                                     affinity_map=affinity_map,scale_scaffolding=scale_scaffolding,
+            #                                     sparse_points_idx=sparse_points_idx,sparse_scales_values=sparse_scales_values,
+            #                                     delta_scales=delta_scales,mode=stage)
+            
             #if len(warping_vis) > 0:
             #    self.log_warping(warping_vis, mode=stage)
             # self.log_img_tensorboard(tgt_img, gt_depth, utils.inv2depth(tgt_ga_depth).unsqueeze(0).permute(1,0,2,3), 
@@ -608,6 +615,248 @@ class midasNetConsistentModule(pl.LightningModule):
             "ref_pred_poses": [view_poses[-1] for view_poses in pred_poses],
         }
         #TODO: compute loss for the pose as well
+        
+    @torch.no_grad()
+    def visualize_affinity_propagation(self, tgt_img, sparse_scales, 
+                                    sparse_scales_pre, valid_mask_pre, 
+                                    affinity_map, scale_scaffolding, sparse_points_idx, 
+                                    sparse_scales_values, delta_scales, mode="train"):
+        """
+        Visualize the affinity propagation process with:
+        - Original sparse scales
+        - Sparse points on target image
+        - Affinity maps for selected points
+        - Scale scaffolding
+        - Final delta scales
+        """
+        import matplotlib.pyplot as plt
+        import numpy as np
+        import cv2
+        
+        device = tgt_img.device
+        tgt_img = tgt_img.permute(0,3,1,2)
+        B, C, H, W = tgt_img.shape
+        
+        # Select first sample in batch
+        idx = 0
+        tgt_img_vis = tgt_img[idx].detach().cpu()
+        h_down, w_down = scale_scaffolding.shape[2], scale_scaffolding.shape[3]
+        
+        def draw_dot_marker(image, y, x, radius=5, color=(1.0, 0.0, 0.0)):
+            """Draw a solid red dot marker at the specified coordinates."""
+            # Ensure image is a tensor
+            if not isinstance(image, torch.Tensor):
+                image = torch.tensor(image)
+            
+            # Create a copy to avoid modifying the original
+            marked_image = image.clone()
+            
+            # Get image dimensions
+            _, h, w = marked_image.shape
+            
+            # Draw a filled circle
+            for dy in range(-radius, radius+1):
+                for dx in range(-radius, radius+1):
+                    # Check if point is within circle
+                    if dy*dy + dx*dx <= radius*radius:
+                        # Calculate coordinates
+                        py, px = y+dy, x+dx
+                        
+                        # Ensure coordinates are within bounds
+                        if 0 <= py < h and 0 <= px < w:
+                            marked_image[0, py, px] = color[0]  # R
+                            marked_image[1, py, px] = color[1]  # G
+                            marked_image[2, py, px] = color[2]  # B
+            
+            return marked_image
+        
+        def apply_colormap(tensor, colormap="viridis", vmin=None, vmax=None):
+            """Apply colormap to a tensor."""
+            if isinstance(tensor, torch.Tensor):
+                tensor_np = tensor.detach().cpu().numpy()
+            else:
+                tensor_np = tensor
+            
+            # Use percentile-based normalization for better visualization
+            if vmin is None:
+                vmin = np.percentile(tensor_np, 2)  # Avoid extreme minimums
+            if vmax is None:
+                vmax = np.percentile(tensor_np, 98)  # Avoid extreme maximums
+            
+            norm = (tensor_np - vmin) / (vmax - vmin + 1e-6)
+            norm = np.clip(norm, 0, 1)
+            
+            cmap = plt.get_cmap(colormap)
+            colored = cmap(norm)[:, :, :3]  # Drop alpha channel
+            
+            return torch.from_numpy(colored).permute(2, 0, 1).float()
+        
+        def overlay_text_on_image(image, text, position=(10, 30), font_scale=0.5, color=(255, 0, 0)):
+            """Add text overlay to an image."""
+            image_np = (image.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            cv2.putText(image_np, text, position, cv2.FONT_HERSHEY_SIMPLEX, 
+                    font_scale, color, thickness=1, lineType=cv2.LINE_AA)
+            return torch.from_numpy(image_np).permute(2, 0, 1).float() / 255.0
+        
+        # 1. Visualize original sparse points on target image
+        # Convert RGB to grayscale for better point visibility
+        tgt_img_gray = 0.299 * tgt_img_vis[0] + 0.587 * tgt_img_vis[1] + 0.114 * tgt_img_vis[2]
+        tgt_img_gray = tgt_img_gray.unsqueeze(0).repeat(3, 1, 1)  # Make 3-channel grayscale
+        
+        # Create overlay of sparse points
+        sparse_overlay = tgt_img_gray.clone()
+        point_mask = torch.zeros_like(tgt_img_gray[0])
+        
+        if len(sparse_points_idx[idx]) > 0:
+            # Create a heatmap of sparse points with their scale values
+            sparse_vis = torch.zeros((H, W), device='cpu')
+            for i, (y, x) in enumerate(sparse_points_idx[idx]):
+                if i < len(sparse_scales_values[idx]):
+                    # Calculate the scaled position if point coords are in a different resolution
+                    y_scaled = min(int(y * (H / valid_mask_pre.shape[2])), H-1)
+                    x_scaled = min(int(x * (W / valid_mask_pre.shape[3])), W-1)
+                    sparse_vis[y_scaled, x_scaled] = sparse_scales_values[idx][i].item()
+                    point_mask[y_scaled, x_scaled] = 1
+            
+            # Apply color to sparse points based on their scale values
+            colored_points = apply_colormap(sparse_vis, 'plasma')
+            
+            # Blend colored points with target image
+            alpha = 0.7
+            sparse_overlay = alpha * colored_points + (1-alpha) * tgt_img_vis
+            
+            # Add bright outlines to points
+            kernel = np.ones((3, 3), np.uint8)
+            point_mask_np = point_mask.numpy()
+            point_outline = cv2.dilate(point_mask_np, kernel, iterations=1) - point_mask_np
+            
+            for c in range(3):
+                sparse_overlay_np = sparse_overlay[c].numpy()
+                sparse_overlay_np[point_outline > 0] = 1.0
+                sparse_overlay[c] = torch.from_numpy(sparse_overlay_np)
+        
+        # Add text indicating number of sparse points
+        num_points = len(sparse_points_idx[idx])
+        sparse_overlay = overlay_text_on_image(
+            sparse_overlay, f"Sparse Points: {num_points}", 
+            position=(10, 20), color=(255, 255, 255)
+        )
+        
+        # 2. Visualize affinity maps for selected points
+        # Choose up to 3 points to visualize their affinity
+        max_affinity_vis = 3
+        affinity_imgs = []
+        
+        if num_points > 0:
+            # Get indices of points to visualize (evenly spaced if possible)
+            vis_indices = [i * (num_points // max_affinity_vis) for i in range(max_affinity_vis)]
+            vis_indices = [i for i in vis_indices if i < num_points]  # Ensure indices are valid
+            
+            for i, point_idx in enumerate(vis_indices):
+                if point_idx < affinity_map.shape[2]:  # Ensure point index is within bounds
+                    # Get affinity map for this point
+                    point_affinity = affinity_map[idx, :, point_idx].view(h_down, w_down)
+                    affinity_rgb = apply_colormap(point_affinity, 'inferno')
+                    
+                    # Get point coordinates for the marker
+                    y, x = sparse_points_idx[idx][point_idx]
+                    
+                    # Scale coordinates to affinity map resolution
+                    vis_y = min(int(y * (h_down / valid_mask_pre.shape[2])), h_down-1)
+                    vis_x = min(int(x * (w_down / valid_mask_pre.shape[3])), w_down-1)
+                    
+                    # Draw red dot at the point location instead of text
+                    affinity_rgb = draw_dot_marker(affinity_rgb, vis_y, vis_x, radius=4, color=(1.0, 0.0, 0.0))
+                    
+                    # Still keep scale value as text
+                    point_scale = sparse_scales_values[idx][point_idx].item() if point_idx < len(sparse_scales_values[idx]) else 0
+                    affinity_rgb = overlay_text_on_image(
+                        affinity_rgb, f"Scale: {point_scale:.3f}", 
+                        position=(10, 20), color=(255, 255, 255)
+                    )
+                    
+                    affinity_imgs.append(affinity_rgb.unsqueeze(0))
+        
+        # If we have fewer than max_affinity_vis points, add blank images
+        while len(affinity_imgs) < max_affinity_vis:
+            blank = torch.zeros(3, h_down, w_down)
+            affinity_imgs.append(blank.unsqueeze(0))
+        
+        # Combine affinity visualizations horizontally
+        affinity_row = torch.cat(affinity_imgs, dim=-1).squeeze(0)
+        
+        # 3. Visualize scale scaffolding
+        scaffolding_rgb = apply_colormap(scale_scaffolding[idx, 0], 'viridis')
+        
+        # Add stats as text overlay
+        scaff_data = scale_scaffolding[idx, 0].detach().cpu()
+        mean_val = scaff_data.mean().item()
+        std_val = scaff_data.std().item()
+        min_val = scaff_data.min().item()
+        max_val = scaff_data.max().item()
+        
+        scaffolding_rgb = overlay_text_on_image(
+            scaffolding_rgb, f"Mean: {mean_val:.3f}, Std: {std_val:.3f}", 
+            position=(10, 20), color=(255, 255, 255)
+        )
+        scaffolding_rgb = overlay_text_on_image(
+            scaffolding_rgb, f"Min: {min_val:.3f}, Max: {max_val:.3f}", 
+            position=(10, 40), color=(255, 255, 255)
+        )
+        
+        # 4. Visualize final delta scales
+        delta_rgb = apply_colormap(delta_scales[idx, 0], 'plasma')
+        
+        # Add stats as text overlay
+        delta_data = delta_scales[idx, 0].detach().cpu()
+        delta_mean = delta_data.mean().item()
+        delta_std = delta_data.std().item()
+        delta_min = delta_data.min().item()
+        delta_max = delta_data.max().item()
+        
+        delta_rgb = overlay_text_on_image(
+            delta_rgb, f"Mean: {delta_mean:.3f}, Std: {delta_std:.3f}", 
+            position=(10, 20), color=(255, 255, 255)
+        )
+        delta_rgb = overlay_text_on_image(
+            delta_rgb, f"Min: {delta_min:.3f}, Max: {delta_max:.3f}", 
+            position=(10, 40), color=(255, 255, 255)
+        )
+        
+        # 5. Combine all visualizations
+        # First row: target with sparse points | scale scaffolding
+        # Second row: affinity maps for selected points
+        # Third row: delta scales (final output)
+        
+        # Resize scaffolding and delta_rgb to match target image resolution for better comparison
+        scaffolding_rgb_resized = torch.nn.functional.interpolate(
+            scaffolding_rgb.unsqueeze(0), size=(H, W), mode='bilinear', align_corners=False
+        ).squeeze(0)
+        
+        delta_rgb_resized = torch.nn.functional.interpolate(
+            delta_rgb.unsqueeze(0), size=(H, W), mode='bilinear', align_corners=False
+        ).squeeze(0)
+        
+        # Create rows
+        row1 = torch.cat([sparse_overlay, scaffolding_rgb_resized], dim=-1)
+        # Resize affinity to match width of row1
+        affinity_row_resized = torch.nn.functional.interpolate(
+            affinity_row.unsqueeze(0), size=(H, row1.shape[-1]), mode='bilinear', align_corners=False
+        ).squeeze(0)
+        row3 = torch.nn.functional.interpolate(
+            delta_rgb_resized.unsqueeze(0), size=(H, row1.shape[-1]), mode='bilinear', align_corners=False
+        ).squeeze(0)
+        
+        # Combine all rows
+        final_grid = torch.cat([row1, affinity_row_resized, row3], dim=-2)
+        
+        # 6. Log to TensorBoard
+        self.logger.experiment.add_image(
+            f"{mode}_affinity",
+            final_grid,
+            global_step=self.global_step,
+            dataformats="CHW"
+        )
         
 
     @torch.no_grad()
