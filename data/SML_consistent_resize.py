@@ -51,8 +51,7 @@ def generate_sample_index(num_frames, skip_frames, sequence_length):
 
     return sample_index_list
 
-
-class SML_consistent_dataset(Dataset):
+class SML_consistent_resize(Dataset):
     def __init__(self,
                  data_root,
                  mode="train",
@@ -63,6 +62,8 @@ class SML_consistent_dataset(Dataset):
         self.root = Path(data_root)
         print("Root: ", self.root)
         self.depth_scale = depth_scale
+        self.target_height = 288
+        self.target_width = 384
         if mode == "train":
             self.scenes = [subfolder for subfolder in (self.root / 'training').iterdir() if subfolder.is_dir()]
             # scene_list_path = self.root/'train_image.txt'
@@ -170,7 +171,69 @@ class SML_consistent_dataset(Dataset):
             return pose
         else:
             raise ValueError("Pose should be of shape (3, 4) or (4, 4)")
+
+    def resize_and_adjust_intrinsics(self, intrinsics, original_size, target_size):
+        """Adjust camera intrinsics for resized images"""
+        if intrinsics.shape == (4,):  # [fx, fy, cx, cy] format
+            fx, fy, cx, cy = intrinsics
+            
+            # Scale factors
+            scale_w = target_size[1] / original_size[1]
+            scale_h = target_size[0] / original_size[0]
+            
+            # Adjust focal lengths and principal point
+            new_fx = fx * scale_w
+            new_fy = fy * scale_h
+            new_cx = cx * scale_w
+            new_cy = cy * scale_h
+            
+            return np.array([new_fx, new_fy, new_cx, new_cy], dtype=np.float32)
+            
+        elif intrinsics.shape == (3, 3):  # 3x3 matrix format
+            # Scale factors
+            scale_w = target_size[1] / original_size[1]
+            scale_h = target_size[0] / original_size[0]
+            
+            # Create scaling matrix
+            S = np.eye(3)
+            S[0, 0] = scale_w  # Scale fx
+            S[1, 1] = scale_h  # Scale fy
+            S[0, 2] = intrinsics[0, 2] * scale_w  # Scale cx
+            S[1, 2] = intrinsics[1, 2] * scale_h  # Scale cy
+            
+            # Apply scaling to intrinsics
+            return S @ intrinsics
         
+        return intrinsics  # Return unchanged if format is not recognized
+    
+    def resize_depth(self, depth, target_size):
+        """Resize depth map using nearest neighbor interpolation"""
+        # Handle empty depth maps
+        if np.sum(depth > 0) == 0:
+            return np.zeros(target_size, dtype=depth.dtype)
+        
+        # Get original dimensions and create mask of valid depth points
+        h, w = depth.shape
+        mask = depth > 0
+        
+        # Calculate scale factors
+        scale_h = target_size[0] / h
+        scale_w = target_size[1] / w
+        
+        # Resize using nearest neighbor to avoid interpolation artifacts
+        resized_depth = cv2.resize(depth, (target_size[1], target_size[0]), 
+                                  interpolation=cv2.INTER_NEAREST)
+        
+        # Resize mask using nearest neighbor as well
+        resized_mask = cv2.resize(mask.astype(np.uint8), (target_size[1], target_size[0]), 
+                                 interpolation=cv2.INTER_NEAREST).astype(bool)
+        
+        # Apply mask to resized depth
+        final_depth = np.zeros_like(resized_depth)
+        final_depth[resized_mask] = resized_depth[resized_mask]
+        
+        return final_depth
+    
     def data_augment(self, img):
         random_gamma = np.random.uniform(0.9, 1.1)
         random_brightness = np.random.uniform(0.8, 1.2)
@@ -225,6 +288,8 @@ class SML_consistent_dataset(Dataset):
     
     def __getitem__(self, index):
         sample = self.samples[index]
+        
+        # Load target data
         tgt_img = load_input_image(str(sample['tgt_img']))
         tgt_gt_depth = load_sparse_depth(str(sample['tgt_gt_depth']), depth_scale=self.depth_scale)
         tgt_sparse_depth = load_sparse_depth(str(sample['tgt_sparse_depth']), depth_scale=self.depth_scale)
@@ -234,193 +299,96 @@ class SML_consistent_dataset(Dataset):
         tgt_depth_pred = load_depth_image_from_npy(str(sample['tgt_depth_pred']))
         tgt_normal = load_depth_image_from_npy(str(sample['tgt_normal']))
         
-
+        # Load reference data
         ref_img = [load_input_image(str(ref_img)) for ref_img in sample['ref_imgs']]
         ref_ga_depth = [load_depth_image_from_npy(str(ref_ga_depth)) for ref_ga_depth in sample['ref_ga_depth']]
-        ref_sparse_depth = [load_sparse_depth(str(ref_sparse_depth), depth_scale=self.depth_scale) for ref_sparse_depth in sample['ref_sparse_depth']]
+        ref_sparse_depth = [load_sparse_depth(str(ref_sparse_depth), depth_scale=self.depth_scale) 
+                          for ref_sparse_depth in sample['ref_sparse_depth']]
         ref_interp = [load_depth_image_from_npy(str(ref_interp)) for ref_interp in sample['ref_interp']]
-        ref_gt_depth = [load_sparse_depth(str(ref_gt_depth), depth_scale=self.depth_scale) for ref_gt_depth in sample['ref_gt_depth']]
+        ref_gt_depth = [load_sparse_depth(str(ref_gt_depth), depth_scale=self.depth_scale) 
+                       for ref_gt_depth in sample['ref_gt_depth']]
         ref_pose = [self.convert_to_4x4(np.loadtxt(pose)) for pose in sample['ref_pose']]
-
+        
+        # Get intrinsics and original image dimensions
         intrinsics = np.copy(sample['intrinsics'])
+        original_size = tgt_img.shape[:2]  # (H, W)
+        target_size = (288, 384)  # (288, 384)
         
-        # Get original image dimensions
-        h, w = tgt_img.shape[:2]
-        # crop_size = (384, 384)
+        # Adjust intrinsics for resizing
+        intrinsics = self.resize_and_adjust_intrinsics(intrinsics, original_size, target_size)
         
-        # # Calculate crop offsets for center crop
-        # top = (h - crop_size[0]) // 2
-        # left = (w - crop_size[1]) // 2
-        
-        # # Ensure non-negative offsets
-        # top = max(0, top)
-        # left = max(0, left)
-    
-        # # Apply crop to target image and depths
-        # tgt_img = tgt_img[top:top+crop_size[0], left:left+crop_size[1]]
-        # tgt_gt_depth = tgt_gt_depth[top:top+crop_size[0], left:left+crop_size[1]]
-        # tgt_sparse_depth = tgt_sparse_depth[top:top+crop_size[0], left:left+crop_size[1]]
-        # tgt_ga_depth = tgt_ga_depth[top:top+crop_size[0], left:left+crop_size[1]]
-        # tgt_interp = tgt_interp[top:top+crop_size[0], left:left+crop_size[1]]
-        
-        # # Apply crop to reference images and depths
-        # ref_img = [img[top:top+crop_size[0], left:left+crop_size[1]] for img in ref_img]
-        # ref_ga_depth = [depth[top:top+crop_size[0], left:left+crop_size[1]] for depth in ref_ga_depth]
-        # ref_sparse_depth = [depth[top:top+crop_size[0], left:left+crop_size[1]] for depth in ref_sparse_depth]
-        # ref_interp = [depth[top:top+crop_size[0], left:left+crop_size[1]] for depth in ref_interp]
-        # ref_gt_depth = [depth[top:top+crop_size[0], left:left+crop_size[1]] for depth in ref_gt_depth]
-        
-        # # Update intrinsics to account for cropping
-        # # intrinsics is typically [fx, fy, cx, cy] or a 3x3 matrix
-        # if intrinsics.shape == (4,):  # [fx, fy, cx, cy] format
-        #     # Adjust principal point
-        #     intrinsics[2] = intrinsics[2] - left  # cx
-        #     intrinsics[3] = intrinsics[3] - top   # cy
-        # elif intrinsics.shape == (3, 3):  # 3x3 matrix format
-        #     # Adjust principal point
-        #     intrinsics[0, 2] = intrinsics[0, 2] - left  # cx
-        #     intrinsics[1, 2] = intrinsics[1, 2] - top   # cy
-        
-        mask = (tgt_gt_depth < 5.0)
-        mask *= (tgt_gt_depth > 0.2)
-        tgt_gt_depth[~mask] = np.inf
+        # Apply mask to ground truth depth before inverse computation
+        mask = (tgt_gt_depth < 5.0) & (tgt_gt_depth > 0.2)
+        tgt_gt_depth_masked = tgt_gt_depth.copy()
+        tgt_gt_depth_masked[~mask] = np.inf
         tgt_gt_depth_inv = 1.0 / tgt_gt_depth
-        tgt_gt_depth_inv[tgt_gt_depth_inv == float("inf")] = 0
-        tgt_gt_depth_inv = torch.from_numpy(tgt_gt_depth_inv).unsqueeze(0)
-    
+        tgt_gt_depth_inv[tgt_gt_depth_inv == np.inf] = 0.0
+        # Convert to inverse depth and handle infinities
+        #tgt_gt_depth_inv = np.zeros_like(tgt_gt_depth_masked)
+        #valid_mask = tgt_gt_depth_masked < np.inf
+        #tgt_gt_depth_inv[valid_mask] = 1.0 / tgt_gt_depth_masked[valid_mask]
         
-        tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_sparse_depth, tgt_interp, tgt_pose, tgt_normal = [
+        # Resize all depth maps
+        tgt_gt_depth_inv_resized = self.resize_depth(tgt_gt_depth_inv, target_size)
+        tgt_sparse_depth_resized = self.resize_depth(tgt_sparse_depth, target_size)
+        tgt_ga_depth_resized = cv2.resize(tgt_ga_depth, (target_size[1], target_size[0]), 
+                                        interpolation=cv2.INTER_NEAREST)
+        tgt_interp_resized = cv2.resize(tgt_interp, (target_size[1], target_size[0]), 
+                                      interpolation=cv2.INTER_LINEAR)
+        tgt_depth_pred_resized = cv2.resize(tgt_depth_pred, (target_size[1], target_size[0]), 
+                                          interpolation=cv2.INTER_NEAREST)
+        # tgt_normal_resized = cv2.resize(tgt_normal, (target_size[1], target_size[0]), 
+        #                              interpolation=cv2.INTER_LINEAR)
+        
+        # Resize reference depth maps
+        ref_ga_depth_resized = [cv2.resize(depth, (target_size[1], target_size[0]), 
+                                        interpolation=cv2.INTER_NEAREST) 
+                              for depth in ref_ga_depth]
+        ref_sparse_depth_resized = [self.resize_depth(depth, target_size) 
+                                  for depth in ref_sparse_depth]
+        ref_interp_resized = [cv2.resize(depth, (target_size[1], target_size[0]), 
+                                       interpolation=cv2.INTER_LINEAR) 
+                             for depth in ref_interp]
+        ref_gt_depth_resized = [self.resize_depth(depth, target_size) 
+                              for depth in ref_gt_depth]
+        
+        # Transform RGB images using pytorch transforms for better quality
+        tgt_img_resized = cv2.resize(tgt_img, (self.target_width, self.target_height), interpolation=cv2.INTER_LINEAR)
+        ref_img_resized = [cv2.resize(img, (self.target_width, self.target_height), interpolation=cv2.INTER_LINEAR) for img in ref_img]
+        
+        # Convert reference depth maps to tensors
+        ref_ga_depth_tensor = [depth for depth in ref_ga_depth_resized]
+        ref_sparse_depth_tensor = [depth for depth in ref_sparse_depth_resized]
+        ref_interp_tensor = [depth for depth in ref_interp_resized]
+        ref_gt_depth_tensor = [depth for depth in ref_gt_depth_resized]
+        
+        tgt_gt_depth_inv_resized = torch.from_numpy(tgt_gt_depth_inv_resized).unsqueeze(0)
+        
+        tgt_img_resized, tgt_gt_depth_inv_resized, tgt_ga_depth_resized, tgt_sparse_depth_resized, tgt_interp_resized, tgt_pose = [
             T.astype(np.float32) if isinstance(T, np.ndarray) else T for T in [
-                tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_sparse_depth, tgt_interp, tgt_pose, tgt_normal
+                tgt_img_resized, tgt_gt_depth_inv_resized, tgt_ga_depth_resized, tgt_sparse_depth_resized, tgt_interp_resized, tgt_pose
             ]
         ]
         
-        #Convert ref_img, ref_pose, ref_interp, intrinsics tensor to float32
-        ref_img, ref_ga_depth, ref_interp, ref_gt_depth, ref_sparse_depth, ref_pose, intrinsics = [
+        ref_img_resized, ref_ga_depth_resized, ref_interp_resized, ref_gt_depth_resized, ref_sparse_depth_resized, ref_pose, intrinsics = [
             [torch.from_numpy(item).float() if isinstance(item, np.ndarray) else item for item in T]
             if isinstance(T, list) else torch.from_numpy(T).float() if isinstance(T, np.ndarray) else T
-            for T in [ref_img, ref_ga_depth, ref_interp, ref_gt_depth, ref_sparse_depth, ref_pose, intrinsics]
+            for T in [ref_img_resized, ref_ga_depth_resized, ref_interp_resized, ref_gt_depth_resized, ref_sparse_depth_resized, ref_pose, intrinsics]
         ]
         
-        tgt_pose_perturbed = tgt_pose #self.add_perturbation(tgt_pose)
+        # Apply pose perturbation for augmentation
+        tgt_pose_perturbed = tgt_pose #self.add_perturbation(tgt_pose).float()
         ref_pose_perturbed = [self.add_perturbation(p) for p in ref_pose]
         
-        #img, gt_depth, ga_depth, interp_scale
-        return tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, tgt_sparse_depth, ref_img, \
-            ref_ga_depth, ref_interp, ref_gt_depth, ref_sparse_depth, tgt_pose, ref_pose, intrinsics, \
-            tgt_pose_perturbed, ref_pose_perturbed, tgt_depth_pred #, tgt_normal
+        # Convert intrinsics to tensor
+        #intrinsics_tensor = torch.from_numpy(intrinsics).float()
+        return (
+            tgt_img_resized, tgt_gt_depth_inv_resized, tgt_ga_depth_resized, tgt_interp_resized,
+            tgt_sparse_depth_resized, ref_img_resized, ref_ga_depth_tensor, ref_interp_tensor,
+            ref_gt_depth_tensor, ref_sparse_depth_tensor, tgt_pose, ref_pose,
+            intrinsics, tgt_pose_perturbed, ref_pose_perturbed, tgt_depth_pred_resized
+        )
     
     def __len__(self):
         return len(self.samples)
-
-
-# if __name__ == "__main__":
-#     #dataset = SML_consistent_dataset(data_root='/media/saimouli/Data6T/datasets/VOID_150_test', mode='val', sequence_length=3)
-#     dataset = torch.utils.data.DataLoader(SML_consistent_dataset(data_root='/media/saimouli/Data6T/datasets/VOID_150_test', mode='val'))
-#     # rr.init("3d_points_visualization", spawn=True)
-
-#     #for idx in range(len(dataset)):
-#     for batch_data in dataset:
-#         tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, _, ref_imgs, \
-#         ref_ga_depth, ref_interp, ref_gt_depth, _, tgt_pose, ref_pose, intrinsics, \
-#             tgt_pose_per,ref_pose_per = batch_data #dataset[idx] #Cam2Wld poses (R_ctoG, p_CinG)
-
-#         B, H, W,_ = tgt_img.shape
-#         _, _, DH, DW = tgt_gt_depth_inv.shape
-#         scale_factor = DW / float(W)
-        
-# #       perturbed_pose = ref_pose[0].clone().detach().requires_grad_(True)
-# #       optimizer = torch.optim.Adam([perturbed_pose], lr=1e-3)
-#         ref_rel_poses = [tgt_pose.inverse() @ ref_p for ref_p in ref_pose]
-#         cam = Camera(K=intrinsics.float()).scaled(scale_factor)
-#         ref_cam1 = Camera(K=intrinsics.float(), Twc=ref_rel_poses[0]).scaled(scale_factor)
-#         ref_cam2 = Camera(K=intrinsics.float(), Twc=ref_rel_poses[1]).scaled(scale_factor)
-
-#         gt_depth = utils.inv2depth(tgt_gt_depth_inv)
-#         world_points = cam.reconstruct(gt_depth, frame='w')
-#         print("Min/Max world_points:", world_points.min().item(), world_points.max().item())
-        
-#         # Project world points into reference cameras
-#         ref_coords1 = ref_cam1.project(world_points, frame='w', normalize=True)  # (b, h, w, 2)
-#         ref_coords2 = ref_cam2.project(world_points, frame='w', normalize=True)  # (b, h, w, 2)
-
-#         print("Min/Max ref_coords1:", ref_coords1.min().item(), ref_coords1.max().item(), ref_coords1.median().item())
-#         print("Min/Max ref_coords2:", ref_coords2.min().item(), ref_coords2.max().item(), ref_coords2.median().item())
-        
-#         # Warp reference images into the target view
-#         warped_ref1 = F.grid_sample(ref_imgs[0].permute(0, 3, 1, 2), ref_coords1,
-#                                     mode='bilinear', padding_mode='zeros', align_corners=True)
-#         warped_ref2 = F.grid_sample(ref_imgs[1].permute(0, 3, 1, 2), ref_coords2, 
-#                                     mode='bilinear', padding_mode='zeros', align_corners=True)
-
-#         # Convert tensors to numpy for visualization
-#         tgt_img_np = (tgt_img[0].cpu().numpy() * 255).astype(np.uint8)  # Target image
-#         warped_ref1_np = (warped_ref1.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)  # Warped Ref 1
-#         warped_ref2_np = (warped_ref2.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)  # Warped Ref 2
-
-#         warped_identity = F.grid_sample(
-#             tgt_img.permute(0, 3, 1, 2), ref_coords1,
-#             mode='bilinear', padding_mode='zeros', align_corners=True
-#         )
-#         # Convert images to BGR for OpenCV visualization
-#         tgt_img_bgr = cv2.cvtColor(tgt_img_np, cv2.COLOR_RGB2BGR)
-#         warped_ref1_bgr = cv2.cvtColor(warped_ref1_np, cv2.COLOR_RGB2BGR)
-#         warped_ref2_bgr = cv2.cvtColor(warped_ref2_np, cv2.COLOR_RGB2BGR)
-#         warped_identity_bgr = cv2.cvtColor((warped_identity.squeeze(0).permute(1, 2, 0).cpu().numpy()*255).astype(np.uint8), cv2.COLOR_RGB2BGR)
-
-#         # Create overlays of the target image and the warped reference images
-#         fig, axes = plt.subplots(1, 2, figsize=(15, 5))
-#         axes[0].imshow(cv2.cvtColor(warped_ref1_bgr, cv2.COLOR_BGR2RGB))
-#         axes[0].set_title("Warped Ref Image 1")
-#         axes[1].imshow(cv2.cvtColor(warped_ref2_bgr, cv2.COLOR_BGR2RGB))
-#         axes[1].set_title("Warped Ref Image 2")
-        
-#         overlay_ref1 = cv2.addWeighted(tgt_img_bgr, 0.5, warped_ref1_bgr, 0.5, 0)
-#         overlay_ref2 = cv2.addWeighted(tgt_img_bgr, 0.5, warped_ref2_bgr, 0.5, 0)
-
-#         # Plot the aligned images
-#         fig, axes = plt.subplots(1, 4, figsize=(15, 5))
-
-#         # Target image
-#         axes[0].imshow(cv2.cvtColor(tgt_img_bgr, cv2.COLOR_BGR2RGB))
-#         axes[0].set_title("Target Image")
-#         axes[0].axis("off")
-
-#         # Target + Warped Ref Image 1
-#         axes[1].imshow(cv2.cvtColor(overlay_ref1, cv2.COLOR_BGR2RGB))
-#         axes[1].set_title("Overlay: Target + Warped Ref Image 1")
-#         axes[1].axis("off")
-
-#         # Target + Warped Ref Image 2
-#         axes[2].imshow(cv2.cvtColor(overlay_ref2, cv2.COLOR_BGR2RGB))
-#         axes[2].set_title("Overlay: Target + Warped Ref Image 2")
-#         axes[2].axis("off")
-        
-#         axes[3].imshow(cv2.cvtColor(warped_identity_bgr, cv2.COLOR_BGR2RGB))
-#         axes[3].set_title("Warped Identity")
-#         axes[3].axis("off")
-
-#         plt.tight_layout()
-#         plt.show()
-                
-#         #ref_imgs_np = [ref_img.transpose(1, 2, 0).astype(np.uint8) for ref_img in ref_imgs]
-#         fig, axes = plt.subplots(1, len(ref_imgs) + 1, figsize=(15, 5))
-#         mid_idx = len(ref_imgs) // 2
-#         for i, ref_img_np in enumerate(ref_imgs[:mid_idx]):
-#             axes[i].imshow(ref_img_np[0])
-#             axes[i].set_title(f"Ref Image {i + 1}")
-#             axes[i].axis("off")
-
-#         # Plot the target image in the center
-#         axes[mid_idx].imshow(tgt_img[0])
-#         axes[mid_idx].set_title("Target Image")
-#         axes[mid_idx].axis("off")
-
-#         for i, ref_img_np in enumerate(ref_imgs[mid_idx:], start=mid_idx + 1):
-#             axes[i].imshow(ref_img_np[0])
-#             axes[i].set_title(f"Ref Image {i + 1}")
-#             axes[i].axis("off")
-        
-#         plt.tight_layout()
-#         plt.show()
 

@@ -6,7 +6,7 @@ import sys
 module_path = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if module_path not in sys.path:
     sys.path.append(module_path)
-from modules.midas.midas_net_cons_custom import MidasNet_small_cons_videpth, ResNetEncoder
+from modules.midas.midas_net_cons_custom import MidasNet_small_cons_videpth, ResNetEncoder, ResNetEncoder_orig
 import numpy as np
 import modules.midas.utils as utils
 import modules.midas.transforms as transforms
@@ -18,8 +18,214 @@ from functools import partial
 import torchvision
 import math
 from scipy.interpolate import griddata
+import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
+import cv2
+
 #from modules.midas.blocks import OutputConv
 
+class SparsityAwarePooling(nn.Module):
+    def __init__(self, kernel_size, stride, padding=0, use_max_pool=False):
+        super().__init__()
+        if use_max_pool:
+            self.pool = nn.MaxPool2d(kernel_size=kernel_size, stride=stride, padding=padding)
+        else:
+            self.pool = nn.AvgPool2d(kernel_size=kernel_size, stride=stride, padding=padding, count_include_pad=False)
+        self.use_max_pool = use_max_pool
+    
+    def forward(self, sparse_depth):
+        valid_mask = (sparse_depth > 0).float()
+        sparse_depth_valid = sparse_depth * valid_mask
+        
+        if self.use_max_pool:
+            pooled_depth = self.pool(sparse_depth_valid)
+        else:
+            pooled_depth_sum = self.pool(sparse_depth_valid)
+            pooled_mask = self.pool(valid_mask)
+            pooled_depth = torch.where(
+                pooled_mask > 0,
+                pooled_depth_sum / (pooled_mask + 1e-6),
+                torch.zeros_like(pooled_depth_sum)
+            )
+        return pooled_depth
+
+@torch.no_grad()
+def visualize_sparse_depth(sparse_depth_inv, save_dir='debug_vis'):
+    """
+    Visualize sparse depth at original and different scales for debugging
+    
+    Args:
+        sparse_depth_inv: The inverse sparse depth tensor [B, 1, H, W]
+        save_dir: Directory to save visualization files
+    """
+    # Create directory if it doesn't exist
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Create pooling layers
+    pool_s2 = SparsityAwarePooling(kernel_size=2, stride=2)
+    pool_s4 = SparsityAwarePooling(kernel_size=4, stride=4)
+    pool_s8 = SparsityAwarePooling(kernel_size=8, stride=8)
+    
+    # Get pooled versions
+    with torch.no_grad():
+        depth_s2 = pool_s2(sparse_depth_inv)
+        depth_s4 = pool_s4(sparse_depth_inv)
+        depth_s8 = pool_s8(sparse_depth_inv)
+    
+    # Only process the first batch item for simplicity
+    batch_idx = 0
+    
+    # Extract sparse points for each scale
+    def extract_sparse_points(depth):
+        valid_mask = (depth[batch_idx, 0] > 0)
+        indices = torch.nonzero(valid_mask, as_tuple=True)
+        points = [(y.item(), x.item()) for y, x in zip(*indices)]
+        depths = depth[batch_idx, 0][valid_mask].cpu().numpy()
+        return points, depths
+    
+    sparse_points_orig, depths_orig = extract_sparse_points(sparse_depth_inv)
+    sparse_points_s2, depths_s2 = extract_sparse_points(depth_s2)
+    sparse_points_s4, depths_s4 = extract_sparse_points(depth_s4)
+    sparse_points_s8, depths_s8 = extract_sparse_points(depth_s8)
+    
+    # Original resolution
+    H, W = sparse_depth_inv.shape[2:]
+    # Sizes at each scale
+    H_s2, W_s2 = depth_s2.shape[2:]
+    H_s4, W_s4 = depth_s4.shape[2:]
+    H_s8, W_s8 = depth_s8.shape[2:]
+    
+    # Create a colormap for depths
+    all_depths = np.concatenate([depths_orig, depths_s2, depths_s4, depths_s8])
+    vmin, vmax = np.min(all_depths), np.max(all_depths)
+    norm = Normalize(vmin=vmin, vmax=vmax)
+    
+    # Helper function to create scatter plot
+    def plot_sparse_points(points, depths, h, w, title, filename):
+        plt.figure(figsize=(10, 8))
+        plt.scatter([p[1] for p in points], [p[0] for p in points], 
+                   c=depths, cmap='viridis', norm=norm, alpha=0.7)
+        plt.colorbar(label='Depth')
+        plt.xlim(0, w)
+        plt.ylim(h, 0)  # Invert y-axis to match image coordinates
+        plt.title(f"{title} - {len(points)} points")
+        plt.savefig(os.path.join(save_dir, filename))
+        plt.close()
+    
+    # Create density maps
+    def create_density_map(points, h, w, title, filename):
+        density_map = np.zeros((h, w), dtype=np.float32)
+        for y, x in points:
+            if 0 <= y < h and 0 <= x < w:
+                density_map[y, x] = 1.0
+        
+        # Apply Gaussian blur to make the visualization clearer
+        density_map = cv2.GaussianBlur(density_map, (7, 7), 0)
+        
+        plt.figure(figsize=(10, 8))
+        plt.imshow(density_map, cmap='hot')
+        plt.colorbar(label='Density')
+        plt.title(f"{title} - {len(points)} points")
+        plt.savefig(os.path.join(save_dir, filename))
+        plt.close()
+        
+        return density_map
+    
+    # Plot scatter and density for each resolution
+    plot_sparse_points(sparse_points_orig, depths_orig, H, W, 
+                     "Original Resolution Sparse Depth", "orig_scatter.png")
+    plot_sparse_points(sparse_points_s2, depths_s2, H_s2, W_s2, 
+                     "1/2 Scale Sparse Depth", "s2_scatter.png")
+    plot_sparse_points(sparse_points_s4, depths_s4, H_s4, W_s4, 
+                     "1/4 Scale Sparse Depth", "s4_scatter.png")
+    plot_sparse_points(sparse_points_s8, depths_s8, H_s8, W_s8, 
+                     "1/8 Scale Sparse Depth", "s8_scatter.png")
+    
+    density_orig = create_density_map(sparse_points_orig, H, W, 
+                                    "Original Resolution Density", "orig_density.png")
+    density_s2 = create_density_map(sparse_points_s2, H_s2, W_s2, 
+                                  "1/2 Scale Density", "s2_density.png")
+    density_s4 = create_density_map(sparse_points_s4, H_s4, W_s4, 
+                                  "1/4 Scale Density", "s4_density.png")
+    density_s8 = create_density_map(sparse_points_s8, H_s8, W_s8, 
+                                  "1/8 Scale Density", "s8_density.png")
+    
+    # Create a combined visualization
+    fig, axs = plt.subplots(2, 4, figsize=(20, 10))
+    
+    # First row: scatter plots
+    axs[0, 0].scatter([p[1] for p in sparse_points_orig], [p[0] for p in sparse_points_orig], 
+                    c=depths_orig, cmap='viridis', norm=norm, alpha=0.7, s=2)
+    axs[0, 0].set_title(f"Original - {len(sparse_points_orig)} points")
+    axs[0, 0].set_xlim(0, W)
+    axs[0, 0].set_ylim(H, 0)
+    
+    axs[0, 1].scatter([p[1] for p in sparse_points_s2], [p[0] for p in sparse_points_s2], 
+                    c=depths_s2, cmap='viridis', norm=norm, alpha=0.7, s=2)
+    axs[0, 1].set_title(f"1/2 Scale - {len(sparse_points_s2)} points")
+    axs[0, 1].set_xlim(0, W_s2)
+    axs[0, 1].set_ylim(H_s2, 0)
+    
+    axs[0, 2].scatter([p[1] for p in sparse_points_s4], [p[0] for p in sparse_points_s4], 
+                    c=depths_s4, cmap='viridis', norm=norm, alpha=0.7, s=2)
+    axs[0, 2].set_title(f"1/4 Scale - {len(sparse_points_s4)} points")
+    axs[0, 2].set_xlim(0, W_s4)
+    axs[0, 2].set_ylim(H_s4, 0)
+    
+    axs[0, 3].scatter([p[1] for p in sparse_points_s8], [p[0] for p in sparse_points_s8], 
+                    c=depths_s8, cmap='viridis', norm=norm, alpha=0.7, s=2)
+    axs[0, 3].set_title(f"1/8 Scale - {len(sparse_points_s8)} points")
+    axs[0, 3].set_xlim(0, W_s8)
+    axs[0, 3].set_ylim(H_s8, 0)
+    
+    # Second row: density maps
+    axs[1, 0].imshow(density_orig, cmap='hot')
+    axs[1, 0].set_title("Original Density")
+    
+    axs[1, 1].imshow(density_s2, cmap='hot')
+    axs[1, 1].set_title("1/2 Scale Density")
+    
+    axs[1, 2].imshow(density_s4, cmap='hot')
+    axs[1, 2].set_title("1/4 Scale Density")
+    
+    axs[1, 3].imshow(density_s8, cmap='hot')
+    axs[1, 3].set_title("1/8 Scale Density")
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "combined_visualization.png"))
+    plt.close()
+    
+    # Create relative density analysis
+    original_density = len(sparse_points_orig) / (H * W)
+    s2_density = len(sparse_points_s2) / (H_s2 * W_s2)
+    s4_density = len(sparse_points_s4) / (H_s4 * W_s4)
+    s8_density = len(sparse_points_s8) / (H_s8 * W_s8)
+    
+    density_increase = {
+        "1/2 scale": s2_density / original_density,
+        "1/4 scale": s4_density / original_density,
+        "1/8 scale": s8_density / original_density
+    }
+    
+    # Plot density analysis
+    plt.figure(figsize=(10, 6))
+    scales = ["Original", "1/2 Scale", "1/4 Scale", "1/8 Scale"]
+    densities = [original_density, s2_density, s4_density, s8_density]
+    plt.bar(scales, densities)
+    plt.title("Sparse Point Density at Different Scales")
+    plt.ylabel("Points per pixel")
+    plt.savefig(os.path.join(save_dir, "density_analysis.png"))
+    plt.close()
+    
+    # Write statistics to file
+    with open(os.path.join(save_dir, "sparse_depth_stats.txt"), "w") as f:
+        f.write(f"Original resolution: {H}x{W}, {len(sparse_points_orig)} points, {original_density:.6f} points/pixel\n")
+        f.write(f"1/2 scale: {H_s2}x{W_s2}, {len(sparse_points_s2)} points, {s2_density:.6f} points/pixel, {density_increase['1/2 scale']:.2f}x increase\n")
+        f.write(f"1/4 scale: {H_s4}x{W_s4}, {len(sparse_points_s4)} points, {s4_density:.6f} points/pixel, {density_increase['1/4 scale']:.2f}x increase\n")
+        f.write(f"1/8 scale: {H_s8}x{W_s8}, {len(sparse_points_s8)} points, {s8_density:.6f} points/pixel, {density_increase['1/8 scale']:.2f}x increase\n")
+    
+    print(f"Visualization saved to {save_dir}")
+    
 #Implement multi-scale affinity propagation
 class MultiScaleAffinityPropagation(nn.Module):
     def __init__(self, feature_dim=32, scales=[1,2,4], num_layers=18):
@@ -68,6 +274,10 @@ class MultiScaleAffinityPropagation(nn.Module):
         self.conf_head_s4 = nn.Conv2d(feature_dim, 1, kernel_size=1)
         self.conf_head_s2 = nn.Conv2d(feature_dim, 1, kernel_size=1)
 
+        self.pool_s8 = SparsityAwarePooling(kernel_size=8, stride=8, padding=0, use_max_pool=True)
+        self.pool_s4 = SparsityAwarePooling(kernel_size=4, stride=4, padding=0, use_max_pool=True)
+        self.pool_s2 = SparsityAwarePooling(kernel_size=2, stride=2, padding=0, use_max_pool=True)
+
         # Fusion layer 
         #self.fusion = nn.Conv2d(3, 1, kernel_size=1, bias=False)
         #nn.init.constant_(self.fusion.weight, 1/3)
@@ -82,18 +292,23 @@ class MultiScaleAffinityPropagation(nn.Module):
         B, _, H, W = sparse_depth_inv.shape
         # Extract multi-level features using your ResNetEncoder
         # This now returns features at 1/2, 1/4, and 1/8 scales
-        feats_s2, feats_s4, feats_s8 = self.fnet(image)
+        feats_s2, feats_s4, feats_s8 = self.fnet(image) #s2: (B, 32, 144, 192), s4: (B, 32, 36, 48), s8:(B, 32, 18, 24)
         
         # Multi-scale depth
-        depth_s2 = F.interpolate(sparse_depth_inv, size=(H//2, W//2), mode='nearest')
-        depth_s4 = F.interpolate(sparse_depth_inv, size=(H//8, W//8), mode='nearest')
-        depth_s8 = F.interpolate(sparse_depth_inv, size=(H//16, W//16), mode='nearest')
+        #depth_s2 = F.interpolate(sparse_depth_inv, size=(H//2, W//2), mode='nearest') #(B, 1, 144, 192)
+        #depth_s4 = F.interpolate(sparse_depth_inv, size=(H//8, W//8), mode='nearest') #(B, 1, 36, 48)
+        #depth_s8 = F.interpolate(sparse_depth_inv, size=(H//16, W//16), mode='nearest') #(B, 1, 18, 24)
+        
+        depth_s8 = self.pool_s8(sparse_depth_inv)
+        depth_s4 = self.pool_s4(sparse_depth_inv)
+        depth_s2 = self.pool_s2(sparse_depth_inv)
         
         # Extract sparse points at each resolution
         sparse_points_s8 = self._extract_sparse_points(depth_s8)
         sparse_points_s4 = self._extract_sparse_points(depth_s4)
         sparse_points_s2 = self._extract_sparse_points(depth_s2)
         
+        #visualize_sparse_depth(sparse_depth_inv.detach(), save_dir='debug_vis')
         # # Compute affinity and propagate at each scale
         # prop_depth_s2 = self._propagate_level(feats_s2, sparse_points_s2, (H//2, W//2), self.affinity_s2)
         # prop_depth_s4 = self._propagate_level(feats_s4, sparse_points_s4, (H//4, W//4), self.affinity_s4)
@@ -113,19 +328,19 @@ class MultiScaleAffinityPropagation(nn.Module):
         
         # Progressive: 1/8 -> 1/4 -> 1/2
         #coarse scale 1/8
-        conf_s8 = torch.sigmoid(self.conf_head_s8(feats_s8))
+        #conf_s8 = torch.sigmoid(self.conf_head_s8(feats_s8))
         prop_depth_s8 = self._propagate_level(feats_s8, sparse_points_s8, (H//8, W//8), self.affinity_s8)
         
         # Medium Scale 1/4: Refine using upsampled 1/8 depth
         H_4, W_4 = feats_s4.shape[2], feats_s4.shape[3]
         upsampled_depth_s8_to_s4 = F.interpolate(prop_depth_s8, size=(H_4, W_4), mode='bilinear', align_corners=False)
-        upsampled_conf_s8_to_s4 = F.interpolate(conf_s8, size=(H_4, W_4), mode='bilinear', align_corners=False)
+        #upsampled_conf_s8_to_s4 = F.interpolate(conf_s8, size=(H_4, W_4), mode='bilinear', align_corners=False)
         refined_feats_s4 = torch.cat([feats_s4, upsampled_depth_s8_to_s4], dim=1)
         refined_feats_s4 = self.refine_s8_to_s4(refined_feats_s4) + feats_s4
         #conf_s4 = torch.sigmoid(self.conf_head_s4(refined_feats_s4))
-        combined_depth_s4 = upsampled_conf_s8_to_s4 * upsampled_depth_s8_to_s4 + (1 - upsampled_conf_s8_to_s4) * depth_s4
-        combined_sparse_points_s4 = self._extract_sparse_points(combined_depth_s4)
-        prop_depth_s4 = self._propagate_level(refined_feats_s4, combined_sparse_points_s4, 
+        #combined_depth_s4 = upsampled_conf_s8_to_s4 * upsampled_depth_s8_to_s4 + (1 - upsampled_conf_s8_to_s4) * depth_s4
+        #combined_sparse_points_s4 = self._extract_sparse_points(combined_depth_s4)
+        prop_depth_s4 = self._propagate_level(refined_feats_s4, sparse_points_s4, 
                                               (H_4, W_4), self.affinity_s4,
                                               original_sparse_points=sparse_points_s4)
         
@@ -725,7 +940,7 @@ class midasConsNet(nn.Module):
         #self.fnet = ResNetEncoder(out_chs=self.cost_dim, stride=4)
         #self.fnet_midas = MidasNet_small_cons_videpth(features=32, in_channels=3)
         #self.cnet_depth_affinity = ResNetEncoder(out_chs=self.hidden_dim + self.cost_dim-1, stride=4, context_num=1, pretrained=False)
-        #self.cnet_depth = ResNetEncoder(out_chs=self.hidden_dim + self.cost_dim, stride=4, context_num=2, pretrained=False)
+        self.cnet_depth = ResNetEncoder_orig(out_chs=self.hidden_dim + self.cost_dim, stride=4, context_num=2, pretrained=False)
         
         #self.upsample_1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         
@@ -1135,8 +1350,8 @@ class midasConsNet(nn.Module):
         int_depth_pre = context_depth_input[:,0:1, :,:] #shape: [1,1,288,384]
         sparse_scales_pre = context_depth_input[:, 1:2, :, :] # Shape: [1, 1, 288, 384]
         valid_mask_pre = context_depth_input[:, 2:3, :, :] # Shape: [1, 1, 288, 384]
-        tgt_normals_pre = F.interpolate(tgt_normals.permute(0, 3, 1, 2), 
-                                        size=(288, 384), mode='bilinear', align_corners=False) #1, 3, 288, 384
+        # tgt_normals_pre = F.interpolate(tgt_normals.permute(0, 3, 1, 2), 
+        #                                 size=(288, 384), mode='bilinear', align_corners=False) #1, 3, 288, 384
         int_interp_pre = context_depth_input[:,3:4,:,:]
 
         tgt_sparse_depth_inv_resized = F.interpolate(
@@ -1157,19 +1372,19 @@ class midasConsNet(nn.Module):
         #     int_interp_pre
         # )
         
-        propagated_depth_inv = self.depth_prop(tgt_input, tgt_sparse_depth_inv_resized)
-        refined_inv_depth = propagated_depth_inv
+        #propagated_depth_inv = self.depth_prop(tgt_input, tgt_sparse_depth_inv_resized)
+        #refined_inv_depth = propagated_depth_inv
         
-        #get scale scaffolding from the propagated_depth
-        coarse_scales = torch.ones_like(propagated_depth_inv)
-        valid_mask_prop = (propagated_depth_inv > 0)
-        coarse_scales = torch.where(valid_mask_prop, propagated_depth_inv / (int_depth_pre + 1e-6), coarse_scales)
-        coarse_scales = (coarse_scales - coarse_scales.min()) / (coarse_scales.max() - coarse_scales.min() + 1e-6)
-        #normalize corase_scales
+        ##get scale scaffolding from the propagated_depth
+        #coarse_scales = torch.ones_like(propagated_depth_inv)
+        #valid_mask_prop = (propagated_depth_inv > 0)
+        #coarse_scales = torch.where(valid_mask_prop, propagated_depth_inv / (int_depth_pre + 1e-6), coarse_scales)
+        #coarse_scales = (coarse_scales - coarse_scales.min()) / (coarse_scales.max() - coarse_scales.min() + 1e-6)
+        ##normalize corase_scales
         
         #coarse_scales[valid_mask] = propagated_depth_inv[valid_mask] / (tgt_ga_depth[valid_mask] + 1e-6)
         #coarse_scales = (coarse_scales - coarse_scales.min()) / (coarse_scales.max() - coarse_scales.min() + 1e-6)
-        scale_scaffolding = coarse_scales
+        #scale_scaffolding = coarse_scales
         
         # # Extract features using MidasNet #TODO: batch processing?
         # #tgt_feats = self.FeatExtractor(tgt_input) #[1, 32, 288, 384]
@@ -1212,22 +1427,22 @@ class midasConsNet(nn.Module):
         # Step 6: Predict delta scales and confidence
         #ga_depth_feat = self.cnet_depth_affinity(int_depth_pre)
         #ga_depth_feat = self.upsample_1(ga_depth_feat)
-        #context_test = torch.cat([ga_depth_feat, scale_scaffolding], dim=1)
-        
+        context_test = torch.cat([int_depth_pre, int_interp_pre], dim=1)
+        scale_scaffolding = int_interp_pre
         # context = torch.cat([int_depth_pre, scale_scaffolding], dim=1)
-        # context = self.cnet_depth(context)
-        # scale_map = self.scaleOutput(context)
-        # delta_scales = F.relu(1.0 + scale_map)  # Ensure scale is positive
-        # inv_depth_pred = init_metric_depth_inv * delta_scales
+        context = self.cnet_depth(context_test)
+        scale_map = self.scaleOutput(context)
+        delta_scales = F.relu(1.0 + scale_map)  # Ensure scale is positive
+        inv_depth_pred = init_metric_depth_inv * delta_scales
             
-        # if self.min_pred is not None and self.max_pred is not None:
-        #     inv_depth_pred = torch.clamp(
-        #         inv_depth_pred, 
-        #         min=1.0 / self.max_pred, 
-        #         max=1.0 / self.min_pred
-        #     )
+        if self.min_pred is not None and self.max_pred is not None:
+            inv_depth_pred = torch.clamp(
+                inv_depth_pred, 
+                min=1.0 / self.max_pred, 
+                max=1.0 / self.min_pred
+            )
             
-        #refined_inv_depth = inv_depth_pred #[b, 1, 288, 384]
+        refined_inv_depth = inv_depth_pred #[b, 1, 288, 384]
         
         depth_init_up = F.interpolate(
                 refined_inv_depth,

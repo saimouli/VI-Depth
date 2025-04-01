@@ -458,7 +458,7 @@ class midasNetConsistentModule(pl.LightningModule):
         #input_sparse_depth, input_image, rel_depth_pred, depth_gt, validity_map = batch
         tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, tgt_sparse_depth, ref_imgs, \
         ref_ga_depth, ref_interp, _, _, tgt_pose, ref_gt_pose, intrinsics, \
-            tgt_pose_perturbed, ref_pose_perturbed, tgt_depth_pred, tgt_normal = batch
+            tgt_pose_perturbed, ref_pose_perturbed, tgt_depth_pred = batch
         
         gt_depth = utils.inv2depth(tgt_gt_depth_inv)
         
@@ -499,7 +499,7 @@ class midasNetConsistentModule(pl.LightningModule):
                                                             tgt_pose, 
                                                             ref_rel_gtposes, 
                                                             intrinsics,
-                                                            tgt_normal,
+                                                            None,
                                                             tgt_depth_pred,
                                                             self.global_step)
             
