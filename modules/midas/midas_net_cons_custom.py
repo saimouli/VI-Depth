@@ -138,11 +138,122 @@ def weights_init(m):
 
 #         return x
 
+# class ResNetEncoder(models.ResNet):
+#     """Constructs a resnet model with varying number of input images.
+#     Adapted from https://github.com/pytorch/vision/blob/master/torchvision/models/resnet.py
+#     """
+#     def __init__(self, num_layers=18, num_input_images=1, pretrained=True, out_chs=32, stride=8, context_num=None):
+#         layers = {18: [2, 2, 2, 2], 50: [3, 4, 6, 3]}[num_layers]
+#         block = {18: models.resnet.BasicBlock, 50: models.resnet.Bottleneck}[num_layers]    
+#         self.upsample_mode = "bilinear"
+#         super(ResNetEncoder, self).__init__(block, layers)
+        
+#         self.inplanes = 64
+#         if context_num is not None:
+#             self.conv1 = nn.Conv2d(
+#                 context_num, 64, kernel_size=7, stride=2, padding=3, bias=False)
+#         else:
+#             self.conv1 = nn.Conv2d(
+#                 num_input_images * 3, 64, kernel_size=7, stride=2, padding=3, bias=False)
+#         self.bn1 = nn.BatchNorm2d(64)
+#         self.relu = nn.ReLU(inplace=True)
+#         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+#         self.layer1 = self._make_layer(block, 64, layers[0])
+#         self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
+#         self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
+        
+#         self.stride = stride
+#         if stride == 8:
+#             self.upconv1 = nn.Sequential(nn.Conv2d(256, 128, 3, 1, padding=1), nn.ReLU(inplace=True))
+#             self.upconv1_fusion = nn.Sequential(nn.Conv2d(256, 128, 3, 1, padding=1), nn.ReLU(inplace=True))
+#             self.out_conv = nn.Conv2d(128, out_chs, 3, 1, padding=1)
+                
+#         elif stride == 4:
+#             self.upconv1 = nn.Sequential(nn.Conv2d(256, 128, 3, 1, padding=1), nn.ReLU(inplace=True))
+#             self.upconv1_fusion = nn.Sequential(nn.Conv2d(256, 128, 3, 1, padding=1), nn.ReLU(inplace=True))
+#             self.upconv2 = nn.Sequential(nn.Conv2d(128, 64, 3, 1, padding=1), nn.ReLU(inplace=True))
+#             self.upconv2_fusion = nn.Sequential(nn.Conv2d(128, 64, 3, 1, padding=1), nn.ReLU(inplace=True))
+#             self.out_conv = nn.Conv2d(64, out_chs, 3, 1, padding=1)
+            
+#         else:
+#             raise NotImplementedError 
+
+#         # self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
+#         # del self.layer3
+#         del self.layer4
+#         del self.fc
+#         del self.avgpool
+
+#         for m in self.modules():
+#             if isinstance(m, nn.Conv2d):
+#                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+#             elif isinstance(m, nn.BatchNorm2d):
+#                 nn.init.constant_(m.weight, 1)
+#                 nn.init.constant_(m.bias, 0)
+        
+#         if pretrained:
+#             loaded = model_zoo.load_url(models.resnet.model_urls['resnet{}'.format(num_layers)])
+#             loaded['conv1.weight'] = torch.cat([loaded['conv1.weight']] * num_input_images, 1) / num_input_images
+#             loaded_flilter = {k:v for k, v in loaded.items() if "layer4" not in k and "fc" not in k}
+#             try:
+#                 print("load pretrained model from:", models.resnet.model_urls['resnet{}'.format(num_layers)])
+#                 self.load_state_dict(loaded_flilter)
+#             except Exception as e:
+#                 # print(e)
+#                 self.load_state_dict(loaded_flilter, strict=False)
+        
+#     def forward(self, x):
+#         feats = {}
+#         # if input is list, combine batch dimension
+#         is_list = isinstance(x, tuple) or isinstance(x, list)
+#         if is_list:
+#             num = len(x)
+#             batch_dim = x[0].shape[0]
+#             x = torch.cat(x, dim=0)
+
+#         x = self.conv1(x)
+#         x = self.bn1(x)
+#         x = self.relu(x)
+#         x = self.maxpool(x)
+
+#         x = self.layer1(x)
+#         self.layer1_features = x # Store layer1 features
+#         feats["s4"] = x
+        
+#         x = self.layer2(x)
+#         self.layer2_features = x  # Store layer2 features
+#         feats["s8"] = x
+        
+#         x = self.layer3(x)
+#         self.layer3_features = x  # Store layer3 features
+        
+#         if self.stride == 8:
+#             x = F.interpolate(x, scale_factor=2, mode=self.upsample_mode)
+#             x = self.upconv1(x)
+#             x = self.upconv1_fusion(torch.cat([x, feats["s8"]], dim=1))
+#             x = self.out_conv(x)
+            
+#         elif self.stride == 4:
+#             x = F.interpolate(x, scale_factor=2, mode=self.upsample_mode)
+#             x = self.upconv1(x)
+#             x = self.upconv1_fusion(torch.cat([x, feats["s8"]], dim=1)) 
+            
+#             x = F.interpolate(x, scale_factor=2, mode=self.upsample_mode)
+#             x = self.upconv2(x)
+#             x = self.upconv2_fusion(torch.cat([x, feats["s4"]], dim=1))
+            
+#             x = self.out_conv(x)
+        
+#         if is_list:
+#             x = torch.split(x, [batch_dim] * num, dim=0)
+
+#         return x
+
 class ResNetEncoder(models.ResNet):
-    """Constructs a resnet model with varying number of input images.
+    """Constructs a resnet model with multiscale outputs (1/2, 1/4, 1/8).
     Adapted from https://github.com/pytorch/vision/blob/master/torchvision/models/resnet.py
     """
-    def __init__(self, num_layers=18, num_input_images=1, pretrained=True, out_chs=32, stride=8, context_num=None):
+    def __init__(self, num_layers=18, num_input_images=1, pretrained=True, out_chs=32, context_num=None):
         layers = {18: [2, 2, 2, 2], 50: [3, 4, 6, 3]}[num_layers]
         block = {18: models.resnet.BasicBlock, 50: models.resnet.Bottleneck}[num_layers]    
         self.upsample_mode = "bilinear"
@@ -162,28 +273,35 @@ class ResNetEncoder(models.ResNet):
         self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
         self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
         
-        self.stride = stride
-        if stride == 8:
-            self.upconv1 = nn.Sequential(nn.Conv2d(256, 128, 3, 1, padding=1), nn.ReLU(inplace=True))
-            self.upconv1_fusion = nn.Sequential(nn.Conv2d(256, 128, 3, 1, padding=1), nn.ReLU(inplace=True))
-            self.out_conv = nn.Conv2d(128, out_chs, 3, 1, padding=1)
-                
-        elif stride == 4:
-            self.upconv1 = nn.Sequential(nn.Conv2d(256, 128, 3, 1, padding=1), nn.ReLU(inplace=True))
-            self.upconv1_fusion = nn.Sequential(nn.Conv2d(256, 128, 3, 1, padding=1), nn.ReLU(inplace=True))
-            self.upconv2 = nn.Sequential(nn.Conv2d(128, 64, 3, 1, padding=1), nn.ReLU(inplace=True))
-            self.upconv2_fusion = nn.Sequential(nn.Conv2d(128, 64, 3, 1, padding=1), nn.ReLU(inplace=True))
-            self.out_conv = nn.Conv2d(64, out_chs, 3, 1, padding=1)
-            
-        else:
-            raise NotImplementedError 
+        # Output convolutions for each scale
+        # 1/8 scale (after layer3)
+        self.out_conv_1_8 = nn.Conv2d(256, out_chs, 3, 1, padding=1)
+        
+        # 1/4 scale (after layer2)
+        self.out_conv_1_4 = nn.Conv2d(128, out_chs, 3, 1, padding=1)
+        
+        # 1/2 scale (after layer1)
+        self.out_conv_1_2 = nn.Conv2d(64, out_chs, 3, 1, padding=1)
+        
+        # Optional: If you want to process layer features before output
+        self.refine_1_4 = nn.Sequential(
+            nn.Conv2d(128, 128, 3, 1, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.refine_1_2 = nn.Sequential(
+            nn.Conv2d(64, 64, 3, 1, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
 
-        # self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
-        # del self.layer3
+        # Delete unused layers
         del self.layer4
         del self.fc
         del self.avgpool
 
+        # Initialize weights
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -191,19 +309,22 @@ class ResNetEncoder(models.ResNet):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
         
+        # Load pretrained weights if specified
         if pretrained:
             loaded = model_zoo.load_url(models.resnet.model_urls['resnet{}'.format(num_layers)])
             loaded['conv1.weight'] = torch.cat([loaded['conv1.weight']] * num_input_images, 1) / num_input_images
-            loaded_flilter = {k:v for k, v in loaded.items() if "layer4" not in k and "fc" not in k}
+            loaded_filter = {k:v for k, v in loaded.items() if "layer4" not in k and "fc" not in k}
             try:
                 print("load pretrained model from:", models.resnet.model_urls['resnet{}'.format(num_layers)])
-                self.load_state_dict(loaded_flilter)
+                self.load_state_dict(loaded_filter)
             except Exception as e:
                 # print(e)
-                self.load_state_dict(loaded_flilter, strict=False)
+                self.load_state_dict(loaded_filter, strict=False)
         
     def forward(self, x):
-        feats = {}
+        # Create dictionary to store multiscale outputs
+        multiscale_features = {}
+        
         # if input is list, combine batch dimension
         is_list = isinstance(x, tuple) or isinstance(x, list)
         if is_list:
@@ -211,43 +332,47 @@ class ResNetEncoder(models.ResNet):
             batch_dim = x[0].shape[0]
             x = torch.cat(x, dim=0)
 
+        # Initial conv and pooling (1/4 scale)
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
+        
+        # Store features at 1/2 scale (before maxpool)
+        features_1_2_pre = x
+        
         x = self.maxpool(x)
 
+        # Layer 1 (1/4 scale)
         x = self.layer1(x)
-        self.layer1_features = x # Store layer1 features
-        feats["s4"] = x
+        features_1_4 = x
         
+        # Layer 2 (1/8 scale)
         x = self.layer2(x)
-        self.layer2_features = x  # Store layer2 features
-        feats["s8"] = x
+        features_1_8_pre = x
         
+        # Layer 3 (1/16 scale)
         x = self.layer3(x)
-        self.layer3_features = x  # Store layer3 features
         
-        if self.stride == 8:
-            x = F.interpolate(x, scale_factor=2, mode=self.upsample_mode)
-            x = self.upconv1(x)
-            x = self.upconv1_fusion(torch.cat([x, feats["s8"]], dim=1))
-            x = self.out_conv(x)
-            
-        elif self.stride == 4:
-            x = F.interpolate(x, scale_factor=2, mode=self.upsample_mode)
-            x = self.upconv1(x)
-            x = self.upconv1_fusion(torch.cat([x, feats["s8"]], dim=1)) 
-            
-            x = F.interpolate(x, scale_factor=2, mode=self.upsample_mode)
-            x = self.upconv2(x)
-            x = self.upconv2_fusion(torch.cat([x, feats["s4"]], dim=1))
-            
-            x = self.out_conv(x)
+        # Process and store 1/8 scale features
+        features_1_8 = self.out_conv_1_8(x)
         
+        # Process and store 1/4 scale features
+        features_1_4 = self.refine_1_4(features_1_8_pre)
+        features_1_4 = self.out_conv_1_4(features_1_4)
+        
+        # Process and store 1/2 scale features
+        features_1_2 = self.refine_1_2(features_1_2_pre)
+        features_1_2 = self.out_conv_1_2(features_1_2)
+        
+        # Handle list input case
         if is_list:
-            x = torch.split(x, [batch_dim] * num, dim=0)
-
-        return x
+            features_1_8 = torch.split(features_1_8, [batch_dim] * num, dim=0)
+            features_1_4 = torch.split(features_1_4, [batch_dim] * num, dim=0)
+            features_1_2 = torch.split(features_1_2, [batch_dim] * num, dim=0)
+            return features_1_2, features_1_4, features_1_8
+        
+        # Return multiscale features
+        return features_1_2, features_1_4, features_1_8
     
 #Extract features from the backbone network
 class MidasNet_small_cons_videpth(BaseModel):
