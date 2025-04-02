@@ -438,69 +438,72 @@ class midasNetConsistentModule(pl.LightningModule):
         
         final_pred = refined_depths[0]
         l1_loss = torch.abs(final_pred - gt_depth) * valid_mask
-        losses['final_l1'] = l1_loss.sum() / (valid_mask.sum() + 1e-8)
+        losses['final'] = l1_loss.sum() / (valid_mask.sum() + 1e-8)
         
-        prop_loss = 0
-        for scale_name, pred in outputs['propagated_depths'].items():
+        fuse_loss_total = 0
+        for scale_idx, scale_name in enumerate(['s8', 's4', 's2', 's1']):
+            if scale_name not in outputs['propagated_depths']:
+                continue
+            
+            pred = outputs['propagated_depths'][scale_name]
+            
+            # Resize ground truth if needed
             if pred.shape != gt_depth.shape:
-                resized_gt = F.interpolate(
-                    gt_depth,
-                    size=pred.shape[-2:],
-                    mode='nearest'
-                )
-                resized_valid = F.interpolate(
-                    valid_mask,
-                    size=pred.shape[-2:],
-                    mode='nearest'
-                )
+                resized_gt = F.interpolate(gt_depth, size=pred.shape[2:], mode='nearest')
+                resized_valid = F.interpolate(valid_mask, size=pred.shape[2:], mode='nearest')
             else:
                 resized_gt = gt_depth
                 resized_valid = valid_mask
             
             l1_loss = torch.abs(pred - resized_gt) * resized_valid
             scale_loss = l1_loss.sum() / (resized_valid.sum() + 1e-8)
-            losses[f'prop_{scale_name}'] = scale_loss
-            prop_loss += scale_weights.get(scale_name, 0.25) * scale_loss
-
-        losses['prop_total'] = prop_loss
+            losses[f'fuse_{scale_name}'] = scale_loss
+            fuse_loss_total += scale_weights.get(scale_name, 0.25) * scale_loss
         
-        # Loss for initial depth predictions (partially scale-invariant)
-        init_loss = 0
-        for scale_name, pred in outputs['initial_depths'].items():
-            # Resize ground truth to match prediction
-            if pred.shape != gt_depth.shape:
-                resized_gt = F.interpolate(
-                    gt_depth,
-                    size=pred.shape[2:], 
-                    mode='nearest'
-                )
+        losses['fuse_total'] = fuse_loss_total
+        
+        # 3. Initial depth losses with scale invariance (L_initial)
+        initial_loss_total = 0
+        for scale_idx, scale_name in enumerate(['s8', 's4', 's2', 's1']):
+            if scale_name not in outputs['initial_depths']:
+                continue
                 
-                resized_valid = F.interpolate(
-                    valid_mask,
-                    size=pred.shape[2:], 
-                    mode='nearest'
-                )
+            pred = outputs['initial_depths'][scale_name]
+        
+            # Resize ground truth if needed
+            if pred.shape != gt_depth.shape:
+                resized_gt = F.interpolate(gt_depth, size=pred.shape[2:], mode='nearest')
+                resized_valid = F.interpolate(valid_mask, size=pred.shape[2:], mode='nearest')
             else:
                 resized_gt = gt_depth
                 resized_valid = valid_mask
-            
+                
+            # Apply partial scale-invariant loss as mentioned in the paper
             pred_masked = pred * resized_valid
             gt_masked = resized_gt * resized_valid
             
+            # Get mean values over valid regions
             valid_pixels = resized_valid.sum() + 1e-8
-            scale = (gt_masked.sum() / valid_pixels) / (pred_masked.sum() / valid_pixels + 1e-8)
+            pred_mean = pred_masked.sum() / valid_pixels
+            gt_mean = gt_masked.sum() / valid_pixels
             
+            # Compute scale factor
+            scale = gt_mean / (pred_mean + 1e-8)
+            # Apply scale to prediction
             scaled_pred = pred * scale
-            l1_loss = torch.abs(scaled_pred - resized_gt) * resized_valid
-            scale_loss = l1_loss.sum() / valid_pixels
             
-            losses[f'init_{scale_name}'] = scale_loss
-            init_loss += scale_weights.get(scale_name, 0.25) * scale_loss
-        losses['init_total'] = init_loss
+            # Compute loss with scaled prediction
+            si_loss = torch.abs(scaled_pred - resized_gt) * resized_valid
+            si_loss_sum = si_loss.sum() / valid_pixels
+            
+            losses[f'initial_{scale_name}'] = si_loss_sum
+            initial_loss_total += scale_weights.get(scale_name, 0.25) * si_loss_sum
         
-        # Total loss
-        losses['total'] = losses['final_l1'] + 0.7 * prop_loss + 0.5 * init_loss
+        losses['initial_total'] = initial_loss_total
         
+        
+        losses['total'] = losses['final'] + fuse_loss_total + 0.5 * initial_loss_total
+            
         return losses
 
     def get_ref_coords(self, pose, K, depth, scale_factor, device):

@@ -276,11 +276,11 @@ class MultiScaleAffinityPropagation(nn.Module):
             ) for _ in scales
         ])
         
-        # Affinity modules for each level
-        self.affinity_modules = nn.ModuleList([
-            AffinityPropagation(feature_dim=feature_dim, chunk_size=1024 * (2**i))
-            for i, _ in enumerate(scales)
-        ])
+        # # Affinity modules for each level
+        # self.affinity_modules = nn.ModuleList([
+        #     AffinityPropagation(feature_dim=feature_dim, chunk_size=1024 * (2**i))
+        #     for i, _ in enumerate(scales)
+        # ])
         
         # Shift correction modules
         self.shift_correction_modules = nn.ModuleList([
@@ -299,9 +299,13 @@ class MultiScaleAffinityPropagation(nn.Module):
             for scale in scales
         ])
         
-        # Decoders for additional feature processing
         self.decoders = nn.ModuleList([
-            self._make_decoder_level(feature_dim) for _ in scales
+            nn.Sequential(
+                nn.Conv2d(feature_dim, feature_dim, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(feature_dim, feature_dim, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True)
+            ) for _ in scales
         ])
         
         # Final refinement layer
@@ -339,10 +343,6 @@ class MultiScaleAffinityPropagation(nn.Module):
             # Fuse previous scale features if available
             if current_features is not None and current_depth is not None:
                 # Upsample previous features and depth
-                upsampled_features = F.interpolate(current_features, 
-                                                   size=features.shape[2:], 
-                                                    mode='bilinear',
-                                                    align_corners=False)
                 upsampled_depth = F.interpolate(current_depth,
                                                 size=features.shape[2:], 
                                                 mode='bilinear',
@@ -368,21 +368,17 @@ class MultiScaleAffinityPropagation(nn.Module):
                 outputs['propagated_depths'][scale_name] = utils.inv2depth(initial_depth)
                 continue
             
-            # Compute affinity map
-            h, w = decoded_features.shape[2:]
-            affinity_map = self.affinity_modules[scale_idx](
-                decoded_features, sparse_points[0], sparse_points[1], full_res=(h, w)
-            )
-            
-            # Apply shift correction
-            corrected_depth = self.shift_correction_modules[scale_idx](
-                decoded_features, initial_depth, sparse_points, 
-                affinity_map, full_res=(h, w)
+            corrected_depth, point_features = self.shift_correction_modules[scale_idx](
+                decoded_features, initial_depth, sparse_points
             )
             
             outputs['propagated_depths'][scale_name] = utils.inv2depth(corrected_depth)
             
-            current_features = decoded_features
+            if point_features is not None:
+                current_features = decoded_features + point_features
+            else:
+                current_features = decoded_features
+            
             current_depth = corrected_depth
         
         return current_depth, outputs
@@ -401,19 +397,24 @@ class MultiScaleAffinityPropagation(nn.Module):
             sparse_depth_values.append(depths)
         
         return sparse_points_idx, sparse_depth_values
-
-    def _make_decoder_level(self, feature_dim):
-        """Create a decoder for a specific scale"""
-        return nn.Sequential(
-            nn.Conv2d(feature_dim, feature_dim, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(feature_dim, feature_dim, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True)
-        )
     
 class ShiftCorrectionModule(nn.Module):
     def __init__(self, feature_dim):
         super().__init__()
+
+        # Transformer for depth point features
+        self.transformer = nn.TransformerEncoderLayer(
+            d_model=feature_dim + 1,  # +1 for depth value
+            nhead=3,
+            dim_feedforward=256,
+            batch_first=True
+        )
+        # Projections for cross-attention
+        self.query_proj = nn.Conv2d(feature_dim, feature_dim, kernel_size=1)
+        self.key_proj = nn.Linear(feature_dim + 1, feature_dim)
+        
+        # Point feature processing
+        self.point_feature_proj = nn.Linear(feature_dim + 1, feature_dim)
         
         self.confidence = nn.Sequential(
             nn.Conv2d(feature_dim + 2 + 1, 64, kernel_size=3, padding=1),  # +2 for initial and shifted depths, +1 for dist field
@@ -421,8 +422,9 @@ class ShiftCorrectionModule(nn.Module):
             nn.Conv2d(64, 1, kernel_size=1),
             nn.Sigmoid()
         )
+        self.scale = math.sqrt(feature_dim)
         
-    def forward(self, features, initial_depth, sparse_points, affinity_map, full_res=None):
+    def forward(self, features, initial_depth, sparse_points, full_res=None):
         B, C, H, W = features.shape
         device = features.device
         
@@ -430,190 +432,143 @@ class ShiftCorrectionModule(nn.Module):
         N_max = max([len(points) for points in sparse_points_idx] or [0])
         
         if N_max == 0:
-            return initial_depth
+            return initial_depth, None
         
-        # Create tensor of depth values at sparse points
-        depth_at_points = torch.zeros(B, N_max, 1, device=device)
-        for b in range(B):
-            if len(sparse_depth_values[b]) > 0:
-                depth_at_points[b, :len(sparse_depth_values[b]), 0] = sparse_depth_values[b]
-        
-        # Get propagated depth through affinity matrix
-        propagated_depth = torch.bmm(affinity_map, depth_at_points).view(B, 1, H, W)
-        
-        # Sample propagated depth at sparse point locations to compute errors
-        errors_at_points = torch.zeros(B, N_max, 1, device=device)
-        for b in range(B):
-            points = sparse_points_idx[b]
-            for i, (y, x) in enumerate(points):
-                if 0 <= y < H and 0 <= x < W:  # Check bounds
-                    errors_at_points[b, i, 0] = sparse_depth_values[b][i] - propagated_depth[b, 0, y, x]
-
-        # Apply error correction through affinity
-        shift_correction = torch.bmm(affinity_map, errors_at_points).view(B, 1, H, W)
-        shift_corrected_depth = propagated_depth + shift_correction
-        
-        distance_fields = torch.zeros(B, 1, H, W, device=device)
-        for b in range(B):
-            if sparse_points_idx[b]:
-                distance_fields[b, 0] = self._compute_distance_field(sparse_points_idx[b], H, W, device)
-        
-        # Predict confidence for blending
-        confidence_input = torch.cat([
-            features,
-            initial_depth,
-            shift_corrected_depth,
-            distance_fields
-        ], dim=1)
-        
-        blend_weight = self.confidence(confidence_input)
-        # Blend between shift-corrected and initial depth
-        final_depth = blend_weight * shift_corrected_depth + (1 - blend_weight) * initial_depth
-        
-        return final_depth
-    
-    def _compute_distance_field(self, points, H, W, device):
-        """
-        Compute distance field from sparse points
-        
-        Args:
-            points: List of (y, x) coordinates
-            H, W: Height and width of output field
-            device: Device for computation
-            
-        Returns:
-            distance_field: Tensor of distances [H, W]
-        """
-        if not points:
-            return torch.ones(H, W, device=device) * float('inf')
-            
-        y_grid, x_grid = torch.meshgrid(
-            torch.arange(H, device=device),
-            torch.arange(W, device=device),
-            indexing='ij'
-        )
-        
-        distance_field = torch.ones(H, W, device=device) * float('inf')
-        
-        for y, x in points:
-            if 0 <= y < H and 0 <= x < W:  # Check bounds
-                dist = torch.sqrt((y_grid - y).float()**2 + (x_grid - x).float()**2)
-                distance_field = torch.minimum(distance_field, dist)
-        
-        # Normalize distance field
-        distance_field = torch.clamp(distance_field / (math.sqrt(H*H + W*W) * 0.1), 0.0, 1.0)
-        
-        return distance_field
-    
-#propagate scale based on normals
-class AffinityPropagation(nn.Module):
-    def __init__(self, feature_dim, hidden_dim=64, chunk_size=1024):
-        super().__init__()
-        self.chunk_size = chunk_size
-        self.scale = math.sqrt(feature_dim)
-        
-        # Transformer layer for sparse point features
-        #self.transformer_layer = nn.MultiheadAttention(embed_dim=feature_dim, num_heads=4)
-        # Projection for feature-based affinity
-        self.query_proj = nn.Conv2d(feature_dim, feature_dim, kernel_size=1)
-        self.key_proj = nn.Linear(feature_dim + 1, feature_dim) #for sparse features
-        
-        # For creating point features from image features and depth
-        self.transformer_encoder = nn.TransformerEncoderLayer(
-            d_model=feature_dim + 1,  # +1 for depth value
-            nhead=3,
-            dim_feedforward=256,
-            batch_first=True
-        )
-        
-        self.softmax = nn.Softmax(dim=-1)
-        
-    def forward(self, features, sparse_points_idx, sparse_depth_values, full_res=(288, 384)):
-        """
-        Args:
-            features: Feature map from decoder stage [B, C, H, W]
-            sparse_points_idx: List of lists of (y, x) coordinates of sparse points [B]
-            sparse_scales: List of tensors of sparse scale values [B]
-            relative_normals: Relative normals from MiDaS [B, 3, H, W]
-            full_res: Tuple (H_full, W_full) indicating the full resolution of sparse points and normals
-        
-        Returns:
-            affinity_map: Affinity weights [B, H*W, N_max]
-        """
-        B, C, H, W = features.shape
-        device = features.device
-        # Handle case with no valid points
-        N_max = max([len(points) for points in sparse_points_idx] or [0])
-        if N_max == 0:
-            return torch.zeros(B, H * W, 1, device=device)
-        
-        #positional embeddings
+        # Add positional embeddings to features
         pos_embeddings = self._get_positional_embeddings(H, W, C, device)
         features_with_pos = features + pos_embeddings
         
-        # Sample features at sparse point locations and create point features
+        # Sample features and depths at sparse point locations
         sparse_features = []
         valid_mask = torch.zeros(B, N_max, device=device, dtype=torch.bool)
+        initial_depth_at_points = torch.zeros(B, N_max, device=device)
         
         for b in range(B):
             points = sparse_points_idx[b]
             depths = sparse_depth_values[b]
             
             if len(points) == 0:
-                # No points for this batch
                 sparse_features.append(torch.zeros(N_max, C + 1, device=device))
                 continue
             
-            #Get features at point locations
+            # Get features at point locations
             point_features = torch.zeros(len(points), C, device=device)
             for i, (y, x) in enumerate(points):
                 if 0 <= y < H and 0 <= x < W:
                     point_features[i] = features_with_pos[b, :, y, x]
+                    initial_depth_at_points[b, i] = initial_depth[b, 0, y, x]
             
-            # Combine with depth values
+            #combine with depth values
             point_features_with_depth = torch.cat([
                 point_features,
                 depths.view(-1,1)
-            ], dim=-1)  # [N, C + 1]
+            ], dim=-1)
             
-            # Create valid mask
             valid_mask[b, :len(points)] = True
             
             #pad if necessary
             if len(points) < N_max:
                 padding = torch.zeros(N_max - len(points), C + 1, device=device)
                 point_features_with_depth = torch.cat([point_features_with_depth, padding], dim=0)
-            
+                
             sparse_features.append(point_features_with_depth)
         
         sparse_features = torch.stack(sparse_features, dim=0)
         
-        #Apply transformer to point features
+        # Process point features with transformer
         key_padding_mask = ~valid_mask
-        sparse_features_transformed = self.transformer_encoder(sparse_features, src_key_padding_mask=key_padding_mask)
+        sparse_features_transformed = self.transformer(
+            sparse_features,
+            src_key_padding_mask=key_padding_mask
+        )
         
-        #Compute affinities
-        q_features = self.query_proj(features).view(B, -1, H * W).permute(0, 2, 1)
+        # Compute cross-attention between image and point features
+        q_features = self.query_proj(features).view(B, C, H * W).permute(0, 2, 1)  # [B, H*W, C]
         k_features = self.key_proj(sparse_features_transformed)  # [B, N_max, C]
         
-        # Compute affinities in chunks to save memory
-        affinity_map = torch.zeros(B, H * W, N_max, device=device)
+        # Compute attention affinity
+        affinity = torch.bmm(q_features, k_features.transpose(1, 2)) / self.scale
         
-        for i in range(0, H * W, self.chunk_size):
-            end = min(i + self.chunk_size, H * W)
-            q_chunk = q_features[:, i:end, :]
+        #Mask invalid points and apply softmax
+        affinity.masked_fill_(~valid_mask.unsqueeze(1), -1e9)
+        affinity = F.softmax(affinity, dim=-1)  # [B, H*W, N_max]
+        
+        # Get input depths at sparse point locations
+        input_depths = torch.zeros(B, N_max, 1, device=device)
+        for b in range(B):
+            if len(sparse_depth_values[b]) > 0:
+                input_depths[b, :len(sparse_depth_values[b]), 0] = sparse_depth_values[b]
+        
+        # Calculate depth errors at sparse point locations
+        # (d_j - D_initial_j)
+        # D_shift_i = sum_j A_ij(D_initial_i - D_initial_j) + sum_j A_ij d_j
+        # First term: Compute the relative depth structure
+        initial_depth_flat = initial_depth.view(B, 1, H*W).permute(0, 2, 1)  # [B, H*W, 1]
+        
+        # For each pixel, we need its depth difference with respect to each sparse point
+        initial_depth_at_points = initial_depth_at_points.unsqueeze(-1)  # [B, N_max, 1]
+        # Compute relative depth: D_initial_i - D_initial_j
+        relative_depth = initial_depth_flat - initial_depth_at_points.transpose(1, 2) 
+        
+        # This computes sum_j A_ij(D_initial_i - D_initial_j)
+        weighted_relative_depth = (affinity * relative_depth).sum(dim=2, keepdim=True) 
+        weighted_input_depth = torch.bmm(affinity, input_depths)  # [B, H*W, 1]
+        shift_corrected_depth = (weighted_relative_depth + weighted_input_depth).view(B, H, W, 1).permute(0, 3, 1, 2)
+        
+        # Generate distance field for confidence prediction
+        distance_field = self._compute_distance_field(B, H, W, sparse_points_idx, device)
+        
+        # Create feature map from point features for fusion in the decoder
+        point_features_proj = self.point_feature_proj(sparse_features_transformed)
+        point_feature_map = torch.bmm(affinity, point_features_proj).view(B, H, W, C).permute(0, 3, 1, 2)
+        
+        # Predict confidence for blending initial and corrected depths
+        confidence_input = torch.cat([
+            features,
+            initial_depth,
+            shift_corrected_depth,
+            distance_field
+        ], dim=1)
+        
+        blend_weight = self.confidence(confidence_input)
+        
+        # Blend between initial and shift-corrected depth
+        final_depth = blend_weight * shift_corrected_depth + (1 - blend_weight) * initial_depth
+        
+        return final_depth, point_feature_map
+    
+    def _compute_distance_field(self, B, H, W, sparse_points_idx, device):
+        """Compute normalized distance field from sparse points for each batch"""
+        distance_fields = torch.ones(B, 1, H, W, device=device)
+        
+        for b in range(B):
+            points = sparse_points_idx[b]
+            if not points:
+                distance_fields[b] = 1.0
+                continue
+                
+            y_grid, x_grid = torch.meshgrid(
+                torch.arange(H, device=device),
+                torch.arange(W, device=device),
+                indexing='ij'
+            )
             
-            # Compute dot product similarity
-            chunk_affinities = torch.bmm(q_chunk, k_features.transpose(1, 2))
-            chunk_affinities = chunk_affinities / self.scale
+            field = torch.ones(H, W, device=device) * float('inf')
             
-            chunk_affinities.masked_fill_(~valid_mask.unsqueeze(1), -1e9)
-            affinity_map[:, i:end, :] = self.softmax(chunk_affinities)
+            for y, x in points:
+                if 0 <= y < H and 0 <= x < W:
+                    dist = torch.sqrt((y_grid - y).float()**2 + (x_grid - x).float()**2)
+                    field = torch.minimum(field, dist)
             
-        return affinity_map
-
+            # Normalize distance field
+            max_possible_dist = math.sqrt(H*H + W*W)
+            field = torch.clamp(field / (max_possible_dist * 0.1), 0.0, 1.0)
+            distance_fields[b, 0] = field
+            
+        return distance_fields
+    
     def _get_positional_embeddings(self, H, W, C, device):
-        # Create position encodings
+        """Create sinusoidal positional embeddings"""
         y_grid, x_grid = torch.meshgrid(
             torch.linspace(-1, 1, H, device=device),
             torch.linspace(-1, 1, W, device=device),
@@ -632,10 +587,142 @@ class AffinityPropagation(nn.Module):
         pos_embed[:, dim_t:2*dim_t:2] = torch.sin(pos_x[:, ::2] * div_term.view(1, -1, 1, 1))
         pos_embed[:, dim_t+1:2*dim_t:2] = torch.cos(pos_x[:, 1::2] * div_term.view(1, -1, 1, 1))
         
-        if C > 2*dim_t:
-            pos_embed[:, 2*dim_t:] = pos_embed[:, :C-2*dim_t]
-            
         return pos_embed
+    
+#propagate scale based on normals
+# class AffinityPropagation(nn.Module):
+#     def __init__(self, feature_dim, hidden_dim=64, chunk_size=1024):
+#         super().__init__()
+#         self.chunk_size = chunk_size
+#         self.scale = math.sqrt(feature_dim)
+        
+#         # Transformer layer for sparse point features
+#         #self.transformer_layer = nn.MultiheadAttention(embed_dim=feature_dim, num_heads=4)
+#         # Projection for feature-based affinity
+#         self.query_proj = nn.Conv2d(feature_dim, feature_dim, kernel_size=1)
+#         self.key_proj = nn.Linear(feature_dim + 1, feature_dim) #for sparse features
+        
+#         # Point feature processing
+#         self.point_feature_proj = nn.Linear(feature_dim + 1, feature_dim)
+        
+#         # For creating point features from image features and depth
+#         self.transformer_encoder = nn.TransformerEncoderLayer(
+#             d_model=feature_dim + 1,  # +1 for depth value
+#             nhead=3,
+#             dim_feedforward=256,
+#             batch_first=True
+#         )
+        
+#         self.softmax = nn.Softmax(dim=-1)
+        
+#     def forward(self, features, sparse_points_idx, sparse_depth_values, full_res=(288, 384)):
+#         """
+#         Args:
+#             features: Feature map from decoder stage [B, C, H, W]
+#             sparse_points_idx: List of lists of (y, x) coordinates of sparse points [B]
+#             sparse_scales: List of tensors of sparse scale values [B]
+#             relative_normals: Relative normals from MiDaS [B, 3, H, W]
+#             full_res: Tuple (H_full, W_full) indicating the full resolution of sparse points and normals
+        
+#         Returns:
+#             affinity_map: Affinity weights [B, H*W, N_max]
+#         """
+#         B, C, H, W = features.shape
+#         device = features.device
+#         # Handle case with no valid points
+#         N_max = max([len(points) for points in sparse_points_idx] or [0])
+#         if N_max == 0:
+#             return torch.zeros(B, H * W, 1, device=device)
+        
+#         #positional embeddings
+#         pos_embeddings = self._get_positional_embeddings(H, W, C, device)
+#         features_with_pos = features + pos_embeddings
+        
+#         # Sample features at sparse point locations and create point features
+#         sparse_features = []
+#         valid_mask = torch.zeros(B, N_max, device=device, dtype=torch.bool)
+        
+#         for b in range(B):
+#             points = sparse_points_idx[b]
+#             depths = sparse_depth_values[b]
+            
+#             if len(points) == 0:
+#                 # No points for this batch
+#                 sparse_features.append(torch.zeros(N_max, C + 1, device=device))
+#                 continue
+            
+#             #Get features at point locations
+#             point_features = torch.zeros(len(points), C, device=device)
+#             for i, (y, x) in enumerate(points):
+#                 if 0 <= y < H and 0 <= x < W:
+#                     point_features[i] = features_with_pos[b, :, y, x]
+            
+#             # Combine with depth values
+#             point_features_with_depth = torch.cat([
+#                 point_features,
+#                 depths.view(-1,1)
+#             ], dim=-1)  # [N, C + 1]
+            
+#             # Create valid mask
+#             valid_mask[b, :len(points)] = True
+            
+#             #pad if necessary
+#             if len(points) < N_max:
+#                 padding = torch.zeros(N_max - len(points), C + 1, device=device)
+#                 point_features_with_depth = torch.cat([point_features_with_depth, padding], dim=0)
+            
+#             sparse_features.append(point_features_with_depth)
+        
+#         sparse_features = torch.stack(sparse_features, dim=0)
+        
+#         #Apply transformer to point features
+#         key_padding_mask = ~valid_mask
+#         sparse_features_transformed = self.transformer_encoder(sparse_features, src_key_padding_mask=key_padding_mask)
+        
+#         #Compute affinities
+#         q_features = self.query_proj(features).view(B, -1, H * W).permute(0, 2, 1)
+#         k_features = self.key_proj(sparse_features_transformed)  # [B, N_max, C]
+        
+#         # Compute affinities in chunks to save memory
+#         affinity_map = torch.zeros(B, H * W, N_max, device=device)
+        
+#         for i in range(0, H * W, self.chunk_size):
+#             end = min(i + self.chunk_size, H * W)
+#             q_chunk = q_features[:, i:end, :]
+            
+#             # Compute dot product similarity
+#             chunk_affinities = torch.bmm(q_chunk, k_features.transpose(1, 2))
+#             chunk_affinities = chunk_affinities / self.scale
+            
+#             chunk_affinities.masked_fill_(~valid_mask.unsqueeze(1), -1e9)
+#             affinity_map[:, i:end, :] = self.softmax(chunk_affinities)
+            
+#         return affinity_map
+
+#     def _get_positional_embeddings(self, H, W, C, device):
+#         # Create position encodings
+#         y_grid, x_grid = torch.meshgrid(
+#             torch.linspace(-1, 1, H, device=device),
+#             torch.linspace(-1, 1, W, device=device),
+#             indexing='ij'
+#         )
+        
+#         dim_t = C // 4
+#         pos_embed = torch.zeros(1, C, H, W, device=device)
+#         div_term = torch.exp(torch.arange(0, dim_t, 2, device=device) * (-math.log(10000.0) / dim_t))
+        
+#         pos_y = y_grid.unsqueeze(0).unsqueeze(1).expand(1, dim_t, H, W)
+#         pos_embed[:, 0:dim_t:2] = torch.sin(pos_y[:, ::2] * div_term.view(1, -1, 1, 1))
+#         pos_embed[:, 1:dim_t:2] = torch.cos(pos_y[:, 1::2] * div_term.view(1, -1, 1, 1))
+        
+#         pos_x = x_grid.unsqueeze(0).unsqueeze(1).expand(1, dim_t, H, W)
+#         pos_embed[:, dim_t:2*dim_t:2] = torch.sin(pos_x[:, ::2] * div_term.view(1, -1, 1, 1))
+#         pos_embed[:, dim_t+1:2*dim_t:2] = torch.cos(pos_x[:, 1::2] * div_term.view(1, -1, 1, 1))
+        
+#         if C > 2*dim_t:
+#             pos_embed[:, 2*dim_t:] = pos_embed[:, :C-2*dim_t]
+            
+#         return pos_embed
     
 class Conv3x3(nn.Module):
     """Layer to pad and convolve input
