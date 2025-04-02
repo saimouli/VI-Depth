@@ -392,6 +392,7 @@ class midasNetConsistentModule(pl.LightningModule):
         gamma = 0.85
         min_disp = self.min_depth
         max_disp = self.max_depth
+        
         for i in range(num_scales):
             w = gamma**(num_scales - i - 1)
             total_w += w
@@ -405,7 +406,103 @@ class midasNetConsistentModule(pl.LightningModule):
         
         return total_loss / total_w
     
-    
+    def calculate_multiscale_depth_loss(self, refined_depths, outputs, gt_depth):
+        """
+        Calculate the supervised loss for depth completion
+        
+        Parameters
+        ----------
+        outputs : dict
+            Dictionary containing model outputs:
+            - 'final': final inverse depth prediction
+            - 'initial_depths': dict of initial inverse depth predictions at each scale
+            - 'propagated_depths': dict of propagated inverse depth predictions at each scale
+        gt_depth_inv : torch.Tensor [B,1,H,W]
+            Ground-truth inverse depth map
+        
+        Returns
+        -------
+        loss_dict : dict
+            Dictionary containing losses
+        """
+        # Main depth supervision for final output
+        losses = {}
+        valid_mask = (gt_depth > 0).float()
+        
+        scale_weights = {
+            's8': 0.2,  # Weight for 1/8 scale
+            's4': 0.3,  # Weight for 1/4 scale
+            's2': 0.5,   # Weight for 1/2 scale
+            's1': 1.0
+        }
+        
+        final_pred = refined_depths[0]
+        l1_loss = torch.abs(final_pred - gt_depth) * valid_mask
+        losses['final_l1'] = l1_loss.sum() / (valid_mask.sum() + 1e-8)
+        
+        prop_loss = 0
+        for scale_name, pred in outputs['propagated_depths'].items():
+            if pred.shape != gt_depth.shape:
+                resized_gt = F.interpolate(
+                    gt_depth,
+                    size=pred.shape[-2:],
+                    mode='nearest'
+                )
+                resized_valid = F.interpolate(
+                    valid_mask,
+                    size=pred.shape[-2:],
+                    mode='nearest'
+                )
+            else:
+                resized_gt = gt_depth
+                resized_valid = valid_mask
+            
+            l1_loss = torch.abs(pred - resized_gt) * resized_valid
+            scale_loss = l1_loss.sum() / (resized_valid.sum() + 1e-8)
+            losses[f'prop_{scale_name}'] = scale_loss
+            prop_loss += scale_weights.get(scale_name, 0.25) * scale_loss
+
+        losses['prop_total'] = prop_loss
+        
+        # Loss for initial depth predictions (partially scale-invariant)
+        init_loss = 0
+        for scale_name, pred in outputs['initial_depths'].items():
+            # Resize ground truth to match prediction
+            if pred.shape != gt_depth.shape:
+                resized_gt = F.interpolate(
+                    gt_depth,
+                    size=pred.shape[2:], 
+                    mode='nearest'
+                )
+                
+                resized_valid = F.interpolate(
+                    valid_mask,
+                    size=pred.shape[2:], 
+                    mode='nearest'
+                )
+            else:
+                resized_gt = gt_depth
+                resized_valid = valid_mask
+            
+            pred_masked = pred * resized_valid
+            gt_masked = resized_gt * resized_valid
+            
+            valid_pixels = resized_valid.sum() + 1e-8
+            scale = (gt_masked.sum() / valid_pixels) / (pred_masked.sum() / valid_pixels + 1e-8)
+            
+            scaled_pred = pred * scale
+            l1_loss = torch.abs(scaled_pred - resized_gt) * resized_valid
+            scale_loss = l1_loss.sum() / valid_pixels
+            
+            losses[f'init_{scale_name}'] = scale_loss
+            init_loss += scale_weights.get(scale_name, 0.25) * scale_loss
+        losses['init_total'] = init_loss
+        
+        # Total loss
+        losses['total'] = losses['final_l1'] + 0.7 * prop_loss + 0.5 * init_loss
+        
+        return losses
+
     def get_ref_coords(self, pose, K, depth, scale_factor, device):
         if not isinstance(pose, Pose):
             pose = Pose(pose)
@@ -492,7 +589,7 @@ class midasNetConsistentModule(pl.LightningModule):
         #(b, n, iters, 6) 
         #if self.current_epoch < 60:
         self.model.iter_steps=0   
-        refined_depth_inv, refined_ref_poses, scale_scaffolding = self.model(tgt_img, ref_imgs,
+        refined_depth_inv, refined_ref_poses, outputs = self.model(tgt_img, ref_imgs,
                                                             tgt_ga_depth, ref_ga_depth, 
                                                             tgt_interp, tgt_sparse_depth,
                                                             ref_interp, 
@@ -526,8 +623,19 @@ class midasNetConsistentModule(pl.LightningModule):
         #                         log_variance=None,
         #                         mask=None)
         
-        depth_loss = self.calculate_grudepth_loss(utils.inv2depth(refined_depth_inv), 
-                                            utils.inv2depth(tgt_gt_depth_inv))
+        refined_depths = utils.inv2depth(refined_depth_inv)
+
+        # Calculate loss including multi-scale supervision
+        losses = self.calculate_multiscale_depth_loss(
+            refined_depths,
+            outputs, 
+            gt_depth
+        )
+        
+        depth_loss = losses['total']
+    
+        # depth_loss = self.calculate_grudepth_loss(utils.inv2depth(refined_depth_inv), 
+        #                                     utils.inv2depth(tgt_gt_depth_inv))
         
         #visualize flag
         if batch_idx %10 == 0:

@@ -318,11 +318,12 @@ class SML_consistent_resize(Dataset):
         intrinsics = self.resize_and_adjust_intrinsics(intrinsics, original_size, target_size)
         
         # Apply mask to ground truth depth before inverse computation
-        mask = (tgt_gt_depth < 5.0) & (tgt_gt_depth > 0.2)
-        tgt_gt_depth_masked = tgt_gt_depth.copy()
-        tgt_gt_depth_masked[~mask] = np.inf
+        mask = (tgt_gt_depth < 5.0)
+        mask *= (tgt_gt_depth > 0.2)
+        tgt_gt_depth[~mask] = np.inf
         tgt_gt_depth_inv = 1.0 / tgt_gt_depth
-        tgt_gt_depth_inv[tgt_gt_depth_inv == np.inf] = 0.0
+        tgt_gt_depth_inv[tgt_gt_depth_inv == float("inf")] = 0
+        
         # Convert to inverse depth and handle infinities
         #tgt_gt_depth_inv = np.zeros_like(tgt_gt_depth_masked)
         #valid_mask = tgt_gt_depth_masked < np.inf
