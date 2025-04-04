@@ -592,7 +592,7 @@ class midasNetConsistentModule(pl.LightningModule):
         #(b, n, iters, 6) 
         #if self.current_epoch < 60:
         self.model.iter_steps=0   
-        refined_depth_inv, refined_ref_poses, outputs = self.model(tgt_img, ref_imgs,
+        refined_depth_inv, refined_ref_poses = self.model(tgt_img, ref_imgs,
                                                             tgt_ga_depth, ref_ga_depth, 
                                                             tgt_interp, tgt_sparse_depth,
                                                             ref_interp, 
@@ -625,20 +625,18 @@ class midasNetConsistentModule(pl.LightningModule):
         #                         gt_depth,
         #                         log_variance=None,
         #                         mask=None)
-        
-        refined_depths = utils.inv2depth(refined_depth_inv)
 
         # Calculate loss including multi-scale supervision
-        losses = self.calculate_multiscale_depth_loss(
-            refined_depths,
-            outputs, 
-            gt_depth
-        )
+        # losses = self.calculate_multiscale_depth_loss(
+        #     refined_depths,
+        #     outputs, 
+        #     gt_depth
+        # )
         
-        depth_loss = losses['total']
+        #depth_loss = losses['total']
     
-        # depth_loss = self.calculate_grudepth_loss(utils.inv2depth(refined_depth_inv), 
-        #                                     utils.inv2depth(tgt_gt_depth_inv))
+        depth_loss = self.calculate_grudepth_loss(utils.inv2depth(refined_depth_inv), 
+                                            utils.inv2depth(tgt_gt_depth_inv))
         
         #visualize flag
         if batch_idx %10 == 0:

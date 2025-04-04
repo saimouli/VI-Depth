@@ -21,7 +21,7 @@ from scipy.interpolate import griddata
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
 import cv2
-
+from modules.networks import conv_bn_relu, convt_bn_relu, get_resnet18, get_resnet34
 #from modules.midas.blocks import OutputConv
 
 class SparsityAwarePooling(nn.Module):
@@ -588,142 +588,7 @@ class ShiftCorrectionModule(nn.Module):
         pos_embed[:, dim_t+1:2*dim_t:2] = torch.cos(pos_x[:, 1::2] * div_term.view(1, -1, 1, 1))
         
         return pos_embed
-    
-#propagate scale based on normals
-# class AffinityPropagation(nn.Module):
-#     def __init__(self, feature_dim, hidden_dim=64, chunk_size=1024):
-#         super().__init__()
-#         self.chunk_size = chunk_size
-#         self.scale = math.sqrt(feature_dim)
-        
-#         # Transformer layer for sparse point features
-#         #self.transformer_layer = nn.MultiheadAttention(embed_dim=feature_dim, num_heads=4)
-#         # Projection for feature-based affinity
-#         self.query_proj = nn.Conv2d(feature_dim, feature_dim, kernel_size=1)
-#         self.key_proj = nn.Linear(feature_dim + 1, feature_dim) #for sparse features
-        
-#         # Point feature processing
-#         self.point_feature_proj = nn.Linear(feature_dim + 1, feature_dim)
-        
-#         # For creating point features from image features and depth
-#         self.transformer_encoder = nn.TransformerEncoderLayer(
-#             d_model=feature_dim + 1,  # +1 for depth value
-#             nhead=3,
-#             dim_feedforward=256,
-#             batch_first=True
-#         )
-        
-#         self.softmax = nn.Softmax(dim=-1)
-        
-#     def forward(self, features, sparse_points_idx, sparse_depth_values, full_res=(288, 384)):
-#         """
-#         Args:
-#             features: Feature map from decoder stage [B, C, H, W]
-#             sparse_points_idx: List of lists of (y, x) coordinates of sparse points [B]
-#             sparse_scales: List of tensors of sparse scale values [B]
-#             relative_normals: Relative normals from MiDaS [B, 3, H, W]
-#             full_res: Tuple (H_full, W_full) indicating the full resolution of sparse points and normals
-        
-#         Returns:
-#             affinity_map: Affinity weights [B, H*W, N_max]
-#         """
-#         B, C, H, W = features.shape
-#         device = features.device
-#         # Handle case with no valid points
-#         N_max = max([len(points) for points in sparse_points_idx] or [0])
-#         if N_max == 0:
-#             return torch.zeros(B, H * W, 1, device=device)
-        
-#         #positional embeddings
-#         pos_embeddings = self._get_positional_embeddings(H, W, C, device)
-#         features_with_pos = features + pos_embeddings
-        
-#         # Sample features at sparse point locations and create point features
-#         sparse_features = []
-#         valid_mask = torch.zeros(B, N_max, device=device, dtype=torch.bool)
-        
-#         for b in range(B):
-#             points = sparse_points_idx[b]
-#             depths = sparse_depth_values[b]
-            
-#             if len(points) == 0:
-#                 # No points for this batch
-#                 sparse_features.append(torch.zeros(N_max, C + 1, device=device))
-#                 continue
-            
-#             #Get features at point locations
-#             point_features = torch.zeros(len(points), C, device=device)
-#             for i, (y, x) in enumerate(points):
-#                 if 0 <= y < H and 0 <= x < W:
-#                     point_features[i] = features_with_pos[b, :, y, x]
-            
-#             # Combine with depth values
-#             point_features_with_depth = torch.cat([
-#                 point_features,
-#                 depths.view(-1,1)
-#             ], dim=-1)  # [N, C + 1]
-            
-#             # Create valid mask
-#             valid_mask[b, :len(points)] = True
-            
-#             #pad if necessary
-#             if len(points) < N_max:
-#                 padding = torch.zeros(N_max - len(points), C + 1, device=device)
-#                 point_features_with_depth = torch.cat([point_features_with_depth, padding], dim=0)
-            
-#             sparse_features.append(point_features_with_depth)
-        
-#         sparse_features = torch.stack(sparse_features, dim=0)
-        
-#         #Apply transformer to point features
-#         key_padding_mask = ~valid_mask
-#         sparse_features_transformed = self.transformer_encoder(sparse_features, src_key_padding_mask=key_padding_mask)
-        
-#         #Compute affinities
-#         q_features = self.query_proj(features).view(B, -1, H * W).permute(0, 2, 1)
-#         k_features = self.key_proj(sparse_features_transformed)  # [B, N_max, C]
-        
-#         # Compute affinities in chunks to save memory
-#         affinity_map = torch.zeros(B, H * W, N_max, device=device)
-        
-#         for i in range(0, H * W, self.chunk_size):
-#             end = min(i + self.chunk_size, H * W)
-#             q_chunk = q_features[:, i:end, :]
-            
-#             # Compute dot product similarity
-#             chunk_affinities = torch.bmm(q_chunk, k_features.transpose(1, 2))
-#             chunk_affinities = chunk_affinities / self.scale
-            
-#             chunk_affinities.masked_fill_(~valid_mask.unsqueeze(1), -1e9)
-#             affinity_map[:, i:end, :] = self.softmax(chunk_affinities)
-            
-#         return affinity_map
-
-#     def _get_positional_embeddings(self, H, W, C, device):
-#         # Create position encodings
-#         y_grid, x_grid = torch.meshgrid(
-#             torch.linspace(-1, 1, H, device=device),
-#             torch.linspace(-1, 1, W, device=device),
-#             indexing='ij'
-#         )
-        
-#         dim_t = C // 4
-#         pos_embed = torch.zeros(1, C, H, W, device=device)
-#         div_term = torch.exp(torch.arange(0, dim_t, 2, device=device) * (-math.log(10000.0) / dim_t))
-        
-#         pos_y = y_grid.unsqueeze(0).unsqueeze(1).expand(1, dim_t, H, W)
-#         pos_embed[:, 0:dim_t:2] = torch.sin(pos_y[:, ::2] * div_term.view(1, -1, 1, 1))
-#         pos_embed[:, 1:dim_t:2] = torch.cos(pos_y[:, 1::2] * div_term.view(1, -1, 1, 1))
-        
-#         pos_x = x_grid.unsqueeze(0).unsqueeze(1).expand(1, dim_t, H, W)
-#         pos_embed[:, dim_t:2*dim_t:2] = torch.sin(pos_x[:, ::2] * div_term.view(1, -1, 1, 1))
-#         pos_embed[:, dim_t+1:2*dim_t:2] = torch.cos(pos_x[:, 1::2] * div_term.view(1, -1, 1, 1))
-        
-#         if C > 2*dim_t:
-#             pos_embed[:, 2*dim_t:] = pos_embed[:, :C-2*dim_t]
-            
-#         return pos_embed
-    
+       
 class Conv3x3(nn.Module):
     """Layer to pad and convolve input
     """
@@ -997,6 +862,155 @@ class UpMaskNet(nn.Module):
         mask = .25 * self.mask(feat)
         return mask
     
+
+class InitDepth(nn.Module):
+    def __init__(self, network='resnet18'):
+        super(InitDepth, self).__init__()
+        self.network = network
+        #self.args = args
+
+        # Encoder
+        self.conv1_rgb = conv_bn_relu(3, 48, kernel=3, stride=1, padding=1,
+                                      bn=False)
+        self.conv1_dep = conv_bn_relu(1, 16, kernel=3, stride=1, padding=1,
+                                      bn=False)
+
+        if self.network == 'resnet18':
+            net = get_resnet18(pretrained=True)
+        elif self.network == 'resnet34':
+            net = get_resnet34(pretrained=True)
+        else:
+            raise NotImplementedError
+
+        # 1/1
+        self.conv2 = net.layer1
+        # 1/2
+        self.conv3 = net.layer2
+        # 1/4
+        self.conv4 = net.layer3
+        # 1/8
+        self.conv5 = net.layer4
+
+        del net
+
+        # 1/16
+        self.conv6 = conv_bn_relu(512, 512, kernel=3, stride=2, padding=1)
+
+        # Shared Decoder
+        # 1/8
+        self.dec5 = convt_bn_relu(512, 256, kernel=3, stride=2,
+                                  padding=1, output_padding=1)
+        # 1/4
+        self.dec4 = convt_bn_relu(256+512, 128, kernel=3, stride=2,
+                                  padding=1, output_padding=1)
+        # 1/2
+        self.dec3 = convt_bn_relu(128+256, 64, kernel=3, stride=2,
+                                  padding=1, output_padding=1)
+
+        # 1/1
+        self.dec2 = convt_bn_relu(64+128, 64, kernel=3, stride=2,
+                                  padding=1, output_padding=1)
+
+        # Init Depth Branch
+        # 1/1
+        self.id_dec1 = conv_bn_relu(64+64, 64, kernel=3, stride=1,
+                                    padding=1)
+        self.id_dec0 = conv_bn_relu(64+64, 1, kernel=3, stride=1,
+                                    padding=1, bn=False, relu=True)
+
+        # Guidance Branch
+        # 1/1
+        # self.gd_dec1 = ConvBnReLU(64+64, 64, kernel_size=3, stride=1,
+        #                             padding=1)
+        # self.gd_dec0 = ConvBnReLU(64+64, self.num_neighbors, kernel_size=3, stride=1,
+        #                             padding=1, bn=False, relu=False)
+
+        # if self.args.conf_prop:
+        #     # Confidence Branch
+        #     # Confidence is shared for propagation and mask generation
+        #     # 1/1
+        #     self.cf_dec1 = ConvBnReLU(64+64, 32, kernel=3, stride=1,
+        #                                 padding=1)
+        #     self.cf_dec0 = nn.Sequential(
+        #         nn.Conv2d(32+64, 1, kernel_size=3, stride=1, padding=1),
+        #         nn.Sigmoid()
+        #     )
+
+        # Set parameter groups
+        # params = []
+        # for param in self.named_parameters():
+        #     if param[1].requires_grad:
+        #         params.append(param[1])
+
+        # params = nn.ParameterList(params)
+
+        # self.param_groups = [
+        #     {'params': params, 'lr': self.args.lr}
+        # ]
+
+    def _concat(self, fd, fe, dim=1):
+        # Decoder feature may have additional padding
+        _, _, Hd, Wd = fd.shape
+        _, _, He, We = fe.shape
+
+        # Remove additional padding
+        if Hd > He:
+            h = Hd - He
+            fd = fd[:, :, :-h, :]
+
+        if Wd > We:
+            w = Wd - We
+            fd = fd[:, :, :, :-w]
+
+        f = torch.cat((fd, fe), dim=dim)
+
+        return f
+
+    def forward(self, rgb, dep):
+        # rgb = sample['rgb']
+        # dep = sample['dep']
+
+        # Encoding
+        fe1_rgb = self.conv1_rgb(rgb)
+        fe1_dep = self.conv1_dep(dep)
+
+        fe1 = torch.cat((fe1_rgb, fe1_dep), dim=1)
+
+        fe2 = self.conv2(fe1)
+        fe3 = self.conv3(fe2)
+        fe4 = self.conv4(fe3)
+        fe5 = self.conv5(fe4)
+        fe6 = self.conv6(fe5)
+
+        # Shared Decoding
+        fd5 = self.dec5(fe6)
+        fd4 = self.dec4(self._concat(fd5, fe5))
+        fd3 = self.dec3(self._concat(fd4, fe4))
+        fd2 = self.dec2(self._concat(fd3, fe3))
+
+        # Init Depth Decoding
+        id_fd1 = self.id_dec1(self._concat(fd2, fe2))
+        pred_init = self.id_dec0(self._concat(id_fd1, fe1))
+
+        # Guidance Decoding
+        #gd_fd1 = self.gd_dec1(self._concat(fd2, fe2))
+        #guide = self.gd_dec0(self._concat(gd_fd1, fe1))
+
+        #if self.args.conf_prop:
+        #    # Confidence Decoding
+        #    cf_fd1 = self.cf_dec1(self._concat(fd2, fe2))
+        #    confidence = self.cf_dec0(self._concat(cf_fd1, fe1))
+        #else:
+        #    confidence = None
+        confidence = None
+
+        # Remove negative depth
+        pred_init = torch.clamp(pred_init, min=0)
+
+        #output = {'pred_init': pred_init, 'confidence': confidence}
+
+        return pred_init
+      
 class midasConsNet(nn.Module):
     def __init__(self, min_pred, max_pred, min_depth, max_depth, nsamples, sml_model_path, 
                  is_train=True, log_fn=None, isConvGRU=False):
@@ -1016,8 +1030,10 @@ class midasConsNet(nn.Module):
         self.iter_steps = 0
         self.seq_len = 0
         
+        self.init_depth = InitDepth()
+        
         #self.ap = AffinityPropagation(feature_dim=self.cost_dim, hidden_dim=self.hidden_dim)
-        self.depth_prop = MultiScaleAffinityPropagation(feature_dim=self.cost_dim)
+        #self.depth_prop = MultiScaleAffinityPropagation(feature_dim=self.cost_dim)
         
         #self.fnet = ResNetEncoder(out_chs=self.cost_dim, stride=4)
         #self.fnet_midas = MidasNet_small_cons_videpth(features=32, in_channels=3)
@@ -1443,6 +1459,8 @@ class midasConsNet(nn.Module):
             align_corners=None  
         )
         #valid_mask_pre = (tgt_sparse_depth_inv_resized > 0).float()
+        inv_depth_pred = self.init_depth(tgt_input, tgt_sparse_depth_inv_resized)
+        
         
         ##Visualize the sparse scales
         # self.visualize_sparse_scales(
@@ -1454,8 +1472,8 @@ class midasConsNet(nn.Module):
         #     int_interp_pre
         # )
 
-        inv_depth_pred, outputs = self.depth_prop(tgt_input, tgt_sparse_depth_inv_resized)
-        refined_inv_depth = inv_depth_pred
+        #inv_depth_pred, outputs = self.depth_prop(tgt_input, tgt_sparse_depth_inv_resized)
+        #refined_inv_depth = inv_depth_pred
         
         ##get scale scaffolding from the propagated_depth
         #coarse_scales = torch.ones_like(propagated_depth_inv)
@@ -1649,8 +1667,7 @@ class midasConsNet(nn.Module):
         
         if self.is_train:
             return inv_depth_predictions, \
-                torch.stack([torch.stack(poses_ref, dim=1) for poses_ref in pose_predictions], dim=2), \
-                    outputs #(b, n, iters, 6)
+                torch.stack([torch.stack(poses_ref, dim=1) for poses_ref in pose_predictions], dim=2) #(b, n, iters, 6)
         else:
             return inv_depth_predictions[-1],\
                 torch.stack(pose_predictions[-1], dim=1).view(tgt_img.shape[0], len(ref_imgs), 6) #(b, n, 6)
