@@ -1,20 +1,36 @@
 import numpy as np
 np.set_printoptions(suppress=True)
 
-from scipy.interpolate import griddata
+from scipy.interpolate import griddata, Rbf
 
 
 def interpolate_knots(map_size, knot_coords, knot_values, interpolate, fill_corners):
     grid_x, grid_y = np.mgrid[0:map_size[0], 0:map_size[1]]
 
-    interpolated_map = griddata(
-        points=knot_coords.T,
-        values=knot_values,
-        xi=(grid_y, grid_x),
-        method=interpolate,
-        fill_value=1.0)
-
-    return interpolated_map
+    if interpolate == 'rbf':
+        # Extract x and y coordinates
+        x = knot_coords[0]
+        y = knot_coords[1]
+        
+        # Create RBF interpolator
+        # 'thin_plate' is generally good for spatial data with few points
+        rbf = Rbf(x, y, knot_values, function='thin_plate', smooth=0.03)
+        
+        # Apply RBF interpolation to the entire grid
+        yy, xx = np.meshgrid(np.arange(map_size[0]), np.arange(map_size[1]), indexing='ij')
+        interpolated_map = rbf(xx, yy)
+        
+        return interpolated_map
+    else:
+        # Original griddata method for other interpolation types
+        interpolated_map = griddata(
+            points=knot_coords.T,
+            values=knot_values,
+            xi=(grid_y, grid_x),
+            method=interpolate,
+            fill_value=1.0)
+        
+        return interpolated_map
 
 
 class Interpolator2D(object):
@@ -36,7 +52,7 @@ class Interpolator2D(object):
             self.knot_list.append((int(self.knot_coords[0,i]), int(self.knot_coords[1,i])))
 
         # to be computed
-        self.interpolated_map = None
+        self.interpolated_scale_map = None
         self.confidence_map = None
         self.output = None
 
