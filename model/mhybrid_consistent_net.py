@@ -1038,7 +1038,7 @@ class midasConsNet(nn.Module):
         #self.fnet = ResNetEncoder(out_chs=self.cost_dim, stride=4)
         #self.fnet_midas = MidasNet_small_cons_videpth(features=32, in_channels=3)
         #self.cnet_depth_affinity = ResNetEncoder(out_chs=self.hidden_dim + self.cost_dim-1, stride=4, context_num=1, pretrained=False)
-        #self.cnet_depth = ResNetEncoder_orig(out_chs=self.hidden_dim + self.cost_dim, stride=4, context_num=2, pretrained=False)
+        self.cnet_depth = ResNetEncoder_orig(out_chs=self.hidden_dim + self.cost_dim, stride=4, context_num=2, pretrained=False)
         
         #self.upsample_1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         
@@ -1413,7 +1413,8 @@ class midasConsNet(nn.Module):
 
     def forward(self, tgt_img, ref_imgs, tgt_ga_depth, ref_ga_depth, 
                 tgt_interp, tgt_sparse_depth, ref_interp, tgt_pose, 
-                ref_pose, intrinsics, tgt_normals, tgt_depth_pred_inv, global_step, depth_only=False):
+                ref_pose, intrinsics, tgt_normals, tgt_depth_pred_inv, 
+                global_step, depth_only=False):
         """
         Refine metric depth scale and VIO poses and target/reference images.
         """ 
@@ -1459,7 +1460,7 @@ class midasConsNet(nn.Module):
             align_corners=None  
         )
         #valid_mask_pre = (tgt_sparse_depth_inv_resized > 0).float()
-        inv_depth_pred = self.init_depth(tgt_input, tgt_sparse_depth_inv_resized)
+        #inv_depth_pred = self.init_depth(tgt_input, tgt_sparse_depth_inv_resized)
         
         
         ##Visualize the sparse scales
@@ -1527,12 +1528,12 @@ class midasConsNet(nn.Module):
         # Step 6: Predict delta scales and confidence
         #ga_depth_feat = self.cnet_depth_affinity(int_depth_pre)
         #ga_depth_feat = self.upsample_1(ga_depth_feat)
-        #context_test = torch.cat([int_depth_pre, int_interp_pre], dim=1)
+        context_test = torch.cat([int_depth_pre, int_interp_pre], dim=1)
         # context = torch.cat([int_depth_pre, scale_scaffolding], dim=1)
-        #context = self.cnet_depth(context_test)
-        #scale_map = self.scaleOutput(context)
-        #delta_scales = F.relu(1.0 + scale_map)  # Ensure scale is positive
-        #inv_depth_pred = init_metric_depth_inv * delta_scales
+        context = self.cnet_depth(context_test)
+        scale_map = self.scaleOutput(context)
+        delta_scales = F.relu(1.0 + scale_map)  # Ensure scale is positive
+        inv_depth_pred = init_metric_depth_inv * delta_scales
             
         if self.min_pred is not None and self.max_pred is not None:
            inv_depth_pred = torch.clamp(

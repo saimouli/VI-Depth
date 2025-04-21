@@ -226,13 +226,14 @@ class SML_consistent_dataset(Dataset):
     def __getitem__(self, index):
         sample = self.samples[index]
         tgt_img = load_input_image(str(sample['tgt_img']))
+        tgt_path = str(sample['tgt_img'])
         tgt_gt_depth = load_sparse_depth(str(sample['tgt_gt_depth']), depth_scale=self.depth_scale)
         tgt_sparse_depth = load_sparse_depth(str(sample['tgt_sparse_depth']), depth_scale=self.depth_scale)
         tgt_ga_depth = load_depth_image_from_npy(str(sample['tgt_ga_depth']))
         tgt_interp = load_depth_image_from_npy(str(sample['tgt_interp']))
         tgt_pose = self.convert_to_4x4(np.loadtxt(str(sample['tgt_pose'])))
         tgt_depth_pred = load_depth_image_from_npy(str(sample['tgt_depth_pred']))
-        tgt_normal = load_depth_image_from_npy(str(sample['tgt_normal']))
+        #tgt_normal = load_depth_image_from_npy(str(sample['tgt_normal']))
         
 
         ref_img = [load_input_image(str(ref_img)) for ref_img in sample['ref_imgs']]
@@ -289,9 +290,9 @@ class SML_consistent_dataset(Dataset):
         tgt_gt_depth_inv = torch.from_numpy(tgt_gt_depth_inv).unsqueeze(0)
     
         
-        tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_sparse_depth, tgt_interp, tgt_pose, tgt_normal = [
+        tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_sparse_depth, tgt_interp, tgt_pose = [
             T.astype(np.float32) if isinstance(T, np.ndarray) else T for T in [
-                tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_sparse_depth, tgt_interp, tgt_pose, tgt_normal
+                tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_sparse_depth, tgt_interp, tgt_pose
             ]
         ]
         
@@ -308,7 +309,7 @@ class SML_consistent_dataset(Dataset):
         #img, gt_depth, ga_depth, interp_scale
         return tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, tgt_sparse_depth, ref_img, \
             ref_ga_depth, ref_interp, ref_gt_depth, ref_sparse_depth, tgt_pose, ref_pose, intrinsics, \
-            tgt_pose_perturbed, ref_pose_perturbed, tgt_depth_pred #, tgt_normal
+            tgt_pose_perturbed, ref_pose_perturbed, tgt_depth_pred, tgt_path #, tgt_normal
     
     def __len__(self):
         return len(self.samples)

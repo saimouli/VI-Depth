@@ -8,6 +8,7 @@ np.bool = np.bool_
 from tqdm import tqdm
 from PIL import Image
 
+from modules.interpolator import PolynomialInterpolator2D, Interpolator2D
 import modules.midas.utils as utils
 
 import pipeline
@@ -135,7 +136,8 @@ def evaluate_ddp(dataset_path, depth_predictor, nsamples, sml_model_path, device
 
         print(summary_tb)
         
-def evaluate(dataset_path, depth_predictor, nsamples, sml_model_path):
+def evaluate(dataset_path, depth_predictor, nsamples, sml_model_path, add_sparse_points=False, sparse_point_percentage=0,
+             add_noise=False, noise_sigma=0.0):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device: %s" % device)
 
@@ -157,7 +159,15 @@ def evaluate(dataset_path, depth_predictor, nsamples, sml_model_path):
     # initialize error aggregators
     avg_error_w_int_depth = metrics.ErrorMetricsAverager()
     avg_error_w_pred = metrics.ErrorMetricsAverager()
+    avg_error_w_poly = metrics.ErrorMetricsAverager()
+    avg_error_w_linear = metrics.ErrorMetricsAverager()
 
+    # Print experiment configuration
+    if add_sparse_points:
+        print(f"Adding {sparse_point_percentage}% additional sparse points from ground truth")
+    if add_noise:
+        print(f"Adding Gaussian noise with sigma={noise_sigma} to sparse points")
+        
     sparse_count = []; rmse_val = []; mae_val = []; absrel_val = []
     # iterate through inputs list
     for i in tqdm(range(len(test_image_list))):
@@ -177,9 +187,18 @@ def evaluate(dataset_path, depth_predictor, nsamples, sml_model_path):
         assert(np.all(np.unique(validity_map) == [0, 256]))
         validity_map[validity_map > 0] = 1
         
+        ga_depth_fp = input_image_fp.replace("image", "ga_depth_inv").replace(".png", ".npy")
+        ga_depth_inv = np.load(ga_depth_fp)
+        
+        interp_scale_fp = input_image_fp.replace("image", "interp_scale").replace(".png", ".npy")
+        interp_scale = np.load(interp_scale_fp)
+        
+        #print("inpt img fp: ", input_image_fp)
+        #print("ga depth fp: ", ga_depth_fp)
+        
         
         # print("Before Pts: ", np.count_nonzero(validity_map))
-        # reduce_pts = int(np.count_nonzero(validity_map) * 0.95)
+        # reduce_pts = int(np.count_nonzero(validity_map) * 0.90)
         # nonzero_indices = np.argwhere(validity_map == 1)
         # remove_indices = np.random.choice(len(nonzero_indices), size=reduce_pts, replace=False)
         # points_to_remove = nonzero_indices[remove_indices]
@@ -194,6 +213,57 @@ def evaluate(dataset_path, depth_predictor, nsamples, sml_model_path):
         target_depth = np.array(Image.open(target_depth_fp), dtype=np.float32) / 256.0
         target_depth[target_depth <= 0] = 0.0
 
+        original_sparse_count = np.count_nonzero(validity_map)
+
+        # Add sparse points from ground truth if enabled
+        if add_sparse_points and sparse_point_percentage > 0:
+            # Calculate how many points to add
+            current_points = np.count_nonzero(validity_map)
+            points_to_add = int(current_points * sparse_point_percentage / 100)
+            
+            # Find valid ground truth points that aren't already in validity map
+            valid_gt_mask = (target_depth > min_depth) & (target_depth < max_depth)
+            candidate_points = valid_gt_mask & (validity_map == 0)
+            candidate_indices = np.where(candidate_points)
+            
+            # If we have enough candidate points
+            if len(candidate_indices[0]) >= points_to_add:
+                print("Before Pts: ", np.count_nonzero(validity_map))
+                # Randomly select points to add
+                random_indices = np.random.choice(len(candidate_indices[0]), size=points_to_add, replace=False)
+                selected_x = candidate_indices[0][random_indices]
+                selected_y = candidate_indices[1][random_indices]
+                
+                # Add the points
+                for x, y in zip(selected_x, selected_y):
+                    validity_map[x, y] = 1
+                    input_sparse_depth[x, y] = target_depth[x, y]
+                
+                #print(f"Added {points_to_add} sparse points ({sparse_point_percentage}%) to image {i}")
+                #total how many
+                total_points = np.count_nonzero(validity_map)
+                print(f"Total points after addition: {total_points}")
+            else:
+                print(f"Warning: Not enough candidate points to add {points_to_add} points to image {i}")
+
+        if add_noise and noise_sigma > 0:
+            # Create a noise mask with same shape as input_sparse_depth
+            noise = np.random.normal(0, noise_sigma, input_sparse_depth.shape)
+            
+            # Only add noise where validity_map is 1
+            noise_mask = validity_map > 0
+            
+            # Apply noise only to valid sparse points
+            input_sparse_depth[noise_mask] += noise[noise_mask]
+            
+            # Ensure all values remain positive and within valid range
+            input_sparse_depth[input_sparse_depth <= 0] = min_depth
+            input_sparse_depth[input_sparse_depth > max_depth] = max_depth
+        
+        # Store new sparse point count
+        new_sparse_count = np.count_nonzero(validity_map)
+        sparse_count.append(new_sparse_count)
+        
         # target depth valid/mask
         mask = (target_depth < max_depth)
         if min_depth is not None:
@@ -202,9 +272,31 @@ def evaluate(dataset_path, depth_predictor, nsamples, sml_model_path):
         target_depth = 1.0 / target_depth
 
         # run pipeline
-        output = method.run(input_image, input_sparse_depth, validity_map, device)
-
-        # compute error metrics using intermediate (globally aligned) depth
+        output = method.run(input_image, input_sparse_depth, validity_map, device, ga_depth_inv, interp_scale)
+        
+        input_sparse_depth[~validity_map.astype(np.bool)] = np.inf
+        input_sparse_depth_inv = 1.0 / input_sparse_depth
+        ScaleMapInterpolator = PolynomialInterpolator2D(pred_inv=output["ga_depth"], 
+                                            sparse_depth_inv=input_sparse_depth_inv, 
+                                            valid=validity_map.astype(np.bool))
+        ScaleMapInterpolator.generate_polynomial_scale_map(degree=3, reg_lambda=5.0)
+        poly_depth = ScaleMapInterpolator.apply_scale_map()
+        
+        ####### rbf/linear ######
+        ScaleMapInterpolator = Interpolator2D(
+            pred_inv = output["ga_depth"],
+            sparse_depth_inv = input_sparse_depth_inv,
+            valid=validity_map.astype(np.bool)
+        )
+        ScaleMapInterpolator.generate_interpolated_scale_map(
+            interpolate_method='linear',
+            fill_corners=False
+        )
+        int_scales = ScaleMapInterpolator.interpolated_scale_map.astype(np.float32)
+        lin_depth = output["ga_depth"] * int_scales
+        #################
+        
+        # Compute error metrics using intermediate (globally aligned) depth
         error_w_int_depth = metrics.ErrorMetrics()
         error_w_int_depth.compute(
             estimate = output["ga_depth"], 
@@ -219,18 +311,57 @@ def evaluate(dataset_path, depth_predictor, nsamples, sml_model_path):
             target = target_depth, 
             valid = mask.astype(np.bool),
         )
+        
+        error_w_poly = metrics.ErrorMetrics()
+        error_w_poly.compute(
+            estimate = poly_depth, 
+            target = target_depth, 
+            valid = mask.astype(np.bool),
+        )
 
+        error_w_lin = metrics.ErrorMetrics()
+        error_w_lin.compute(
+            estimate = lin_depth, 
+            target = target_depth, 
+            valid = mask.astype(np.bool),
+        )
         # accumulate error metrics
         avg_error_w_int_depth.accumulate(error_w_int_depth)
         avg_error_w_pred.accumulate(error_w_pred)
+        avg_error_w_poly.accumulate(error_w_poly)
+        avg_error_w_linear.accumulate(error_w_lin)
         
-        rmse_val.append(error_w_pred.rmse)
-        mae_val.append(error_w_pred.mae)
-        absrel_val.append(error_w_pred.absrel)
+        #rmse_val.append(error_w_pred.rmse)
+        #mae_val.append(error_w_pred.mae)
+        #absrel_val.append(error_w_pred.absrel)
     
     # plt.boxplot(sparse_count, vert=True, patch_artist=True)
     # plt.ylabel("Number of Sparse Points")
     # plt.show()
+    
+    if add_sparse_points or add_noise:
+        try:
+            import matplotlib.pyplot as plt
+            plt.figure(figsize=(10, 6))
+            plt.boxplot(sparse_count, vert=True, patch_artist=True)
+            plt.ylabel("Number of Sparse Points")
+            plt.title("Distribution of Sparse Points Across Test Images")
+            
+            # If adding sparse points, show the percentage increase
+            if add_sparse_points:
+                plt.axhline(y=original_sparse_count, color='r', linestyle='--', 
+                           label=f"Original count (avg: {original_sparse_count})")
+                plt.axhline(y=original_sparse_count * (1 + sparse_point_percentage/100), 
+                           color='g', linestyle='--', 
+                           label=f"Target {sparse_point_percentage}% increase")
+                plt.legend()
+                
+            #plt.savefig(f"sparse_points_distribution{'_with_noise' if add_noise else ''}.png")
+            #plt.close()
+            print(f"Saved sparse points distribution plot")
+        except Exception as e:
+            print(f"Could not create visualization: {e}")
+            
     # compute average error metrics
     print("Averaging metrics for globally-aligned depth over {} samples".format(
         avg_error_w_int_depth.total_count
@@ -241,17 +372,26 @@ def evaluate(dataset_path, depth_predictor, nsamples, sml_model_path):
         avg_error_w_pred.total_count
     ))
     avg_error_w_pred.average()
+    avg_error_w_poly.average()
+    avg_error_w_linear.average()
 
     from prettytable import PrettyTable
     summary_tb = PrettyTable()
-    summary_tb.field_names = ["metric", "GA Only", "GA+SML"]
+    
+    title = "Evaluation Results"
+    if add_sparse_points:
+        title += f" with {sparse_point_percentage}% additional sparse points"
+    if add_noise:
+        title += f" and noise (sigma={noise_sigma})"
+    summary_tb.title = title
+    summary_tb.field_names = ["metric", "GA Only", "GA+SML", "Poly", "Lin"]
 
-    summary_tb.add_row(["RMSE", f"{avg_error_w_int_depth.rmse_avg:7.2f}", f"{avg_error_w_pred.rmse_avg:7.2f}"])
-    summary_tb.add_row(["MAE", f"{avg_error_w_int_depth.mae_avg:7.2f}", f"{avg_error_w_pred.mae_avg:7.2f}"])
-    summary_tb.add_row(["AbsRel", f"{avg_error_w_int_depth.absrel_avg:8.3f}", f"{avg_error_w_pred.absrel_avg:8.3f}"])
-    summary_tb.add_row(["iRMSE", f"{avg_error_w_int_depth.inv_rmse_avg:7.2f}", f"{avg_error_w_pred.inv_rmse_avg:7.2f}"])
-    summary_tb.add_row(["iMAE", f"{avg_error_w_int_depth.inv_mae_avg:7.2f}", f"{avg_error_w_pred.inv_mae_avg:7.2f}"])
-    summary_tb.add_row(["iAbsRel", f"{avg_error_w_int_depth.inv_absrel_avg:8.3f}", f"{avg_error_w_pred.inv_absrel_avg:8.3f}"])
+    summary_tb.add_row(["RMSE", f"{avg_error_w_int_depth.rmse_avg:7.2f}", f"{avg_error_w_pred.rmse_avg:7.2f}", f"{avg_error_w_poly.rmse_avg:7.2f}", f"{avg_error_w_linear.rmse_avg:7.2f}"])
+    summary_tb.add_row(["MAE", f"{avg_error_w_int_depth.mae_avg:7.2f}", f"{avg_error_w_pred.mae_avg:7.2f}", f"{avg_error_w_poly.mae_avg:7.2f}", f"{avg_error_w_linear.mae_avg:7.2f}"])
+    summary_tb.add_row(["AbsRel", f"{avg_error_w_int_depth.absrel_avg:8.3f}", f"{avg_error_w_pred.absrel_avg:8.3f}", f"{avg_error_w_poly.absrel_avg:8.3f}", f"{avg_error_w_linear.absrel_avg:8.3f}"])
+    summary_tb.add_row(["iRMSE", f"{avg_error_w_int_depth.inv_rmse_avg:7.2f}", f"{avg_error_w_pred.inv_rmse_avg:7.2f}", f"{avg_error_w_poly.inv_rmse_avg:7.2f}", f"{avg_error_w_linear.inv_rmse_avg:7.2f}"])
+    summary_tb.add_row(["iMAE", f"{avg_error_w_int_depth.inv_mae_avg:7.2f}", f"{avg_error_w_pred.inv_mae_avg:7.2f}", f"{avg_error_w_poly.inv_mae_avg:7.2f}", f"{avg_error_w_linear.inv_mae_avg:7.2f}"])
+    summary_tb.add_row(["iAbsRel", f"{avg_error_w_int_depth.inv_absrel_avg:8.3f}", f"{avg_error_w_pred.inv_absrel_avg:8.3f}", f"{avg_error_w_poly.inv_absrel_avg:8.3f}", f"{avg_error_w_linear.inv_absrel_avg:8.3f}"])
     
     print(summary_tb)
 
@@ -475,7 +615,7 @@ if __name__=="__main__":
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('-ds', '--dataset-path', type=str, default='/media/saimouli/Data6T/datasets/VOID_150/testing',
+    parser.add_argument('-ds', '--dataset-path', type=str, default='/media/saimouli/Data6T/datasets/VOID_150_test/testing',
                         help='Path to VOID release dataset.')
     parser.add_argument('-dp', '--depth-predictor', type=str, default='dpt_hybrid', 
                         help='Name of depth predictor to use in pipeline.')
@@ -492,6 +632,10 @@ if __name__=="__main__":
         args.depth_predictor, 
         args.nsamples, 
         args.sml_model_path,
+        add_sparse_points=False,
+        sparse_point_percentage=50,
+        add_noise=False,
+        noise_sigma=0.04 # 4cm
     )
     
     # evaluate_ddp(

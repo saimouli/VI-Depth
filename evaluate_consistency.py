@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from data.SML_consistent_dataset import SML_consistent_dataset
+from data.SML_consistent_resize import SML_consistent_resize
 from utils.camera import Camera
 import modules.midas.utils as utils
 import cv2
@@ -128,10 +129,30 @@ def plot_depth(tgt_img_cpu, tgt_gt_depth_inv_cpu, tgt_ga_depth_cpu, tgt_pred_dep
     plt.tight_layout()
     plt.show()
     
+def get_ga_and_scale(depth_pred, input_sparse_depth, input_sparse_depth_valid, min_pred, max_pred):
+    int_depth,_,_ = compute_ls_solution(depth_pred, input_sparse_depth, input_sparse_depth_valid, min_pred, max_pred)
+        
+    # Interpolation of scale map
+    assert (np.sum(input_sparse_depth_valid) >= 3), "not enough valid sparse points"
+    ScaleMapInterpolator = Interpolator2D(
+        pred_inv = int_depth,
+        sparse_depth_inv = input_sparse_depth,
+        valid = input_sparse_depth_valid,
+    )
     
+    ScaleMapInterpolator.generate_interpolated_scale_map(
+        interpolate_method='linear', 
+        fill_corners=False
+    )
+    int_scales = ScaleMapInterpolator.interpolated_scale_map.astype(np.float32)
+    int_scales = utils.normalize_unit_range(int_scales)
+
+    return int_depth, int_scales
+   
 #currently evaluating the GT depth consistency TODO: include valid mask for gt depth
 if __name__ == "__main__":
-    dataset = SML_consistent_dataset(data_root='/media/saimouli/Data6T/datasets/VOID_150', mode='val')
+    dataset = SML_consistent_dataset(data_root='/media/saimouli/Data6T/datasets/VOID_150_small', mode='val')
+    #dataset = SML_consistent_resize(data_root='/media/saimouli/Data6T/datasets/VOID_150_small', mode='val')
     dataloader = torch.utils.data.DataLoader(dataset)
     
     sml_model_path = "weights/sml_model.dpredictor.dpt_hybrid.nsamples.150.ckpt"
@@ -139,6 +160,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     #model = midasNet(min_pred, max_pred, min_depth, max_depth, 150, sml_model_path)
     model_transforms = transforms.get_transforms("dpt_hybrid", "void", str(150))
+    add_noise = True; noise_sigma = 0.04
     # ScaleMapLearner_transform = model_transforms["sml_model"]
     # ScaleMapLearner = MidasNet_small_videpth(
     #     path=sml_model_path,
@@ -154,7 +176,7 @@ if __name__ == "__main__":
     # model.to(device)
     
     model = midasNetConsistentModule(sml_model_path=sml_model_path, useConvGRU=True, is_train=False)
-    model = model.load_from_checkpoint("/home/saimouli/Desktop/version_15/red90_model/total_loss=0.089.ckpt")
+    model = model.load_from_checkpoint("lightning_logs/MVSML/version_0/checkpoints/epoch=15-val/total_loss=0.085.ckpt")
     #model = model.load_from_checkpoint("/home/saimouli/Documents/github/VI_Depth_sai/weights/withcostv/total_loss=0.088.ckpt")
     #model = model.load_from_checkpoint("/home/saimouli/Documents/github/VI_Depth_sai/weights/without_costv/total_loss=0.086.ckpt")
     model.eval()
@@ -184,41 +206,61 @@ if __name__ == "__main__":
     
         # Unpack batch data
         tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, tgt_sparse_depth, ref_img, \
-        ref_ga_depth, ref_interp, ref_gt_depth, ref_sparse_depth, tgt_pose, ref_gt_pose, intrinsics, _, ref_pose_perturbed, tgt_depth_pred = batch_data #dataset[idx] #Cam2Wld poses (R_ctoG, p_CinG)
+        ref_ga_depth, ref_interp, ref_gt_depth, ref_sparse_depth, tgt_pose, ref_gt_pose, \
+            intrinsics, _, ref_pose_perturbed, tgt_depth_pred, _ = batch_data #dataset[idx] #Cam2Wld poses (R_ctoG, p_CinG)
         
         ##########################################################################
+        ## add noise
+        if add_noise:
+            #print(f"Adding Gaussian noise with sigma={noise_sigma} to sparse points")
+            tgt_sparse_depth_np = tgt_sparse_depth.squeeze().cpu().numpy()
+            validity_map_bool = (tgt_sparse_depth_np > 0)
+            input_sparse_depth_valid = (tgt_sparse_depth_np < max_depth) * (tgt_sparse_depth_np > min_depth)
+            input_sparse_depth_valid = input_sparse_depth_valid.astype(bool)
+            noise = np.random.normal(0, noise_sigma, tgt_sparse_depth_np.shape)
+            tgt_sparse_depth_np[validity_map_bool] += noise[validity_map_bool]
+            
+            tgt_sparse_depth_np[~input_sparse_depth_valid] = np.inf 
+            tgt_sparse_depth_np = 1.0 / tgt_sparse_depth_np 
+            
+            #recompute tgt_ga_depth
+            tgt_ga_depth, int_scales = get_ga_and_scale(tgt_depth_pred.squeeze().cpu().numpy(), tgt_sparse_depth_np, 
+                                                   input_sparse_depth_valid, min_pred, max_pred)
+            tgt_ga_depth = torch.from_numpy(tgt_ga_depth).unsqueeze(0).float().to(device)
+            tgt_interp = torch.from_numpy(int_scales).unsqueeze(0).float().to(device)
+        
         ###reduce tgt sparse depth and try interpolating again and then pass
-        validity_map = (tgt_sparse_depth > 0).squeeze().cpu().numpy().astype(np.uint8)
-        print("Before Pts: ", np.count_nonzero(validity_map))
-        reduce_pts = int(np.count_nonzero(validity_map) * 0.90)
-        nonzero_indices = np.argwhere(validity_map == 1)
-        remove_indices = np.random.choice(len(nonzero_indices), size=reduce_pts, replace=False)
-        points_to_remove = nonzero_indices[remove_indices]
-        for x, y in points_to_remove:
-            validity_map[x, y] = 0
-        print("After Pts: ", np.count_nonzero(validity_map))
-        input_sparse_depth_valid = validity_map.astype(bool)
-        tgt_sparse_depth = tgt_sparse_depth.squeeze().cpu().numpy()
-        tgt_sparse_depth[~input_sparse_depth_valid] = np.inf
-        tgt_sparse_depth = 1.0 / tgt_sparse_depth 
+        # validity_map = (tgt_sparse_depth > 0).squeeze().cpu().numpy().astype(np.uint8)
+        # print("Before Pts: ", np.count_nonzero(validity_map))
+        # reduce_pts = int(np.count_nonzero(validity_map) * 0.90)
+        # nonzero_indices = np.argwhere(validity_map == 1)
+        # remove_indices = np.random.choice(len(nonzero_indices), size=reduce_pts, replace=False)
+        # points_to_remove = nonzero_indices[remove_indices]
+        # for x, y in points_to_remove:
+        #     validity_map[x, y] = 0
+        # print("After Pts: ", np.count_nonzero(validity_map))
+        # input_sparse_depth_valid = validity_map.astype(bool)
+        # tgt_sparse_depth = tgt_sparse_depth.squeeze().cpu().numpy()
+        # tgt_sparse_depth[~input_sparse_depth_valid] = np.inf
+        # tgt_sparse_depth = 1.0 / tgt_sparse_depth 
         
-        #recompute tgt_ga_depth
-        tgt_ga_depth = tgt_ga_depth.squeeze().cpu().numpy()
-        tgt_ga_depth,_,_ = compute_ls_solution(tgt_depth_pred.squeeze().cpu().numpy(), tgt_sparse_depth, input_sparse_depth_valid, min_pred, max_pred)
-        tgt_ga_depth = torch.from_numpy(tgt_ga_depth).unsqueeze(0).float().to(device)
+        # #recompute tgt_ga_depth
+        # tgt_ga_depth = tgt_ga_depth.squeeze().cpu().numpy()
+        # tgt_ga_depth,_,_ = compute_ls_solution(tgt_depth_pred.squeeze().cpu().numpy(), tgt_sparse_depth, input_sparse_depth_valid, min_pred, max_pred)
+        # tgt_ga_depth = torch.from_numpy(tgt_ga_depth).unsqueeze(0).float().to(device)
         
-        ScaleMapInterpolator = Interpolator2D(
-            pred_inv = tgt_ga_depth.squeeze().cpu().numpy(),
-            sparse_depth_inv = tgt_sparse_depth,
-            valid = input_sparse_depth_valid,
-        )
-        ScaleMapInterpolator.generate_interpolated_scale_map(
-            interpolate_method='linear', 
-            fill_corners=False
-        )
-        int_scales = ScaleMapInterpolator.interpolated_scale_map.astype(np.float32)
-        int_scales = utils.normalize_unit_range(int_scales)
-        tgt_interp = torch.from_numpy(int_scales).unsqueeze(0).float().to(device)
+        # ScaleMapInterpolator = Interpolator2D(
+        #     pred_inv = tgt_ga_depth.squeeze().cpu().numpy(),
+        #     sparse_depth_inv = tgt_sparse_depth,
+        #     valid = input_sparse_depth_valid,
+        # )
+        # ScaleMapInterpolator.generate_interpolated_scale_map(
+        #     interpolate_method='linear', 
+        #     fill_corners=False
+        # )
+        # int_scales = ScaleMapInterpolator.interpolated_scale_map.astype(np.float32)
+        # int_scales = utils.normalize_unit_range(int_scales)
+        # tgt_interp = torch.from_numpy(int_scales).unsqueeze(0).float().to(device)
         ##################################################################################
         
         ref_rel_poses = [tgt_pose.inverse() @ ref_p for ref_p in ref_pose_perturbed]
@@ -237,9 +279,10 @@ if __name__ == "__main__":
         
         refined_depth_inv, refined_ref_poses = model(tgt_img, ref_img,
                                                     tgt_ga_depth, ref_ga_depth, 
-                                                    tgt_interp, ref_interp, 
+                                                    tgt_interp, tgt_sparse_depth, 
+                                                    ref_interp, 
                                                     tgt_pose, 
-                                                    ref_rel_gtposes, 
+                                                    ref_rel_poses,
                                                     intrinsics)
         #compute consistent module
         # sml_depth_inv = model(tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, ref_img, 
@@ -330,7 +373,7 @@ if __name__ == "__main__":
             # # compute error metrics using SML output depth
             error_w_pred = metrics.ErrorMetrics()
             error_w_pred.compute(
-                estimate = refined_depth_inv[-1].cpu().detach().numpy(), 
+                estimate = refined_depth_inv[-1].cpu().detach().squeeze(0).numpy(), 
                 target = filtered_gt_depth_inv.cpu().detach().squeeze(0).numpy(), 
                 valid = mask.astype(bool),
             )

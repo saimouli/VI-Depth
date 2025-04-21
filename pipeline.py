@@ -85,7 +85,7 @@ class VIDepth(object):
             )
         return depth_pred
 
-    def run(self, input_image, input_sparse_depth, validity_map, device):
+    def run(self, input_image, input_sparse_depth, validity_map, device, ga_depth_inv=None, interp_scale=None):
 
         input_height, input_width = np.shape(input_image)[0], np.shape(input_image)[1]
         

@@ -4,7 +4,7 @@ import numpy as np
 import pipeline
 from utils_eval import compute_ls_solution
 import modules.midas.utils as utils
-from modules.interpolator import Interpolator2D
+from modules.interpolator import Interpolator2D, PolynomialInterpolator2D
 from tqdm import tqdm
 from PIL import Image
 import torch
@@ -43,21 +43,19 @@ def detect_normals(depth_image, input_sparse_depth, input_image, display=False):
 
     return normal
 
-def get_ga_and_scale(depth_pred, input_image, input_sparse_depth_inv, min_pred, max_pred):
-    input_sparse_depth_valid = (input_sparse_depth_inv < max_pred) * (input_sparse_depth_inv > min_pred)
-    input_sparse_depth_valid = input_sparse_depth_valid.astype(bool)
-    int_depth,_,_ = compute_ls_solution(depth_pred, input_sparse_depth_inv, input_sparse_depth_valid, min_pred, max_pred)
+def get_ga_and_scale(depth_pred, input_sparse_depth, input_sparse_depth_valid, min_pred, max_pred):
+    int_depth,_,_ = compute_ls_solution(depth_pred, input_sparse_depth, input_sparse_depth_valid, min_pred, max_pred)
         
     # Interpolation of scale map
     assert (np.sum(input_sparse_depth_valid) >= 3), "not enough valid sparse points"
     ScaleMapInterpolator = Interpolator2D(
         pred_inv = int_depth,
-        sparse_depth_inv = input_sparse_depth_inv,
+        sparse_depth_inv = input_sparse_depth,
         valid = input_sparse_depth_valid,
     )
     
     ScaleMapInterpolator.generate_interpolated_scale_map(
-        interpolate_method='linear',
+        interpolate_method='linear', 
         fill_corners=False
     )
     int_scales = ScaleMapInterpolator.interpolated_scale_map.astype(np.float32)
@@ -250,9 +248,9 @@ def visualize_depth_completion_process(input_image, input_sparse_depth, plane_ma
     
     plt.tight_layout()
     return fig
-
+        
 # This script is used to save ga depth, depth, and interpolated needed for training
-def save_priors(data_dir, densify=True, reduce_flag=True):
+def save_priors(data_dir):
     device = "cuda"; nsamples = 150; sml_model_path = ""
     depth_predictor = "dpt_hybrid"
     #data_dir = "/media/saimouli/RPNG_FLASH_4/datasets/VOID_150"
@@ -261,6 +259,7 @@ def save_priors(data_dir, densify=True, reduce_flag=True):
     import os
     folders = [f for f in os.listdir(data_dir) if not f.endswith('.txt')]
     print("Folder length: ", len(folders))
+
     # for each folder, read the images in image folder
     for folder in folders:
         print("Folder: ", folder)
@@ -268,24 +267,13 @@ def save_priors(data_dir, densify=True, reduce_flag=True):
         image_folder = os.path.join(data_dir, folder, "image")
         # get list of images in the image folder
         images = [f for f in os.listdir(image_folder) if f.endswith('.png')]
-        images_path = sorted([os.path.join(image_folder, f) for f in images])
+        images_path = [os.path.join(image_folder, f) for f in images]
 
         sparse_folder = os.path.join(data_dir, folder, "sparse_depth")
-        sprase_depth_path = sorted([os.path.join(sparse_folder, f) for f in images])
+        sprase_depth_path = [os.path.join(sparse_folder, f) for f in images]
 
-        normal_mask_folder = os.path.join(data_dir, folder, "normal_masks/inference")
-        # normal_masks = sorted([f for f in os.listdir(normal_mask_folder) if f.endswith('.npy') and 'masks' in f], 
-        #                     key=lambda x: int(x.split('_')[0]))
-        normal_masks = sorted([f for f in os.listdir(normal_mask_folder) if f.endswith('.npy') and 'masks' in f])
-        normal_params = sorted([f for f in os.listdir(normal_mask_folder) if f.endswith('.npy') and 'parameters' in f])
-        normal_masks = [os.path.join(normal_mask_folder, f) for f in normal_masks]
-        normal_params = [os.path.join(normal_mask_folder, f) for f in normal_params]
-
-        min_depth, max_depth = 0.1, 5.0
+        min_depth, max_depth = 0.1, 8.0
         min_pred, max_pred = 0.1, 8.0
-        
-        intrinsic_path = os.path.join(data_dir, folder, "K.txt")
-        intrinsic = np.loadtxt(intrinsic_path)
 
         # Instantiate method
         method = pipeline.VIDepth(
@@ -301,94 +289,45 @@ def save_priors(data_dir, densify=True, reduce_flag=True):
         print("Save folder: ", save_folder)
         os.makedirs(save_folder, exist_ok=True)
         save_folder = os.path.join(data_dir, folder)
-        save_folder = os.path.join(data_dir, folder)
+        save_folder = os.path.join(save_folder, "ga_depth_inv")
         os.makedirs(save_folder, exist_ok=True)
         save_folder = os.path.join(data_dir, folder)
-        save_folder = os.path.join(save_folder, "interp_scale_guided")
+        save_folder = os.path.join(save_folder, "interp_scale")
         os.makedirs(save_folder, exist_ok=True)
 
         for i in tqdm(range(len(images))):
             input_image_fp = images_path[i]
             input_sparse_depth_fp = sprase_depth_path[i]
-            input_normal_mask_fp = normal_masks[i]
-            input_normal_param_fp = normal_params[i]
             input_image = utils.read_image(input_image_fp)
             input_sparse_depth = load_sparse_depth(input_sparse_depth_fp)
-            normal_mask = np.load(input_normal_mask_fp)
-            normal_param = np.load(input_normal_param_fp)
+
             depth_infer_inv = method.infer_depth(input_image)
             input_sparse_depth_valid = (input_sparse_depth < max_depth) * (input_sparse_depth > min_depth)
 
             input_sparse_depth_valid = input_sparse_depth_valid.astype(bool)
-            #input_sparse_depth[~input_sparse_depth_valid] = np.inf # set invalid depth
-            #input_sparse_depth_inv = 1.0 / input_sparse_depth
+            input_sparse_depth[~input_sparse_depth_valid] = np.inf # set invalid depth
+            input_sparse_depth_inv = 1.0 / input_sparse_depth
 
-            ##Reduce the sparse points
-            validity_map = input_sparse_depth_valid
-            print("Before Pts: ", np.count_nonzero(validity_map))
-            if reduce_flag==True:
-                reduce_pts = int(np.count_nonzero(validity_map) * 0.80)
-                nonzero_indices = np.argwhere(validity_map == 1)
-                remove_indices = np.random.choice(len(nonzero_indices), size=reduce_pts, replace=False)
-                points_to_remove = nonzero_indices[remove_indices]
-                for x, y in points_to_remove:
-                    validity_map[x, y] = 0
-                    input_sparse_depth[x, y] = 0
+            ga_depth_inv, interp_scale = get_ga_and_scale(depth_infer_inv, input_sparse_depth_inv, 
+                                                          input_sparse_depth_valid, min_pred, max_pred )
 
-                print("After Pts: ", np.count_nonzero(validity_map))
-
-            input_sparse_depth_valid = validity_map.astype(bool)
-            # input_sparse_depth[~input_sparse_depth_valid] = np.inf
-            # input_sparse_depth_inv = 1.0 / input_sparse_depth 
-            densify_sparse_depth = input_sparse_depth
-            if densify==True:
-                densify_sparse_depth = strategic_scaffold_filling(input_sparse_depth, 
-                                                                  normal_mask, 
-                                                                  normal_param,
-                                                                  intrinsic,
-                                                                  min_points_per_plane = 2, 
-                                                                  fill_ratio=0.0005,
-                                                                  inlier_threshold=0.05,
-                                                                  edge_buffer=2)
-                validity_map = densify_sparse_depth > 0
-                input_sparse_depth_valid = validity_map.astype(bool)
-                print("After densify Pts: ", np.count_nonzero(validity_map))
-                fig = visualize_depth_completion_process(input_image, input_sparse_depth, normal_mask, normal_params, densify_sparse_depth)
-
-            densify_sparse_depth[~input_sparse_depth_valid] = np.inf
-            densify_sparse_depth_inv = 1.0 / densify_sparse_depth 
-            ga_depth_inv, interp_scale = get_ga_and_scale( depth_infer_inv, input_image, densify_sparse_depth_inv, 
-                                                          min_pred, max_pred )
-            
-            plt.figure(1);plt.imshow((input_image*255.0).astype(np.uint8))
-            #also plot sparse points on top of the input image using validity_map
-            # Get valid point coordinates from validity_map
-            valid_points = np.where(validity_map)
-            # Plot sparse points as red dots on the image
-            plt.scatter(valid_points[1], valid_points[0], c='red', s=1)
-            plt.figure(2);plt.imshow(interp_scale)
-            #also plot the distribution of interp_scale
-            plt.figure(3);plt.hist(interp_scale.flatten(), bins=100)
-            
-            normals_rel = detect_normals(depth_infer_inv, None, input_image, False)
-            fig, axes = plt.subplots(1,1, figsize=(10, 8))
-            plot_surface_normals(input_image, normals_rel, axes)
-            
-            plt.show()
+            # plt.figure(1);plt.imshow(ga_depth_inv)
+            # plt.figure(2);plt.imshow(interp_scale)
+            # plt.show()
 
             ## save the images in the respective folders
             save_image_path = os.path.join(data_dir, folder, "depth_infer_dpt", images[i])
             save_image_path = save_image_path.replace('.png', '.npy')
 
-            #save_depth_image_as_npy(depth_infer_inv, save_image_path)
+            save_depth_image_as_npy(depth_infer_inv, save_image_path)
             save_image_path = os.path.join(data_dir, folder, "ga_depth_inv", images[i])
             save_image_path = save_image_path.replace('.png', '.npy')
             #Image.fromarray(ga_depth_inv).save(save_image_path)
-            #save_depth_image_as_npy(ga_depth_inv, save_image_path)
-            save_image_path = os.path.join(data_dir, folder, "interp_scale_guided", images[i])
+            save_depth_image_as_npy(ga_depth_inv, save_image_path)
+            save_image_path = os.path.join(data_dir, folder, "interp_scale", images[i])
             save_image_path = save_image_path.replace('.png', '.npy')
             #Image.fromarray(interp_scale).save(save_image_path)
-            #save_depth_image_as_npy(interp_scale, save_image_path)
+            save_depth_image_as_npy(interp_scale, save_image_path)
 
             #depth_infer_load = load_depth_image_from_npy(save_image_path) #os.path.join(data_dir, folder, "depth_infer_dpt", images[i]))
             # if not np.array_equal(depth_infer_load, depth_infer_inv):
@@ -438,8 +377,8 @@ def create_frame_index(data_dir):
             R1, R2 = pose1[:3, :3], pose2[:3, :3]
             rot_angle = rotation_angle(R1, R2)
             
-            if pose_diff < 0.1 and rot_angle < 6:
-                continue
+            # if pose_diff < 0.1 and rot_angle < 6:
+            #     continue
             index.append(idx)
             frame_names.append(images[idx])
 
@@ -585,13 +524,12 @@ def save_init_depth(data_dir):
         # plt.show()
 
 if __name__ == "__main__":
-    data_dir = "/media/saimouli/Data6T/datasets/VOID_150_small/training" #"/media/saimouli/RPNG_FLASH_4/datasets/VOID_150/training"
-    #save_init_depth(data_dir)
+    data_dir = "/media/saimouli/Data6T/datasets/VOID_150_small/testing" #"/media/saimouli/RPNG_FLASH_4/datasets/VOID_150/training"
 
-
-    save_priors(data_dir, densify=False, reduce_flag=False)
+    save_priors(data_dir)
     #save_normals(data_dir)
     #create_frame_index(data_dir)
+    
     # import matplotlib.pyplot as plt
     # normals = np.load("/media/saimouli/Data6T/datasets/VOID_150_small/testing/copyroom4/dpt_normals/1552625608.9718.npy")
     # img = utils.read_image("/media/saimouli/Data6T/datasets/VOID_150_small/testing/copyroom4/image/1552625608.9718.png")

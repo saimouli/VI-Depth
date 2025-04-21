@@ -19,6 +19,8 @@ from torch.utils.data import Dataset
 from pytorch3d.transforms import se3_exp_map, se3_log_map
 import cv2
 from utils.camera import Camera, pose_to_se3, se3_to_pose, se3_update
+from utils_eval import compute_ls_solution
+from modules.interpolator import Interpolator2D
 
 def load_input_image(input_image_fp):
     return utils.read_image(input_image_fp)
@@ -50,6 +52,26 @@ def generate_sample_index(num_frames, skip_frames, sequence_length):
             sample_index_list.append(sample_index)
 
     return sample_index_list
+
+def get_ga_and_scale(depth_pred, input_sparse_depth, input_sparse_depth_valid, min_pred, max_pred):
+    int_depth,_,_ = compute_ls_solution(depth_pred, input_sparse_depth, input_sparse_depth_valid, min_pred, max_pred)
+        
+    # Interpolation of scale map
+    assert (np.sum(input_sparse_depth_valid) >= 3), "not enough valid sparse points"
+    ScaleMapInterpolator = Interpolator2D(
+        pred_inv = int_depth,
+        sparse_depth_inv = input_sparse_depth,
+        valid = input_sparse_depth_valid,
+    )
+    
+    ScaleMapInterpolator.generate_interpolated_scale_map(
+        interpolate_method='linear', 
+        fill_corners=False
+    )
+    int_scales = ScaleMapInterpolator.interpolated_scale_map.astype(np.float32)
+    int_scales = utils.normalize_unit_range(int_scales)
+
+    return int_depth, int_scales
 
 class SML_consistent_resize(Dataset):
     def __init__(self,
@@ -99,9 +121,9 @@ class SML_consistent_resize(Dataset):
             depth_pred = [depth_pred[d] for d in frame_index]
             
             #load normals
-            normals_path = scene / 'dpt_normals'
-            normals = sorted(normals_path.glob('*.npy'))
-            normals = [normals[d] for d in frame_index]
+            # normals_path = scene / 'dpt_normals'
+            # normals = sorted(normals_path.glob('*.npy'))
+            # normals = [normals[d] for d in frame_index]
             
             # Load ga depth inverse
             ga_depth_inv_path = scene / 'ga_depth_inv'
@@ -138,7 +160,7 @@ class SML_consistent_resize(Dataset):
                 sample = {'intrinsics': intrinsics,
                           'tgt_img': imgs[sample_index['tgt_idx']]}
                 sample['tgt_depth_pred'] = depth_pred[sample_index['tgt_idx']]
-                sample['tgt_normal'] = normals[sample_index['tgt_idx']]
+                #sample['tgt_normal'] = normals[sample_index['tgt_idx']]
                 sample['tgt_ga_depth'] = ga_depth_inv[sample_index['tgt_idx']]
                 sample['tgt_gt_depth'] = gt_depth[sample_index['tgt_idx']]
                 sample['tgt_pose'] = poses[sample_index['tgt_idx']]
@@ -291,13 +313,14 @@ class SML_consistent_resize(Dataset):
         
         # Load target data
         tgt_img = load_input_image(str(sample['tgt_img']))
+        tgt_path = str(sample['tgt_img'])
         tgt_gt_depth = load_sparse_depth(str(sample['tgt_gt_depth']), depth_scale=self.depth_scale)
         tgt_sparse_depth = load_sparse_depth(str(sample['tgt_sparse_depth']), depth_scale=self.depth_scale)
         tgt_ga_depth = load_depth_image_from_npy(str(sample['tgt_ga_depth']))
         tgt_interp = load_depth_image_from_npy(str(sample['tgt_interp']))
         tgt_pose = self.convert_to_4x4(np.loadtxt(str(sample['tgt_pose'])))
         tgt_depth_pred = load_depth_image_from_npy(str(sample['tgt_depth_pred']))
-        tgt_normal = load_depth_image_from_npy(str(sample['tgt_normal']))
+        #tgt_normal = load_depth_image_from_npy(str(sample['tgt_normal']))
         
         # Load reference data
         ref_img = [load_input_image(str(ref_img)) for ref_img in sample['ref_imgs']]
@@ -387,7 +410,7 @@ class SML_consistent_resize(Dataset):
             tgt_img_resized, tgt_gt_depth_inv_resized, tgt_ga_depth_resized, tgt_interp_resized,
             tgt_sparse_depth_resized, ref_img_resized, ref_ga_depth_tensor, ref_interp_tensor,
             ref_gt_depth_tensor, ref_sparse_depth_tensor, tgt_pose, ref_pose,
-            intrinsics, tgt_pose_perturbed, ref_pose_perturbed, tgt_depth_pred_resized
+            intrinsics, tgt_pose_perturbed, ref_pose_perturbed, tgt_depth_pred_resized, tgt_path
         )
     
     def __len__(self):
