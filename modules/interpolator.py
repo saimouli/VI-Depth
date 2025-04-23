@@ -220,3 +220,32 @@ class Interpolator2D(object):
             interpolate=interpolate_method,
             fill_corners=fill_corners
         ).astype(np.float32)
+
+class Interpolator2DWithUncertainty(Interpolator2D):
+    def __init__(self, ga_depth_inv, sparse_inv, valid, var_m):
+        super().__init__(pred_inv=ga_depth_inv,
+                         sparse_depth_inv=sparse_inv,
+                         valid=valid)
+        #compute per-knot variance of scale = (1/d_m)/(1/p)
+        # Var(1/d_m) ≈ Var(d_m)/d_m^4
+        var_inv = var_m[valid] / (sparse_inv[valid]**4)
+        # and Var(scale_i) = Var(1/d_m)/(1/p)^2
+        self.knot_vars = var_inv / (ga_depth_inv[valid]**2)
+    
+    def generate_interpolated_scale_map(self, interpolate_method, fill_corners=False):
+        # Call the parent method to generate the scale map
+        super().generate_interpolated_scale_map(interpolate_method, fill_corners)
+        self.interpolated_scale_map = self.interpolated_scale_map.astype(np.float32)
+        # now build a var_map the same way, using griddata on self.knot_vars
+    
+        coords = self.knot_coords.T
+        grid_x, grid_y = np.mgrid[0:self.map_size[0], 0:self.map_size[1]]
+        var_map = griddata(
+            points=coords,
+            values=self.knot_vars,
+            xi=(grid_x, grid_y),
+            method=interpolate_method,
+            fill_value=np.max(self.knot_vars)
+        ).astype(np.float32)
+        self.var_map = var_map
+        return self.interpolated_scale_map, self.var_map

@@ -20,7 +20,8 @@ class midasNetConsistentModule(pl.LightningModule):
     def __init__(self, lr: float = 0.1, wd: float = 0.1, min_pred: float = 0.1, 
                  max_pred: float = 8.0, min_depth: float = 0.2, 
                  max_depth: float = 5.0, nsamples: int = 150, img_h=480, 
-                 img_w=640, sml_model_path: str = None, useConvGRU: bool = True, is_train: bool = True,
+                 img_w=640, sml_model_path: str = None, useConvGRU: bool = True, 
+                 is_train: bool = True, do_scale_uncer: bool = False,
                  *args: Any, **kwargs: Any) -> None:
         super(midasNetConsistentModule, self).__init__(*args, **kwargs)
         self.model = midasConsNet(min_pred, max_pred, min_depth, max_depth, nsamples, 
@@ -35,6 +36,8 @@ class midasNetConsistentModule(pl.LightningModule):
         self.orig_w = img_w
         self.abs_loss = nn.L1Loss()
         self.useConvGRU = useConvGRU
+        self.do_scale_uncer = do_scale_uncer
+        
 
     def on_fit_start(self):
         """Ensure that metric averaging uses the correct device after model initialization."""
@@ -54,7 +57,7 @@ class midasNetConsistentModule(pl.LightningModule):
     def forward(self, tgt_img, ref_img,tgt_ga_depth, 
                 ref_ga_depth, tgt_interp, tgt_sparse_depth, 
                 ref_interp, tgt_pose, 
-                ref_pose, intrinsics):
+                ref_pose, intrinsics, tgt_scale_uncer, do_scale_uncer=False):
         refined_depth_inv, refined_ref_poses = self.model(tgt_img, ref_img,
                                                             tgt_ga_depth, ref_ga_depth, 
                                                             tgt_interp, tgt_sparse_depth, 
@@ -64,7 +67,10 @@ class midasNetConsistentModule(pl.LightningModule):
                                                             intrinsics,
                                                             None,
                                                             None, 
-                                                            self.global_step)
+                                                            self.global_step,
+                                                            tgt_scale_uncer,
+                                                            do_scale_uncer=do_scale_uncer,
+                                                            )
 
         return refined_depth_inv,refined_ref_poses 
     
@@ -562,7 +568,7 @@ class midasNetConsistentModule(pl.LightningModule):
         #input_sparse_depth, input_image, rel_depth_pred, depth_gt, validity_map = batch
         tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, tgt_sparse_depth, ref_imgs, \
         ref_ga_depth, ref_interp, _, _, tgt_pose, ref_gt_pose, intrinsics, \
-            tgt_pose_perturbed, ref_pose_perturbed, tgt_depth_pred,_ = batch
+            tgt_pose_perturbed, ref_pose_perturbed, tgt_depth_pred,_, tgt_scale_uncer = batch
         
         gt_depth = utils.inv2depth(tgt_gt_depth_inv)
         
@@ -605,7 +611,9 @@ class midasNetConsistentModule(pl.LightningModule):
                                                             intrinsics,
                                                             None,
                                                             tgt_depth_pred,
-                                                            self.global_step)
+                                                            self.global_step,
+                                                            tgt_scale_uncer,
+                                                            do_scale_uncer=self.do_scale_uncer)
             
         # elif self.current_epoch < 30:
         #     self.model.iter_steps=3

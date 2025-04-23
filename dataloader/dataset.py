@@ -60,6 +60,7 @@ class SMLDataConsistentModule(pl.LightningDataModule):
             img_size: Tuple = (480, 640),
             batch_size: int = 12,
             num_workers: int = 3,
+            add_noise: bool = False,
     ):
         super().__init__()
         self.img_size = img_size
@@ -67,6 +68,7 @@ class SMLDataConsistentModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.sequence_length = sequence_length
         self.data_root = data_root
+        self.add_noise = add_noise
         #self.data_train = os.path.join(data_root, 'training')
         #self.data_val = os.path.join(data_root, 'testing')
 
@@ -75,12 +77,14 @@ class SMLDataConsistentModule(pl.LightningDataModule):
             self.train_dataset = SML_consistent_dataset(
                 self.data_root,
                 mode="train",
-                sequence_length=self.sequence_length
+                sequence_length=self.sequence_length,
+                add_noise=self.add_noise
             )
             self.test_dataset = SML_consistent_dataset(
                 self.data_root,
                 mode="val",
-                sequence_length=self.sequence_length
+                sequence_length=self.sequence_length,
+                add_noise=self.add_noise
             )
     def train_dataloader(self):
         return DataLoader(
