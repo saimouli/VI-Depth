@@ -20,7 +20,7 @@ from pytorch3d.transforms import se3_exp_map, se3_log_map
 import cv2
 from utils.camera import Camera, pose_to_se3, se3_to_pose, se3_update
 from utils_eval import compute_ls_solution
-from modules.interpolator import Interpolator2D
+from modules.interpolator import Interpolator2D, Interpolator2DWithUncertainty
 
 def load_input_image(input_image_fp):
     return utils.read_image(input_image_fp)
@@ -79,9 +79,11 @@ class SML_consistent_resize(Dataset):
                  mode="train",
                  sequence_length=3,
                  depth_scale=256.0,
+                 add_noise=False,
                 ):
         #self.root = Path(root)/'training'
         self.root = Path(data_root)
+        self.add_noise = add_noise
         print("Root: ", self.root)
         self.depth_scale = depth_scale
         self.target_height = 288
@@ -308,6 +310,139 @@ class SML_consistent_resize(Dataset):
         
         return perturbed_mat
     
+    def backproject_sparse(self, d_m, valid, fx, fy, cx, cy):
+            ys, xs = np.nonzero(valid)
+            Z = d_m[ys, xs]
+            X = (xs - cx)/fx * Z
+            Y = (ys - cy)/fy * Z
+            X_means = np.stack([X, Y, Z], axis=1)
+            coords = list(zip(ys, xs))
+            return X_means, coords
+
+    def simulate_vio_analytic(self, X_means, Sigmas, coords, shape): #(N,3) proj. points, Sigmas (N,3,3)
+        """
+        For each sparse point i:
+        - True depth = Z_i
+        - Depth variance     = Σ_i[2,2]
+        - Inject one zero‑mean sample n ~ N(0, Σ_i[2,2])
+        - New depth = Z_i + n
+        Returns
+        - d_m_noisy: noisy depth
+        - var_m: depth variance
+        """
+        H, W = shape  # Use the provided shape
+        
+        d_m_noisy = np.zeros((H,W), dtype=np.float32)
+        var_m = np.zeros((H,W), dtype=np.float32)
+        
+        for i, (y,x) in enumerate(coords):
+            Z = X_means[i,2]
+            sigma2_z = Sigmas[i,2,2] # variance of Z
+            noise = np.random.normal(0, np.sqrt(sigma2_z))
+            d_m_noisy[y,x] = Z + noise
+            var_m[y,x] = sigma2_z
+        
+        return d_m_noisy, var_m
+    
+    def ls_without_uncertainty(self, d_r, d_m, valid, min_pred, max_pred):
+        """
+        Ordinary (un-weighted) least-squares fit of scale s and offset b:
+        minimize  ∑_i (s·d_r[i] + b − d_m[i])²
+        over all valid i.
+        
+        Returns:
+        aligned : H×W float32 = s·d_r + b  (clamped)
+        (s, b)  : the fitted scale and offset
+        """
+        # extract only the valid knots
+        dr = d_r[valid].astype(np.float64)
+        dm = d_m[valid].astype(np.float64)
+
+        # build normal equations with w_i = 1
+        A00 = np.sum(dr * dr)
+        A01 = np.sum(dr)
+        A11 = dr.shape[0]            # = ∑ 1
+
+        b0  = np.sum(dr * dm)
+        b1  = np.sum(dm)
+
+        A = np.array([[A00, A01],
+                    [A01, A11]], dtype=np.float64)
+        B = np.array([b0, b1],       dtype=np.float64)
+
+        # solve for s,b
+        invA = np.linalg.inv(A)
+        s, b = invA.dot(B)
+
+        # apply and clamp
+        aligned = (d_r * s + b).astype(np.float32)
+        if min_pred is not None:
+            aligned[aligned > 1.0/min_pred] = 1.0/min_pred
+        if max_pred is not None:
+            aligned[aligned < 1.0/max_pred] = 1.0/max_pred
+
+        return aligned, (s, b)
+
+    def create_vio_noise_model(self, X_means, randomize=True):
+        Zs = X_means[:, 2]
+        
+        if randomize:
+            noise_type = np.random.choice(['linear', 'quadratic', 'constant'])
+            
+            if noise_type == 'linear':
+                # Linear noise model: alpha * Z
+                alpha = np.random.uniform(0.01, 0.06)  # 1-5% of depth
+                min_noise = np.random.uniform(0.005, 0.02)  # 0.5-2cm minimum
+                max_noise = np.random.uniform(0.02, 0.06)  # 2-5cm maximum
+                sigma_zs = np.clip(alpha * Zs, min_noise, max_noise)
+            elif noise_type == 'quadratic':
+                # Quadratic noise model: alpha * Z^2
+                alpha = np.random.uniform(0.005, 0.025)  # Smaller alpha for quadratic
+                min_noise = np.random.uniform(0.005, 0.02)
+                max_noise = np.random.uniform(0.08, 0.15)
+                sigma_zs = np.clip(alpha * Zs**2, min_noise, max_noise)
+            else:
+                sigma_zs = np.ones_like(Zs) * np.random.uniform(0.02, 0.06)
+
+            # Randomly add outliers (5% chance)
+            if np.random.random() < 0.5:  # 50% chance to add outliers
+                outlier_ratio = np.random.uniform(0.01, 0.08)  # 1-8% outliers
+                outlier_mask = np.random.random(Zs.shape) < outlier_ratio
+                outlier_scale = np.random.uniform(2.0, 5.0)  # 2-5x normal noise
+                sigma_zs[outlier_mask] *= outlier_scale
+        else:
+            # Default deterministic noise model for inference
+            alpha = 0.02  # 2 cm of noise at 1 m, 4 cm at 2 m, etc.
+            sigma_zs = np.clip(alpha * Zs, 0.01, 0.10)  # 1-10cm noise
+        
+        # Create covariance matrices (no noise in x,y directions)
+        sigma_xs = np.full_like(sigma_zs, 0.001)
+        sigma_ys = np.full_like(sigma_zs, 0.001)
+        
+        Sigmas = np.array([
+            np.diag([sx*sx, sy*sy, sz*sz])
+            for sx, sy, sz in zip(sigma_xs, sigma_ys, sigma_zs)
+        ])
+        
+        return Sigmas
+    
+    def get_ga_scale_uncertainity(self, depth_pred_inv, input_sparse_depth_inv, var_m, valid, min_pred, max_pred):
+        
+        # aligned_depth_inv, _, var_map = weighted_ls_with_uncertainity(depth_pred_inv, input_sparse_depth_inv, 
+        #                                                     var_m, valid, min_pred, max_pred)
+        
+        aligned_depth_inv, _ = self.ls_without_uncertainty(depth_pred_inv, input_sparse_depth_inv, 
+                                                    valid, min_pred, max_pred)
+        
+        assert (np.sum(valid) >= 3), "not enough valid sparse points"
+        interpolator = Interpolator2DWithUncertainty(aligned_depth_inv, input_sparse_depth_inv, valid, var_m)
+        scale_map, uncertainty_map = interpolator.generate_interpolated_scale_map('linear')
+        
+        int_scales = utils.normalize_unit_range(scale_map)
+        
+        
+        return aligned_depth_inv, int_scales, uncertainty_map
+    
     def __getitem__(self, index):
         sample = self.samples[index]
         
@@ -387,6 +522,14 @@ class SML_consistent_resize(Dataset):
         ref_gt_depth_tensor = [depth for depth in ref_gt_depth_resized]
         
         tgt_gt_depth_inv_resized = torch.from_numpy(tgt_gt_depth_inv_resized).unsqueeze(0)
+        
+        h, w = tgt_interp_resized.shape[:2]
+        tgt_scale_uncertainty = torch.zeros((1, h, w), dtype=torch.float32)
+        
+        if self.add_noise:
+            fx, fy, cx, cy = intrinsics[0, 0], intrinsics[1, 1], intrinsics[0, 2], intrinsics[1, 2]
+            
+        
         
         tgt_img_resized, tgt_gt_depth_inv_resized, tgt_ga_depth_resized, tgt_sparse_depth_resized, tgt_interp_resized, tgt_pose = [
             T.astype(np.float32) if isinstance(T, np.ndarray) else T for T in [

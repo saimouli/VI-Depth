@@ -1038,7 +1038,7 @@ class midasConsNet(nn.Module):
         #self.fnet = ResNetEncoder(out_chs=self.cost_dim, stride=4)
         #self.fnet_midas = MidasNet_small_cons_videpth(features=32, in_channels=3)
         #self.cnet_depth_affinity = ResNetEncoder(out_chs=self.hidden_dim + self.cost_dim-1, stride=4, context_num=1, pretrained=False)
-        self.cnet_depth = ResNetEncoder_orig(out_chs=self.hidden_dim + self.cost_dim, stride=4, context_num=2, pretrained=False)
+        self.cnet_depth = ResNetEncoder_orig(out_chs=self.hidden_dim + self.cost_dim, stride=4, pretrained=True)
         self.cnet_depth_uncer = ResNetEncoder_orig(out_chs=self.hidden_dim + self.cost_dim, stride=4, pretrained=True)
         
         #self.upsample_1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
@@ -1545,7 +1545,7 @@ class midasConsNet(nn.Module):
             inv_depth_pred = init_metric_depth_inv * delta_scales
         
         else:
-            context_test = torch.cat([int_depth_pre, int_interp_pre], dim=1)
+            context_test = torch.cat([int_depth_pre, int_interp_pre, int_interp_pre], dim=1)
             # context = torch.cat([int_depth_pre, scale_scaffolding], dim=1)
             context = self.cnet_depth(context_test)
             scale_map = self.scaleOutput(context)

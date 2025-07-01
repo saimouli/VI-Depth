@@ -102,9 +102,9 @@ class SML_consistent_dataset(Dataset):
             depth_pred = [depth_pred[d] for d in frame_index]
             
             #load normals
-            normals_path = scene / 'dpt_normals'
-            normals = sorted(normals_path.glob('*.npy'))
-            normals = [normals[d] for d in frame_index]
+            #normals_path = scene / 'dpt_normals'
+            #normals = sorted(normals_path.glob('*.npy'))
+            #normals = [normals[d] for d in frame_index]
             
             # Load ga depth inverse
             ga_depth_inv_path = scene / 'ga_depth_inv'
@@ -141,7 +141,7 @@ class SML_consistent_dataset(Dataset):
                 sample = {'intrinsics': intrinsics,
                           'tgt_img': imgs[sample_index['tgt_idx']]}
                 sample['tgt_depth_pred'] = depth_pred[sample_index['tgt_idx']]
-                sample['tgt_normal'] = normals[sample_index['tgt_idx']]
+                #sample['tgt_normal'] = normals[sample_index['tgt_idx']]
                 sample['tgt_ga_depth'] = ga_depth_inv[sample_index['tgt_idx']]
                 sample['tgt_gt_depth'] = gt_depth[sample_index['tgt_idx']]
                 sample['tgt_pose'] = poses[sample_index['tgt_idx']]
@@ -309,28 +309,32 @@ class SML_consistent_dataset(Dataset):
             if noise_type == 'linear':
                 # Linear noise model: alpha * Z
                 alpha = np.random.uniform(0.01, 0.06)  # 1-5% of depth
-                min_noise = np.random.uniform(0.005, 0.02)  # 0.5-2cm minimum
-                max_noise = np.random.uniform(0.02, 0.06)  # 2-5cm maximum
-                sigma_zs = np.clip(alpha * Zs, min_noise, max_noise)
+                #min_noise = np.random.uniform(0.005, 0.02)  # 0.5-2cm minimum
+                #max_noise = np.random.uniform(0.02, 0.06)  # 2-5cm maximum
+                sigma_zs   = alpha * Zs
+                sigma_zs   = np.clip(sigma_zs, 0.005, 0.15)
             elif noise_type == 'quadratic':
                 # Quadratic noise model: alpha * Z^2
                 alpha = np.random.uniform(0.005, 0.025)  # Smaller alpha for quadratic
-                min_noise = np.random.uniform(0.005, 0.02)
-                max_noise = np.random.uniform(0.08, 0.15)
-                sigma_zs = np.clip(alpha * Zs**2, min_noise, max_noise)
+                #min_noise = np.random.uniform(0.005, 0.02)
+                #max_noise = np.random.uniform(0.08, 0.15)
+                sigma_zs   = alpha * (Zs**2)
+                sigma_zs   = np.clip(sigma_zs, 0.005, 0.15)
             else:
-                sigma_zs = np.ones_like(Zs) * np.random.uniform(0.02, 0.06)
+                sigma_zs   = np.random.uniform(0.02, 0.06, size=Zs.shape)
 
             # Randomly add outliers (5% chance)
-            if np.random.random() < 0.5:  # 50% chance to add outliers
-                outlier_ratio = np.random.uniform(0.01, 0.08)  # 1-8% outliers
-                outlier_mask = np.random.random(Zs.shape) < outlier_ratio
-                outlier_scale = np.random.uniform(2.0, 5.0)  # 2-5x normal noise
-                sigma_zs[outlier_mask] *= outlier_scale
+            if np.random.random() < 0.1:  # 50% chance to add outliers
+                mask       = np.random.rand(*Zs.shape) < np.random.uniform(0.01,0.05)
+                sigma_zs[mask] *= np.random.uniform(2.0,4.0)
+                #outlier_ratio = np.random.uniform(0.01, 0.08)  # 1-8% outliers
+                #outlier_mask = np.random.random(Zs.shape) < outlier_ratio
+                #outlier_scale = np.random.uniform(2.0, 5.0)  # 2-5x normal noise
+                #sigma_zs[outlier_mask] *= outlier_scale
         else:
             # Default deterministic noise model for inference
-            alpha = 0.02  # 2 cm of noise at 1 m, 4 cm at 2 m, etc.
-            sigma_zs = np.clip(alpha * Zs, 0.01, 0.10)  # 1-10cm noise
+            alpha = 0.0  # 2 cm of noise at 1 m, 4 cm at 2 m, etc.
+            sigma_zs = np.clip(alpha * Zs, 0.0, 0.0)  # 0-7cm noise
         
         # Create covariance matrices (no noise in x,y directions)
         sigma_xs = np.full_like(sigma_zs, 0.001)
@@ -368,7 +372,7 @@ class SML_consistent_dataset(Dataset):
         tgt_sparse_depth = load_sparse_depth(str(sample['tgt_sparse_depth']), depth_scale=self.depth_scale)
         tgt_ga_depth = load_depth_image_from_npy(str(sample['tgt_ga_depth']))
         tgt_interp = load_depth_image_from_npy(str(sample['tgt_interp']))
-        tgt_pose = self.convert_to_4x4(np.loadtxt(str(sample['tgt_pose'])))
+        tgt_pose = self.convert_to_4x4(np.loadtxt(str(sample['tgt_pose']))) #(R_ctoG, p_CinG)
         tgt_depth_pred = load_depth_image_from_npy(str(sample['tgt_depth_pred']))
         #tgt_normal = load_depth_image_from_npy(str(sample['tgt_normal']))
         
@@ -399,7 +403,7 @@ class SML_consistent_dataset(Dataset):
             X_means, coords = self.backproject_sparse(tgt_sparse_depth, validity_map_bool, fx, fy, cx, cy)
         
             # Create noise model with randomization during training
-            Sigmas = self.create_vio_noise_model(X_means, randomize=self.mode == "train")
+            Sigmas = self.create_vio_noise_model(X_means, randomize=False)
         
             # Simulate noisy sparse depths + variance
             d_m_noisy, var_m = self.simulate_vio_analytic(X_means, Sigmas, coords, tgt_sparse_depth.shape)

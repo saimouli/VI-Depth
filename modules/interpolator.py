@@ -201,7 +201,6 @@ class Interpolator2D(object):
         nonzero_x_loc = np.nonzero(valid)[1]
         self.knot_coords = np.stack((nonzero_x_loc, nonzero_y_loc))
         self.knot_scales = sparse_depth_inv[valid] / pred_inv[valid]
-        self.knot_shifts = sparse_depth_inv[valid] - pred_inv[valid]
 
         self.knot_list = []
         for i in range(self.num_knots):

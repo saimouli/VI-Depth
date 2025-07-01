@@ -377,8 +377,8 @@ def create_frame_index(data_dir):
             R1, R2 = pose1[:3, :3], pose2[:3, :3]
             rot_angle = rotation_angle(R1, R2)
             
-            # if pose_diff < 0.1 and rot_angle < 6:
-            #     continue
+            if pose_diff < 0.05: # and rot_angle < 6:
+                continue
             index.append(idx)
             frame_names.append(images[idx])
 
@@ -526,9 +526,9 @@ def save_init_depth(data_dir):
 if __name__ == "__main__":
     data_dir = "/media/saimouli/Data6T/datasets/VOID_150_small/testing" #"/media/saimouli/RPNG_FLASH_4/datasets/VOID_150/training"
 
-    save_priors(data_dir)
+    #save_priors(data_dir)
     #save_normals(data_dir)
-    #create_frame_index(data_dir)
+    create_frame_index(data_dir)
     
     # import matplotlib.pyplot as plt
     # normals = np.load("/media/saimouli/Data6T/datasets/VOID_150_small/testing/copyroom4/dpt_normals/1552625608.9718.npy")

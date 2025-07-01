@@ -537,11 +537,11 @@ def evaluate_sml(dataset_path, depth_predictor, nsamples, sml_model_path):
     avg_error_w_int_depth = metrics.ErrorMetricsAverager()
     avg_error_w_pred = metrics.ErrorMetricsAverager()
     
-    dataset = SML_dataset(data_root='/media/saimouli/Data6T/datasets/VOID_150/testing', mode='val')
+    dataset = SML_dataset(data_root=dataset_path, mode='val')
     dataloader = torch.utils.data.DataLoader(dataset)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    model = midasNetModule().load_from_checkpoint("weights/total_loss=0.095.ckpt")
+    model = midasNetModule().load_from_checkpoint(sml_model_path)
     #model.load_from_checkpoint("/home/sai/Documents/VI-Depth/weights/total_loss=0.105.ckpt")
     model.eval()
     model.to(device)
@@ -615,7 +615,7 @@ if __name__=="__main__":
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('-ds', '--dataset-path', type=str, default='/media/saimouli/Data6T/datasets/VOID_150_test/testing',
+    parser.add_argument('-ds', '--dataset-path', type=str, default='/media/saimouli/Data6T/datasets/void_150/testing',
                         help='Path to VOID release dataset.')
     parser.add_argument('-dp', '--depth-predictor', type=str, default='dpt_hybrid', 
                         help='Name of depth predictor to use in pipeline.')
@@ -627,16 +627,16 @@ if __name__=="__main__":
     args = parser.parse_args()
     print(args)
     
-    evaluate(
-        args.dataset_path,
-        args.depth_predictor, 
-        args.nsamples, 
-        args.sml_model_path,
-        add_sparse_points=False,
-        sparse_point_percentage=50,
-        add_noise=False,
-        noise_sigma=0.04 # 4cm
-    )
+    # evaluate(
+    #     args.dataset_path,
+    #     args.depth_predictor, 
+    #     args.nsamples, 
+    #     args.sml_model_path,
+    #     add_sparse_points=False,
+    #     sparse_point_percentage=50,
+    #     add_noise=False,
+    #     noise_sigma=0.00 # 4cm
+    # )
     
     # evaluate_ddp(
     #     args.dataset_path,
@@ -648,12 +648,12 @@ if __name__=="__main__":
     #     world_size=1,
     # )
     
-    # evaluate_sml(
-    #     args.dataset_path,
-    #     args.depth_predictor,
-    #     args.nsamples,
-    #     args.sml_model_path,
-    # )
+    evaluate_sml(
+        args.dataset_path,
+        args.depth_predictor,
+        args.nsamples,
+        args.sml_model_path,
+    )
 
     # to test on classroom
     #python3 evaluate.py -ds "/media/saimouli/RPNG_FLASH_4/data/VOID_small/classroom6" -sm /home/saimouli/Documents/github/VI_Depth_sai/weights/sml_model.dpredictor.midas_small.nsamples.150.ckpt
