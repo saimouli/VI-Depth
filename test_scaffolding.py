@@ -415,8 +415,8 @@ def plot_surface_normals(rgb_image, normals, ax, scale=5):
     ax.imshow(rgb_image)
 
     # Plot surface normals as arrows
-    for y in range(0, normals.shape[0], 5):
-        for x in range(0, normals.shape[1], 5):
+    for y in range(0, normals.shape[0], 10):
+        for x in range(0, normals.shape[1], 10):
             if np.isnan(normals[y, x]).any():
                 continue
             ax.arrow(x, y, normals[y, x, 0] * scale, normals[y, x, 1] * scale,
