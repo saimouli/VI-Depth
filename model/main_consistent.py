@@ -20,12 +20,14 @@ class midasNetConsistentModule(pl.LightningModule):
     def __init__(self, lr: float = 0.1, wd: float = 0.1, min_pred: float = 0.1, 
                  max_pred: float = 8.0, min_depth: float = 0.2, 
                  max_depth: float = 5.0, nsamples: int = 150, img_h=480, 
-                 img_w=640, sml_model_path: str = None, useConvGRU: bool = True, is_train: bool = False,
+                 img_w=640, sml_model_path: str = None, useConvGRU: bool = True, is_train: bool = True,
                  *args: Any, **kwargs: Any) -> None:
         super(midasNetConsistentModule, self).__init__(*args, **kwargs)
         self.model = midasConsNet(min_pred, max_pred, min_depth, max_depth, nsamples, 
                                   sml_model_path, is_train=is_train, log_fn=self.log, isConvGRU=useConvGRU)
         #print model params
+        print("useConvGRU: ", useConvGRU)
+        print("is_train: ", is_train)
         print("Model Parameters: ", sum(p.numel() for p in self.model.parameters() if p.requires_grad))
         self.lr = lr
         self.max_depth = max_depth
@@ -458,7 +460,7 @@ class midasNetConsistentModule(pl.LightningModule):
         #input_sparse_depth, input_image, rel_depth_pred, depth_gt, validity_map = batch
         tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp,_, ref_imgs, \
         ref_ga_depth, ref_interp, _, _, tgt_pose, ref_gt_pose, intrinsics, \
-            tgt_pose_perturbed, ref_pose_perturbed = batch
+            tgt_pose_perturbed, ref_pose_perturbed,_ = batch
         
         gt_depth = utils.inv2depth(tgt_gt_depth_inv)
         
