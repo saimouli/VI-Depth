@@ -52,8 +52,7 @@ def generate_sample_index(num_frames, skip_frames, sequence_length):
 
     return sample_index_list
 
-
-class SML_consistent_dataset(Dataset):
+class SML_consistent_dataset_tartan(Dataset):
     def __init__(self,
                  data_root,
                  mode="train",
@@ -85,8 +84,11 @@ class SML_consistent_dataset(Dataset):
         sequence_set = []
 
         for scene in self.scenes:
-            intrinsics = np.genfromtxt(
-                scene/'K.txt').astype(np.float32).reshape((3, 3))
+            intrinsics = np.array([
+                [320,   0, 320],
+                [  0, 320, 240],
+                [  0,   0,   1]
+            ], dtype=np.float32)
 
             # Load image paths
             images_path = scene / 'image'
@@ -164,6 +166,7 @@ class SML_consistent_dataset(Dataset):
                 sequence_set.append(sample)
 
         self.samples = sequence_set
+            
     
     def convert_to_4x4(self, pose):
         if pose.shape == (3, 4):
@@ -343,23 +346,6 @@ class SML_consistent_dataset(Dataset):
         
         return Sigmas
 
-    def get_ga_scale_uncertainity(self, depth_pred_inv, input_sparse_depth_inv, var_m, valid, min_pred, max_pred):
-        
-        # aligned_depth_inv, _, var_map = weighted_ls_with_uncertainity(depth_pred_inv, input_sparse_depth_inv, 
-        #                                                     var_m, valid, min_pred, max_pred)
-        
-        aligned_depth_inv, _ = self.ls_without_uncertainty(depth_pred_inv, input_sparse_depth_inv, 
-                                                    valid, min_pred, max_pred)
-        
-        assert (np.sum(valid) >= 3), "not enough valid sparse points"
-        interpolator = Interpolator2DWithUncertainty(aligned_depth_inv, input_sparse_depth_inv, valid, var_m)
-        scale_map, uncertainty_map = interpolator.generate_interpolated_scale_map('linear')
-        
-        int_scales = utils.normalize_unit_range(scale_map)
-        
-        
-        return aligned_depth_inv, int_scales, uncertainty_map
-
     def __getitem__(self, index):
         sample = self.samples[index]
         tgt_img = load_input_image(str(sample['tgt_img']))
@@ -405,7 +391,7 @@ class SML_consistent_dataset(Dataset):
             d_m_noisy, var_m = self.simulate_vio_analytic(X_means, Sigmas, coords, tgt_sparse_depth.shape)
         
             # Apply noise to sparse depths
-            d_m_noisy[~input_sparse_depth_valid] = np.inf
+            #d_m_noisy[~input_sparse_depth_valid] = np.inf
             noisy_sparse_depth_inv = 1.0 / d_m_noisy
             
             tgt_ga_depth, tgt_interp, uncertainity_map = self.get_ga_scale_uncertainity(
@@ -414,9 +400,9 @@ class SML_consistent_dataset(Dataset):
                 var_m,
                 input_sparse_depth_valid,
                 0.1,
-                8.0
+                5.0
             )
-            uncertainity_map = np.log(1 + uncertainity_map)  # Compress dynamic range
+            #uncertainity_map = np.log(1 + uncertainity_map)  # Compress dynamic range
             tgt_scale_uncertainty = torch.from_numpy(uncertainity_map).unsqueeze(0).float()
         
         
@@ -480,7 +466,7 @@ class SML_consistent_dataset(Dataset):
         #img, gt_depth, ga_depth, interp_scale
         return tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, tgt_sparse_depth, ref_img, \
             ref_ga_depth, ref_interp, ref_gt_depth, ref_sparse_depth, tgt_pose, ref_pose, intrinsics, \
-            tgt_pose_perturbed, ref_pose_perturbed, tgt_depth_pred, tgt_path, tgt_scale_uncertainty #, tgt_normal
+            tgt_pose_perturbed, ref_pose_perturbed, tgt_depth_pred, tgt_path, tgt_scale_uncertainty
     
     def __len__(self):
         return len(self.samples)
@@ -488,15 +474,43 @@ class SML_consistent_dataset(Dataset):
 
 # if __name__ == "__main__":
 #     #dataset = SML_consistent_dataset(data_root='/media/saimouli/Data6T/datasets/VOID_150_test', mode='val', sequence_length=3)
-#     dataset = torch.utils.data.DataLoader(SML_consistent_dataset(data_root='/media/saimouli/Data6T/datasets/VOID_150_test', mode='val'))
+#     dataset = torch.utils.data.DataLoader(SML_consistent_dataset_tartan(data_root='/media/sai/External HDD1/sai/datasets/tartan/data/VI_depth', mode='val'))
 #     # rr.init("3d_points_visualization", spawn=True)
 
 #     #for idx in range(len(dataset)):
 #     for batch_data in dataset:
 #         tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, _, ref_imgs, \
 #         ref_ga_depth, ref_interp, ref_gt_depth, _, tgt_pose, ref_pose, intrinsics, \
-#             tgt_pose_per,ref_pose_per = batch_data #dataset[idx] #Cam2Wld poses (R_ctoG, p_CinG)
+#             tgt_pose_per,ref_pose_per, _, _, _ = batch_data #dataset[idx] #Cam2Wld poses (R_ctoG, p_CinG)
+        
+#         #visualize tgt image, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp
+#         tgt_img_disp = tgt_img[0] 
+        
+#         plt.figure(figsize=(12, 8))
+#         plt.subplot(2, 2, 1)
+#         plt.imshow(tgt_img_disp)
+#         plt.title("Target Image")
+#         plt.axis("off")
 
+#         plt.subplot(2, 2, 2)
+#         plt.imshow(1.0/(tgt_gt_depth_inv[0][0]), cmap='plasma', vmin=0, vmax=5.0)
+#         plt.title("GT Depth")
+#         plt.axis("off")
+
+#         plt.subplot(2, 2, 3)
+#         plt.imshow(1.0/(tgt_ga_depth[0]))
+#         plt.title("GA Depth")
+#         plt.axis("off")
+
+#         plt.subplot(2, 2, 4)
+#         plt.imshow(tgt_interp[0])
+#         plt.title("Interpolated Scale")
+#         plt.axis("off")
+
+#         plt.tight_layout()
+#         plt.show()
+        
+        
 #         B, H, W,_ = tgt_img.shape
 #         _, _, DH, DW = tgt_gt_depth_inv.shape
 #         scale_factor = DW / float(W)

@@ -16,7 +16,7 @@ from model.main_consistent import midasNetConsistentModule
 from data.SML_consistent_resize import SML_consistent_resize
 from torch.nn import functional as F
 import modules.midas.transforms as transforms
-from test_scaffolding import plot_surface_normals
+#from test_scaffolding import plot_surface_normals
 
 def load_sparse_depth(input_sparse_depth_fp):
     input_sparse_depth = np.array(Image.open(input_sparse_depth_fp), dtype=np.float32) / 256.0
@@ -272,8 +272,8 @@ def save_priors(data_dir):
         sparse_folder = os.path.join(data_dir, folder, "sparse_depth")
         sprase_depth_path = [os.path.join(sparse_folder, f) for f in images]
 
-        min_depth, max_depth = 0.1, 8.0
-        min_pred, max_pred = 0.1, 8.0
+        min_depth, max_depth = 0.1, 5.0
+        min_pred, max_pred = 0.1, 5.0
 
         # Instantiate method
         method = pipeline.VIDepth(
@@ -307,6 +307,11 @@ def save_priors(data_dir):
             input_sparse_depth_valid = input_sparse_depth_valid.astype(bool)
             input_sparse_depth[~input_sparse_depth_valid] = np.inf # set invalid depth
             input_sparse_depth_inv = 1.0 / input_sparse_depth
+            
+            #if sparse depth points are less than 3 continue
+            print("# of sparse points: ", np.sum(input_sparse_depth_valid))
+            if np.sum(input_sparse_depth_valid) < 50:
+                continue
 
             ga_depth_inv, interp_scale = get_ga_and_scale(depth_infer_inv, input_sparse_depth_inv, 
                                                           input_sparse_depth_valid, min_pred, max_pred )
@@ -523,12 +528,49 @@ def save_init_depth(data_dir):
         # plt.hist(init_scales_inv.flatten(), bins=100)
         # plt.show()
 
-if __name__ == "__main__":
-    data_dir = "/media/saimouli/Data6T/datasets/VOID_150_small/testing" #"/media/saimouli/RPNG_FLASH_4/datasets/VOID_150/training"
+def clean_dir(data_dir, ref_subfolder="depth_infer_dpt", subfolders_to_clean=["image", "sparse_depth", "absolute_pose", "ground_truth", "ov_pose", "interp_scale"]):
+    #Cleans up the data_dir by removing files from subfolders that do not have a corresponding reference .npy file in ref_subfolder.
+    import os
+    folders = [f for f in os.listdir(data_dir) if not f.endswith('.txt')]
+    for folder in folders:
+        print("Folder: ", folder)
+        ref_folder = os.path.join(data_dir, folder, ref_subfolder)
+        valid_files = set()
+        if not os.path.exists(ref_folder):
+            print(f"Reference folder {ref_folder} does not exist, skipping.")
+            continue
+        for fname in os.listdir(ref_folder):
+            if fname.endswith('.npy'):
+                base = os.path.splitext(fname)[0]
+                valid_files.add(base)
+        print(f"Found {len(valid_files)} valid frames in {ref_subfolder}")
+        
+        for sub in subfolders_to_clean:
+            sub_folder = os.path.join(data_dir, folder, sub)
+            if not os.path.exists(sub_folder):
+                print(f"Subfolder {sub_folder} does not exist, skipping.")
+                continue
 
-    save_priors(data_dir)
+            for fname in os.listdir(sub_folder):
+                base, ext = os.path.splitext(fname)
+                # You may want to adjust extensions as needed (e.g., .png, .txt)
+                if base not in valid_files:
+                    fp = os.path.join(sub_folder, fname)
+                    print(f"Removing: {fp}")
+                    os.remove(fp)
+
+    print("Cleanup complete.")
+
+    
+    
+if __name__ == "__main__":
+    data_dir = "/home/sai/Documents/data/tartan_ov/training" #"/media/saimouli/RPNG_FLASH_4/datasets/VOID_150/training"
+
+    #save_priors(data_dir)
     #save_normals(data_dir)
-    #create_frame_index(data_dir)
+    #clean_dir(data_dir)
+    create_frame_index(data_dir)
+    
     
     # import matplotlib.pyplot as plt
     # normals = np.load("/media/saimouli/Data6T/datasets/VOID_150_small/testing/copyroom4/dpt_normals/1552625608.9718.npy")
