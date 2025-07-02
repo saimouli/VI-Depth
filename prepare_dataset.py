@@ -382,8 +382,8 @@ def create_frame_index(data_dir):
             R1, R2 = pose1[:3, :3], pose2[:3, :3]
             rot_angle = rotation_angle(R1, R2)
             
-            # if pose_diff < 0.1 and rot_angle < 6:
-            #     continue
+            if pose_diff < 0.05: # and rot_angle < 6:
+                continue
             index.append(idx)
             frame_names.append(images[idx])
 

@@ -17,8 +17,10 @@ from model.main import midasNetModule
 #from geometry_msgs.msg import Pose, Point
 import metrics
 import matplotlib.pyplot as plt
-from modules.interpolator import Interpolator2D
+from modules.interpolator import Interpolator2D, Interpolator2DWithUncertainty
 from utils_eval import compute_ls_solution
+from accelerated_features.modules.xfeat import XFeat
+from test_densification import densify_vio_with_triangulation_and_ba
 
 ROS_VIZ = False; EVAL = True
 
@@ -130,7 +132,8 @@ def plot_depth(tgt_img_cpu, tgt_gt_depth_inv_cpu, tgt_ga_depth_cpu, tgt_pred_dep
     plt.show()
     
 def get_ga_and_scale(depth_pred, input_sparse_depth, input_sparse_depth_valid, min_pred, max_pred):
-    int_depth,_,_ = compute_ls_solution(depth_pred, input_sparse_depth, input_sparse_depth_valid, min_pred, max_pred)
+    int_depth,_,_ = compute_ls_solution(depth_pred, input_sparse_depth, 
+                                        input_sparse_depth_valid, min_pred, max_pred)
         
     # Interpolation of scale map
     assert (np.sum(input_sparse_depth_valid) >= 3), "not enough valid sparse points"
@@ -148,19 +151,224 @@ def get_ga_and_scale(depth_pred, input_sparse_depth, input_sparse_depth_valid, m
     int_scales = utils.normalize_unit_range(int_scales)
 
     return int_depth, int_scales
-   
+
+def ls_without_uncertainty(d_r, d_m, valid, min_pred, max_pred):
+    """
+    Ordinary (un-weighted) least-squares fit of scale s and offset b:
+      minimize  ∑_i (s·d_r[i] + b − d_m[i])²
+    over all valid i.
+    
+    Returns:
+      aligned : H×W float32 = s·d_r + b  (clamped)
+      (s, b)  : the fitted scale and offset
+    """
+    # extract only the valid knots
+    dr = d_r[valid].astype(np.float64)
+    dm = d_m[valid].astype(np.float64)
+
+    # build normal equations with w_i = 1
+    A00 = np.sum(dr * dr)
+    A01 = np.sum(dr)
+    A11 = dr.shape[0]            # = ∑ 1
+
+    b0  = np.sum(dr * dm)
+    b1  = np.sum(dm)
+
+    A = np.array([[A00, A01],
+                  [A01, A11]], dtype=np.float64)
+    B = np.array([b0, b1],       dtype=np.float64)
+
+    # solve for s,b
+    invA = np.linalg.inv(A)
+    s, b = invA.dot(B)
+
+    # apply and clamp
+    aligned = (d_r * s + b).astype(np.float32)
+    if min_pred is not None:
+        aligned[aligned > 1.0/min_pred] = 1.0/min_pred
+    if max_pred is not None:
+        aligned[aligned < 1.0/max_pred] = 1.0/max_pred
+
+    return aligned, (s, b)
+
+def weighted_ls_with_uncertainity(d_r, d_m_noisy, var_m, valid, min_pred, max_pred):
+    dr     = d_r[valid].astype(np.float64)
+    dm     = d_m_noisy[valid].astype(np.float64)
+    sigma2 = var_m[valid].astype(np.float64)
+    w_raw = 1.0 /sigma2
+    w     = np.clip(w_raw, a_min=1e-3, a_max=1e3)
+    
+    A00 = np.sum(w*dr*dr)
+    A01 = np.sum(w*dr)
+    A11 = np.sum(w)
+    
+    b0 = np.sum(w*dr*dm)
+    b1 = np.sum(w*dm)
+    
+    A = np.array([[A00, A01], [A01, A11]])
+    B = np.array([b0, b1])
+    
+    invA = np.linalg.inv(A)
+    s,b = invA.dot(B)
+    
+    Var_s = invA[0,0]
+    Var_b = invA[1,1]
+    Cov_sb = invA[0,1]
+    
+    #apply and clamp
+    aligned = (d_r * s + b).astype(np.float32)
+    aligned[aligned>1.0/min_pred] = 1.0/min_pred
+    aligned[aligned<1.0/max_pred] = 1.0/max_pred
+    
+    #per pixel variance
+    var_map = (
+      (d_r**2)*Var_s +
+       Var_b +
+      2*d_r*Cov_sb
+    ).astype(np.float32)
+    
+    return aligned, (s,b), var_map
+
+def create_vio_noise_model(X_means, randomize=True):
+    Zs = X_means[:, 2]
+    
+    if randomize:
+        noise_type = np.random.choice(['linear', 'quadratic', 'constant'])
+        
+        if noise_type == 'linear':
+            # Linear noise model: alpha * Z
+            alpha = np.random.uniform(0.01, 0.06)  # 1-6% of depth
+            #min_noise = np.random.uniform(0.005, 0.02)  # 0.5-2cm minimum
+            #max_noise = np.random.uniform(0.02, 0.06)  # 2-6cm maximum
+            sigma_zs = np.clip(alpha * Zs, 0.005, 0.15)
+        elif noise_type == 'quadratic':
+            # Quadratic noise model: alpha * Z^2
+            alpha      = np.random.uniform(0.005, 0.02)
+            sigma_zs   = alpha * (Zs**2)
+            sigma_zs   = np.clip(sigma_zs, 0.005, 0.15)
+        else:
+            sigma_zs   = np.random.uniform(0.02, 0.06, size=Zs.shape)
+
+        # Randomly add outliers (5% chance)
+        if np.random.random() < 0.1:  # 50% chance to add outliers
+            mask       = np.random.rand(*Zs.shape) < np.random.uniform(0.01,0.05)
+            sigma_zs[mask] *= np.random.uniform(2.0,4.0)
+    else:
+        # Default deterministic noise model for inference
+        alpha = 0.06  # 2 cm of noise at 1 m, 4 cm at 2 m, etc.
+        sigma_zs = np.clip(alpha * Zs, 0.01, 0.10)  # 1-10cm noise
+    
+    # Create covariance matrices (no noise in x,y directions)
+    sigma_xs = np.full_like(sigma_zs, 0.001)
+    sigma_ys = np.full_like(sigma_zs, 0.001)
+    
+    Sigmas = np.array([
+        np.diag([sx*sx, sy*sy, sz*sz])
+        for sx, sy, sz in zip(sigma_xs, sigma_ys, sigma_zs)
+    ])
+    
+    return Sigmas
+        
+    
+def get_ga_scale_uncertainity(depth_pred_inv, input_sparse_depth_inv, var_m, valid, min_pred, max_pred):
+    
+    # aligned_depth_inv, _, var_map = weighted_ls_with_uncertainity(depth_pred_inv, input_sparse_depth_inv, 
+    #                                                     var_m, valid, min_pred, max_pred)
+    
+    aligned_depth_inv, _ = ls_without_uncertainty(depth_pred_inv, input_sparse_depth_inv, 
+                                                  valid, min_pred, max_pred)
+    
+    assert (np.sum(valid) >= 3), "not enough valid sparse points"
+    interpolator = Interpolator2DWithUncertainty(aligned_depth_inv, input_sparse_depth_inv, valid, var_m)
+    scale_map, uncertainty_map = interpolator.generate_interpolated_scale_map('linear')
+    
+    int_scales = utils.normalize_unit_range(scale_map)
+    
+    
+    return aligned_depth_inv, int_scales, uncertainty_map
+    
+def backproject_sparse(d_m, valid, fx, fy, cx, cy):
+    ys, xs = np.nonzero(valid)
+    Z = d_m[ys, xs]
+    X = (xs - cx)/fx * Z
+    Y = (ys - cy)/fy * Z
+    X_means = np.stack([X, Y, Z], axis=1)
+    coords = list(zip(ys, xs))
+    return X_means, coords
+
+def simulate_vio_analytic(X_means, Sigmas, coords, shape): #(N,3) proj. points, Sigmas (N,3,3)
+    """
+    For each sparse point i:
+    - True depth = Z_i
+    - Depth variance     = Σ_i[2,2]
+    - Inject one zero‑mean sample n ~ N(0, Σ_i[2,2])
+    - New depth = Z_i + n
+    Returns
+    - d_m_noisy: noisy depth
+    - var_m: depth variance
+    """
+    H, W = shape  # Use the provided shape
+    
+    d_m_noisy = np.zeros((H,W), dtype=np.float32)
+    var_m = np.zeros((H,W), dtype=np.float32)
+    
+    for i, (y,x) in enumerate(coords):
+        Z = X_means[i,2]
+        sigma2_z = Sigmas[i,2,2] # variance of Z
+        noise = np.random.normal(0, np.sqrt(sigma2_z))
+        d_m_noisy[y,x] = Z + noise
+        var_m[y,x] = sigma2_z
+    
+    return d_m_noisy, var_m
+    
+def verify_uncertainty_map(noisy_sparse_depth_inv, uncertainty_map, input_sparse_depth_valid):
+    import matplotlib.pyplot as plt
+    
+    # Create figure with subplots
+    fig, axs = plt.subplots(1, 3, figsize=(18, 6))
+    
+    # Plot 1: Inverse sparse depth
+    valid_y, valid_x = np.where(input_sparse_depth_valid)
+    inv_depth_values = noisy_sparse_depth_inv[valid_y, valid_x]
+    
+    # For visualization, convert inverse depth to regular depth
+    # (small inverse depth = far object, large inverse depth = close object)
+    depth_values = 1.0 / inv_depth_values
+    
+    scatter1 = axs[0].scatter(valid_x, valid_y, c=depth_values, 
+                              cmap='viridis', s=4)
+    axs[0].set_title('Sparse Points (colored by depth)')
+    axs[0].invert_yaxis()
+    cbar1 = plt.colorbar(scatter1, ax=axs[0])
+    cbar1.set_label('Depth (m)')
+    
+    # Plot 2: Uncertainty map
+    im = axs[1].imshow(uncertainty_map, cmap='hot')
+    axs[1].set_title('Log-Compressed Uncertainty Map')
+    plt.colorbar(im, ax=axs[1])
+    
+    # Plot 3: Overlay sparse points on uncertainty map
+    axs[2].imshow(uncertainty_map, cmap='hot', alpha=0.7)
+    scatter3 = axs[2].scatter(valid_x, valid_y, c=depth_values, 
+                              cmap='viridis', s=4, alpha=1.0)
+    axs[2].set_title('Uncertainty with Sparse Points Overlay')
+    axs[2].invert_yaxis()
+    
+    plt.tight_layout()
+    plt.show()
+    
 #currently evaluating the GT depth consistency TODO: include valid mask for gt depth
 if __name__ == "__main__":
-    dataset = SML_consistent_dataset(data_root='/media/saimouli/Data6T/datasets/VOID_150_small', mode='val')
+    dataset = SML_consistent_dataset(data_root='/media/saimouli/Data6T/datasets/void_150', mode='val', add_noise=False)
     #dataset = SML_consistent_resize(data_root='/media/saimouli/Data6T/datasets/VOID_150_small', mode='val')
     dataloader = torch.utils.data.DataLoader(dataset)
     
-    sml_model_path = "weights/sml_model.dpredictor.dpt_hybrid.nsamples.150.ckpt"
+    sml_model_path = None #"weights/sml_model.dpredictor.dpt_hybrid.nsamples.150.ckpt"
     #sml_model_path = "weights/sml_model.dpredictor.dpt_hybrid.nsamples.150.pretrained.ckpt" #tartanair
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     #model = midasNet(min_pred, max_pred, min_depth, max_depth, 150, sml_model_path)
     model_transforms = transforms.get_transforms("dpt_hybrid", "void", str(150))
-    add_noise = True; noise_sigma = 0.04
+    add_noise = False; #noise_sigma = 0.04
     # ScaleMapLearner_transform = model_transforms["sml_model"]
     # ScaleMapLearner = MidasNet_small_videpth(
     #     path=sml_model_path,
@@ -176,11 +384,13 @@ if __name__ == "__main__":
     # model.to(device)
     
     model = midasNetConsistentModule(sml_model_path=sml_model_path, useConvGRU=True, is_train=False)
-    model = model.load_from_checkpoint("lightning_logs/MVSML/version_0/checkpoints/epoch=15-val/total_loss=0.085.ckpt")
-    #model = model.load_from_checkpoint("/home/saimouli/Documents/github/VI_Depth_sai/weights/withcostv/total_loss=0.088.ckpt")
+    model = model.load_from_checkpoint("weights/epoch=25-val_no_uncer/total_loss=0.080.ckpt")
+    #model = model.load_from_checkpoint("weights/epoch=21-val_uncer/total_loss=0.082.ckpt")
+    #model = model.load_from_checkpoint("lightning_logs/MVSML/version_0/checkpoints/epoch=8-val/total_loss=0.091.ckpt")
     #model = model.load_from_checkpoint("/home/saimouli/Documents/github/VI_Depth_sai/weights/without_costv/total_loss=0.086.ckpt")
     model.eval()
     model.to(device)
+    xfeat = XFeat()
     
     first_frame = True
     threshold = 0.05  # Threshold for inlier correspondence
@@ -207,28 +417,96 @@ if __name__ == "__main__":
         # Unpack batch data
         tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, tgt_sparse_depth, ref_img, \
         ref_ga_depth, ref_interp, ref_gt_depth, ref_sparse_depth, tgt_pose, ref_gt_pose, \
-            intrinsics, _, ref_pose_perturbed, tgt_depth_pred, _ = batch_data #dataset[idx] #Cam2Wld poses (R_ctoG, p_CinG)
+            intrinsics, _, ref_pose_perturbed, tgt_depth_pred, _, tgt_uncer_scale = batch_data #dataset[idx] #Cam2Wld poses (R_ctoG, p_CinG)
         
         ##########################################################################
         ## add noise
         if add_noise:
             #print(f"Adding Gaussian noise with sigma={noise_sigma} to sparse points")
             tgt_sparse_depth_np = tgt_sparse_depth.squeeze().cpu().numpy()
-            validity_map_bool = (tgt_sparse_depth_np > 0)
+            validity_map_bool = tgt_sparse_depth_np > 0
             input_sparse_depth_valid = (tgt_sparse_depth_np < max_depth) * (tgt_sparse_depth_np > min_depth)
             input_sparse_depth_valid = input_sparse_depth_valid.astype(bool)
-            noise = np.random.normal(0, noise_sigma, tgt_sparse_depth_np.shape)
-            tgt_sparse_depth_np[validity_map_bool] += noise[validity_map_bool]
+            intrin_cam = intrinsics.squeeze().cpu().numpy()
+            fx, fy, cx, cy = intrin_cam[0][0], intrin_cam[1][1], intrin_cam[0][2], intrin_cam[1][2]
+            X_means, coords = backproject_sparse(tgt_sparse_depth_np, validity_map_bool, fx, fy, cx, cy)
             
-            tgt_sparse_depth_np[~input_sparse_depth_valid] = np.inf 
-            tgt_sparse_depth_np = 1.0 / tgt_sparse_depth_np 
+            #assign VIO‑style covariances (here a simple diagonal for all points)
+            #2) build per-point sigma_z (depth-dependent example)
+            # Zs = X_means[:,2]
+            # alpha = 0.02 #2 cm of noise at 1 m, 4 cm at 2 m, 6 cm at 3 m, 8 cm at 4 m, 10cm at 5m
+            # sigma_zs = np.clip(alpha * Zs, 0.01, 0.10) #0.01, 0.05) #1cm - 6cm
+            # # constant small xy noise
+            # sigma_xs = np.zeros_like(sigma_zs)
+            # sigma_ys = np.zeros_like(sigma_zs)
+            # Sigmas = np.array([
+            #     np.diag([sx*sx, sy*sy, sz*sz])
+            #     for sx,sy,sz in zip(sigma_xs, sigma_ys, sigma_zs)
+            # ])
+            Sigmas = create_vio_noise_model(X_means, randomize=False)
             
-            #recompute tgt_ga_depth
-            tgt_ga_depth, int_scales = get_ga_and_scale(tgt_depth_pred.squeeze().cpu().numpy(), tgt_sparse_depth_np, 
-                                                   input_sparse_depth_valid, min_pred, max_pred)
+            #sigma_x, sigma_y, sigma_z = 0.00, 0.00, 0.20 #0.1cm, 0.1cm , 4cm #TODO should be random
+            #N = len(coords)
+            #Sigmas = np.array([np.diag([sigma_x**2, sigma_y**2, sigma_z**2]) for i in range(N)])
+            
+            #simulate noisy sparse depths + variance
+            d_m_noisy, var_m = simulate_vio_analytic(X_means, Sigmas, coords, tgt_sparse_depth_np.shape)
+            #print(f"var_m stats: min={var_m[input_sparse_depth_valid].min()}, max={var_m[input_sparse_depth_valid].max()}, mean={var_m[input_sparse_depth_valid].mean()}")
+            
+            # #import matplotlib.pyplot as plt
+
+            # # Create a simple figure with two subplots
+            # fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+            # # Get valid coordinates
+            # valid_y, valid_x = np.where(validity_map_bool)
+
+            # # Plot original sparse depths
+            # scatter1 = ax1.scatter(valid_x, valid_y, c=tgt_sparse_depth_np[valid_y, valid_x], 
+            #                     cmap='viridis', s=5)
+            # ax1.set_title('Original Sparse Depth')
+            # ax1.invert_yaxis()  # Invert y-axis to match image coordinates
+            # plt.colorbar(scatter1, ax=ax1)
+
+            # # Plot noisy sparse depths
+            # scatter2 = ax2.scatter(valid_x, valid_y, c=d_m_noisy[valid_y, valid_x], 
+            #                     cmap='viridis', s=5)
+            # ax2.set_title('Noisy Sparse Depth (4cm std)')
+            # ax2.invert_yaxis()  # Invert y-axis to match image coordinates
+            # plt.colorbar(scatter2, ax=ax2)
+
+            # plt.tight_layout()
+            # plt.show()
+            
+            #noise = np.random.normal(0, noise_sigma, tgt_sparse_depth_np.shape)
+            #tgt_sparse_depth_np[validity_map_bool] += noise[validity_map_bool]
+            
+            d_m_noisy[~input_sparse_depth_valid] = np.inf
+            noisy_sparse_depth_inv = 1.0 / d_m_noisy
+            
+            tgt_ga_depth, int_scales, uncertainity_map = get_ga_scale_uncertainity(
+                tgt_depth_pred.squeeze().cpu().numpy(),
+                noisy_sparse_depth_inv,
+                var_m,
+                input_sparse_depth_valid,
+                min_pred,
+                max_pred
+            )
+            uncertainity_map = np.log(1 + uncertainity_map)  # Compress dynamic range
+            
             tgt_ga_depth = torch.from_numpy(tgt_ga_depth).unsqueeze(0).float().to(device)
             tgt_interp = torch.from_numpy(int_scales).unsqueeze(0).float().to(device)
+            tgt_uncer_scale = torch.from_numpy(uncertainity_map).unsqueeze(0).unsqueeze(0).float().to(device)
+            
+            # tgt_sparse_depth_np[~input_sparse_depth_valid] = np.inf 
+            # tgt_sparse_depth_np = 1.0 / tgt_sparse_depth_np 
+            # ##recompute tgt_ga_depth
+            # tgt_ga_depth, int_scales = get_ga_and_scale(tgt_depth_pred.squeeze().cpu().numpy(), tgt_sparse_depth_np, 
+            #                                        input_sparse_depth_valid, min_pred, max_pred)
+            # tgt_ga_depth = torch.from_numpy(tgt_ga_depth).unsqueeze(0).float().to(device)
+            # tgt_interp = torch.from_numpy(int_scales).unsqueeze(0).float().to(device)
         
+        #############################################################################
         ###reduce tgt sparse depth and try interpolating again and then pass
         # validity_map = (tgt_sparse_depth > 0).squeeze().cpu().numpy().astype(np.uint8)
         # print("Before Pts: ", np.count_nonzero(validity_map))
@@ -243,25 +521,55 @@ if __name__ == "__main__":
         # tgt_sparse_depth = tgt_sparse_depth.squeeze().cpu().numpy()
         # tgt_sparse_depth[~input_sparse_depth_valid] = np.inf
         # tgt_sparse_depth = 1.0 / tgt_sparse_depth 
+
+        #%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+        #Add points using added xfeat points
+        tgt_sparse_depth = tgt_sparse_depth.squeeze().cpu().numpy()
+        sparse_vio_points = []
+        for u in range(tgt_sparse_depth.shape[1]):
+            for v in range(tgt_sparse_depth.shape[0]):
+                if tgt_sparse_depth[v, u] > 0:
+                    depth = tgt_sparse_depth[v, u]
+                    sparse_vio_points.append((u, v, depth))
         
-        # #recompute tgt_ga_depth
-        # tgt_ga_depth = tgt_ga_depth.squeeze().cpu().numpy()
-        # tgt_ga_depth,_,_ = compute_ls_solution(tgt_depth_pred.squeeze().cpu().numpy(), tgt_sparse_depth, input_sparse_depth_valid, min_pred, max_pred)
-        # tgt_ga_depth = torch.from_numpy(tgt_ga_depth).unsqueeze(0).float().to(device)
+        tgt_gt_depth_np = utils.inv2depth(tgt_gt_depth_inv).squeeze().cpu().numpy()
+
+        sparse_pts, new_pts = densify_vio_with_triangulation_and_ba(ref_img[0].squeeze(0).cpu(), tgt_img.squeeze(0).cpu(), ref_img[1].squeeze(0).cpu(), 
+                                                                ref_gt_pose[0].squeeze(0).cpu().numpy(), tgt_pose.squeeze(0).cpu().numpy(), ref_gt_pose[1].squeeze(0).cpu().numpy(), 
+                                                                intrinsics.squeeze(0).cpu().numpy(), 
+                                                                sparse_vio_points, xfeat, gt_depth=tgt_gt_depth_np, 
+                                                                num_new_points=2000)
+        #insert new_pts to tgt_sparse_depth
+        for u, v, depth in new_pts:
+            tgt_sparse_depth[int(v), int(u)] = depth
+
+
+        validity_map = (tgt_sparse_depth > 0).astype(np.uint8)
+        input_sparse_depth_valid = validity_map.astype(bool)
+        tgt_sparse_depth[~input_sparse_depth_valid] = np.inf
+        tgt_sparse_depth = 1.0 / tgt_sparse_depth
+        #%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+        #recompute tgt_ga_depth
+        tgt_ga_depth = tgt_ga_depth.squeeze().cpu().numpy()
+        tgt_ga_depth,_,_ = compute_ls_solution(tgt_depth_pred.squeeze().cpu().numpy(), tgt_sparse_depth, 
+                                               input_sparse_depth_valid, min_pred, max_pred)
+        tgt_ga_depth = torch.from_numpy(tgt_ga_depth).unsqueeze(0).float().to(device)
         
-        # ScaleMapInterpolator = Interpolator2D(
-        #     pred_inv = tgt_ga_depth.squeeze().cpu().numpy(),
-        #     sparse_depth_inv = tgt_sparse_depth,
-        #     valid = input_sparse_depth_valid,
-        # )
-        # ScaleMapInterpolator.generate_interpolated_scale_map(
-        #     interpolate_method='linear', 
-        #     fill_corners=False
-        # )
-        # int_scales = ScaleMapInterpolator.interpolated_scale_map.astype(np.float32)
-        # int_scales = utils.normalize_unit_range(int_scales)
-        # tgt_interp = torch.from_numpy(int_scales).unsqueeze(0).float().to(device)
-        ##################################################################################
+        ScaleMapInterpolator = Interpolator2D(
+            pred_inv = tgt_ga_depth.squeeze().cpu().numpy(),
+            sparse_depth_inv = tgt_sparse_depth,
+            valid = input_sparse_depth_valid,
+        )
+        ScaleMapInterpolator.generate_interpolated_scale_map(
+            interpolate_method='linear', 
+            fill_corners=False
+        )
+        int_scales = ScaleMapInterpolator.interpolated_scale_map.astype(np.float32)
+        int_scales = utils.normalize_unit_range(int_scales)
+        tgt_interp = torch.from_numpy(int_scales).unsqueeze(0).float().to(device)
+        tgt_sparse_depth = torch.from_numpy(tgt_sparse_depth).unsqueeze(0).float().to(device)
+        ##########################################################################################
         
         ref_rel_poses = [tgt_pose.inverse() @ ref_p for ref_p in ref_pose_perturbed]
         ref_rel_gtposes = [tgt_pose.inverse() @ ref_p for ref_p in ref_gt_pose]
@@ -283,7 +591,9 @@ if __name__ == "__main__":
                                                     ref_interp, 
                                                     tgt_pose, 
                                                     ref_rel_poses,
-                                                    intrinsics)
+                                                    intrinsics,
+                                                    tgt_uncer_scale,
+                                                    do_scale_uncer=False)
         #compute consistent module
         # sml_depth_inv = model(tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, ref_img, 
         #                               ref_ga_depth, ref_interp, ref_gt_depth, tgt_pose, ref_gt_pose, intrinsics)

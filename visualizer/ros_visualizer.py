@@ -30,6 +30,8 @@ class PointCloudVisualizer:
         self.path_pub = rospy.Publisher('path_viz', Path, queue_size=10)
         self.pub_normals = rospy.Publisher('pc_normals', PointCloud2, queue_size=10)
         self.pub_tgt_img = rospy.Publisher('tgt_img', Image, queue_size=10)
+        self.pub_active = rospy.Publisher('active_pts', PointCloud2, queue_size=10)
+        self.pub_slam = rospy.Publisher('slam_pts', PointCloud2, queue_size=10)
         # self.tf_buffer = tf2_ros.Buffer()
         # self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
         # self.tf_broadcaster = tf2_ros.TransformBroadcaster()
@@ -123,6 +125,44 @@ class PointCloudVisualizer:
 
         point_cloud_msg = pc2.create_cloud(header, fields, points_with_colors)
         self.pub_sparse.publish(point_cloud_msg)
+
+    def publish_slam_points(self, sparse_pts):
+        header = std_msgs.msg.Header()
+        header.stamp = rospy.Time.now()
+        header.frame_id = "global"  # Change the frame ID if necessary
+
+        fields = [PointField('x', 0, PointField.FLOAT32, 1),
+                    PointField('y', 4, PointField.FLOAT32, 1),
+                    PointField('z', 8, PointField.FLOAT32, 1),
+                    PointField('rgb', 12, PointField.UINT32, 1)]  # RGBA color information
+
+        points_with_colors = []
+        for i in range(len(sparse_pts)):
+            rgb = (255 << 16)  # Red channel only
+            point = list(sparse_pts[i]) + [rgb]
+            points_with_colors.append(point)
+
+        point_cloud_msg = pc2.create_cloud(header, fields, points_with_colors)
+        self.pub_slam.publish(point_cloud_msg)
+
+    def publish_active_points(self, sparse_pts):
+        header = std_msgs.msg.Header()
+        header.stamp = rospy.Time.now()
+        header.frame_id = "global"  # Change the frame ID if necessary
+
+        fields = [PointField('x', 0, PointField.FLOAT32, 1),
+                    PointField('y', 4, PointField.FLOAT32, 1),
+                    PointField('z', 8, PointField.FLOAT32, 1),
+                    PointField('rgb', 12, PointField.UINT32, 1)]  # RGBA color information
+
+        points_with_colors = []
+        for i in range(len(sparse_pts)):
+            rgb = (255)  # Red channel only
+            point = list(sparse_pts[i]) + [rgb]
+            points_with_colors.append(point)
+
+        point_cloud_msg = pc2.create_cloud(header, fields, points_with_colors)
+        self.pub_active.publish(point_cloud_msg)
     
     def publish_point_cloud_refine(self, points_refine, colors_refine):
         header = std_msgs.msg.Header()

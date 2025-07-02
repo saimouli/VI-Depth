@@ -12,6 +12,7 @@ from utils_eval import compute_ls_solution
 import modules.midas.utils as utils
 import cv2
 from modules.interpolator import Interpolator2D
+from test_scaffolding import plot_surface_normals
 
 def load_sparse_depth(input_sparse_depth_fp):
     input_sparse_depth = np.array(Image.open(input_sparse_depth_fp), dtype=np.float32) / 256.0
@@ -479,8 +480,153 @@ def detect_normals(depth_image, input_sparse_depth, input_image, display=False):
 
     return normal
 
+def segment_planes_from_normals_dual_flood(normals, seed_spacing=(40, 40), 
+                                          loDiff1=(0.01, 0.01, 0.01), upDiff1=(0.01, 0.01, 0.01),
+                                          loDiff2=(0.1, 0.1, 0.1), upDiff2=(0.1, 0.1, 0.1),
+                                          min_region_size=3000):
+
+    norm = np.linalg.norm(normals, axis=2, keepdims=True)
+    normal_map = normals / (norm + 1e-6)
+
+    normal_map = (normal_map + 1) / 2  # Convert from -1:1 to 0:1
+    height, width = normal_map.shape[:2]
+
+    seed_y_n = height // seed_spacing[0]
+    seed_x_n = width // seed_spacing[1]
+
+    xs = np.linspace(0, width-1, seed_x_n+2, dtype=np.int32)[1:-1]
+    ys = np.linspace(0, height-1, seed_y_n+2, dtype=np.int32)[1:-1]
+    xx, yy = np.meshgrid(xs, ys)
+    seed_pts = np.dstack((xx, yy)).reshape(-1,2)
+
+    normal_map = normal_map.astype(np.float32)
+    label_arr = np.zeros((height, width), dtype=np.int32)
+    label_n=1    
+    newVal = (1, 1, 1)
+
+    for pt in seed_pts:
+        x, y = pt
+        if label_arr[y,x] !=0 or np.isnan(normal_map[y, x, 0]):
+            continue
+
+        mask1 = np.zeros((height+2, width+2), np.uint8)
+        mask2 = np.zeros((height+2, width+2), np.uint8)
+
+        retval1 = cv2.floodFill(normal_map.copy(), mask1, (x, y), newVal, loDiff1, upDiff1, flags=8)
+        retval2 = cv2.floodFill(normal_map.copy(), mask2, (x, y), newVal, loDiff2, upDiff2, 
+                              flags=cv2.FLOODFILL_FIXED_RANGE)
+        
+        # Check if both regions are large enough
+        if retval1[0] > min_region_size and retval2[0] > min_region_size:
+            combined_mask = mask1 * mask2
+
+            label_arr[(combined_mask==1)[1:-1, 1:-1]] = label_n
+            label_n += 1
+
+    return label_arr
+
+def visualize_depth_completion_process(input_image, input_sparse_depth, plane_masks, densified_depth, probability_threshold=0.7):
+    """Visualize the depth completion process with stacked plane masks"""
+    # Create a figure with 3 subplots
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    
+    # Get the original sparse points
+    valid_mask_original = input_sparse_depth > 0.2
+    y_orig, x_orig = np.where(valid_mask_original)
+    
+    # Get the newly added points
+    valid_mask_new = densified_depth > 0.2
+    new_points_mask = valid_mask_new & (~valid_mask_original)
+    y_new, x_new = np.where(new_points_mask)
+    
+    # Figure 1: Original image with sparse points
+    axes[0].imshow(input_image)
+    axes[0].scatter(x_orig, y_orig, color='pink', s=5, alpha=0.8)
+    axes[0].set_title(f'Original Image with Sparse Points ({len(x_orig)})')
+    
+    # Figure 2: Plane masks on image
+    # Create a visualization showing the most probable plane for each pixel
+    most_probable_plane = np.argmax(plane_masks, axis=0)
+    max_probability = np.max(plane_masks, axis=0)
+    valid_plane_mask = max_probability > probability_threshold
+    
+    # Create a colormap for visualization
+    cmap = plt.cm.get_cmap('tab20', plane_masks.shape[0])
+    # Create a colored visualization
+    colored_mask = cmap(most_probable_plane)
+    # Set alpha channel based on probability and validity
+    colored_mask[..., 3] = np.where(valid_plane_mask, 0.7, 0)
+    
+    axes[1].imshow(input_image)
+    axes[1].imshow(colored_mask)
+    axes[1].set_title(f'Plane Masks ({plane_masks.shape[0]} planes)')
+    
+    # Figure 3: Image with newly added points
+    axes[2].imshow(input_image)
+    # Plot original points
+    axes[2].scatter(x_orig, y_orig, color='pink', s=5, alpha=0.8, label='Original')
+    # Plot new points
+    axes[2].scatter(x_new, y_new, color='cyan', s=5, alpha=0.8, label='Added')
+    axes[2].set_title(f'Added Points ({len(x_new)} new, {len(x_new) + len(x_orig)} total)')
+    axes[2].legend()
+    
+    plt.tight_layout()
+    return fig
+
+def strategic_scaffold_filling(input_sparse_depth, plane_masks, min_points_per_plane = 1, fill_ratio=0.005):
+    height, width = input_sparse_depth.shape
+    valid_mask = input_sparse_depth > 0.2
+    densified_depth = input_sparse_depth.copy()
+
+    num_planes = plane_masks.shape[0]
+    print("Number of planes: ", num_planes)
+
+    for plane_idx in range(num_planes):
+        # Create binary mask for this plane
+        plane_mask = plane_masks[plane_idx] > 0.7
+        
+        # Skip empty planes
+        if not np.any(plane_mask):
+            continue
+            
+        # Find sparse points in this plane
+        points_in_plane = plane_mask & valid_mask
+        n_points = np.sum(points_in_plane)
+        
+        if n_points >= min_points_per_plane:
+            # Calculate plane size and points to add
+            plane_size = np.sum(plane_mask)
+            n_points_to_add = min(int(plane_size * fill_ratio), plane_size - n_points)
+            
+            if n_points_to_add > 0:
+                # Extract sparse point coordinates and depths
+                y_coords, x_coords = np.where(points_in_plane)
+                depths = input_sparse_depth[points_in_plane]
+                
+                # Find empty pixels in this plane
+                empty_pixels = plane_mask & (~valid_mask)
+                y_empty, x_empty = np.where(empty_pixels)
+                
+                if len(y_empty) > n_points_to_add:
+                    indices = np.random.choice(len(y_empty), n_points_to_add, replace=False)
+                    y_sampled = y_empty[indices]
+                    x_sampled = x_empty[indices]
+                else:
+                    y_sampled = y_empty
+                    x_sampled = x_empty
+                
+                # For each sampled point, assign depth from nearest sparse point
+                for i in range(len(y_sampled)):
+                    if len(y_coords) > 0:
+                        distances = np.sqrt((y_sampled[i] - y_coords)**2 + 
+                                           (x_sampled[i] - x_coords)**2)
+                        nearest_idx = np.argmin(distances)
+                        densified_depth[y_sampled[i], x_sampled[i]] = depths[nearest_idx]
+                    
+    return densified_depth
+
 def main():
-    data_dir = "/media/saimouli/Data6T/datasets/VOID_150_test/testing" #"/media/saimouli/RPNG_FLASH_4/datasets/VOID_150/training"
+    data_dir = "/media/saimouli/Data6T/datasets/VOID_150_small/testing" #"/media/saimouli/RPNG_FLASH_4/datasets/VOID_150/training"
     # save_priors(data_dir)
 
     device = "cuda"; nsamples = 150; sml_model_path = ""
@@ -495,11 +641,16 @@ def main():
         image_folder = os.path.join(data_dir, folder, "image")
         intrinsics = np.genfromtxt(image_folder.replace('image', 'K.txt')).astype(np.float32).reshape((3, 3))
         # get list of images in the image folder
-        images = [f for f in os.listdir(image_folder) if f.endswith('.png')]
-        images_path = [os.path.join(image_folder, f) for f in images]
+        images = np.sort([f for f in os.listdir(image_folder) if f.endswith('.png')])
+        images_path = np.sort([os.path.join(image_folder, f) for f in images])
 
         sparse_folder = os.path.join(data_dir, folder, "sparse_depth")
-        sprase_depth_path = [os.path.join(sparse_folder, f) for f in images]
+        sprase_depth_path = np.sort([os.path.join(sparse_folder, f) for f in images])
+
+        normal_mask_folder = os.path.join(data_dir, folder, "normal_masks/inference")
+        normal_masks = sorted([f for f in os.listdir(normal_mask_folder) if f.endswith('.npy') and 'masks' in f], 
+                            key=lambda x: int(x.split('_')[0]))
+        normal_masks = [os.path.join(normal_mask_folder, f) for f in normal_masks]
 
         min_depth, max_depth = 0.1, 5.0
         min_pred, max_pred = 0.1, 8.0
@@ -512,8 +663,10 @@ def main():
         for i in tqdm(range(len(images))):
             input_image_fp = images_path[i]
             input_sparse_depth_fp = sprase_depth_path[i]
+            input_normal_mask_fp = normal_masks[i]
             input_image = utils.read_image(input_image_fp)
             input_sparse_depth = load_sparse_depth(input_sparse_depth_fp)
+            normal_mask = np.load(input_normal_mask_fp)
             gt_depth_fp = input_image_fp.replace("image", "ground_truth")
             gt_depth = load_sparse_depth(gt_depth_fp)
             mask = (gt_depth < max_depth)
@@ -532,8 +685,6 @@ def main():
             input_sparse_depth_valid = (input_sparse_depth < max_depth) * (input_sparse_depth > min_depth)
 
             input_sparse_depth_valid = input_sparse_depth_valid.astype(bool)
-            input_sparse_depth[~input_sparse_depth_valid] = np.inf # set invalid depth
-            input_sparse_depth_inv = 1.0 / input_sparse_depth
             
             print("Before Pts: ", np.count_nonzero(validity_map))
             reduce_pts = int(np.count_nonzero(validity_map) * 0.90)
@@ -542,23 +693,94 @@ def main():
             points_to_remove = nonzero_indices[remove_indices]
             for x, y in points_to_remove:
                 validity_map[x, y] = 0
+                input_sparse_depth[x, y] = 0
             print("After Pts: ", np.count_nonzero(validity_map))
             input_sparse_depth_valid = (validity_map == 1) * (input_sparse_depth < max_depth) * (input_sparse_depth > min_depth)
             input_sparse_depth_valid = input_sparse_depth_valid.astype(bool)
-            input_sparse_depth[~input_sparse_depth_valid] = np.inf # set invalid depth
-            input_sparse_depth_inv = 1.0 / input_sparse_depth
+            #input_sparse_depth[~input_sparse_depth_valid] = np.inf # set invalid depth
+            #input_sparse_depth_inv = 1.0 / input_sparse_depth
     
             # Visualize normal map
             normals = detect_normals(depth_infer_inv, None, input_image, False)
+            #normals_ga_depth = detect_normals(ga_depth, input_sparse_depth, input_image, False)
+            normals_gt_depth = detect_normals(gt_depth, None, input_image, False)
+
+            # Resize the normals to 288x384
+            resized_normals = cv2.resize(normals, (384, 288), interpolation=cv2.INTER_LINEAR)
+            #resized_normals_gt_depth = cv2.resize(normals_gt_depth, (384, 288), interpolation=cv2.INTER_LINEAR)
+            input_image_resize = cv2.resize(input_image, (384, 288), interpolation=cv2.INTER_LINEAR)
             
-            fig, axes = plt.subplots(1,1, figsize=(10, 8))
-            y_idx, x_idx = np.where(validity_map)
-            axes.scatter(x_idx, y_idx, color='red', s=5, alpha=0.8)
-            axes.imshow(input_image)
-            visualize_normal_map(normals)
+            # fig, axes = plt.subplots(1,1, figsize=(10, 8))
+            # y_idx, x_idx = np.where(validity_map)
+            # axes.scatter(x_idx, y_idx, color='pink', s=5, alpha=0.8)
+            # axes.imshow(input_image_resize)
+            #visualize_normal_map(resized_normals)
+            #visualize_normal_map(resized_normals_gt_depth)
+            #plot_surface_normals(input_image_resize, resized_normals, axes)
+            print("normal mask: ", normal_mask.shape)
+            densify_depth = strategic_scaffold_filling(input_sparse_depth, normal_mask, fill_ratio=0.0005)
+            fig = visualize_depth_completion_process(input_image, input_sparse_depth, normal_mask, densify_depth)
+
+            # segments_gt = segment_planes_from_normals_dual_flood(
+            #     resized_normals_gt_depth, 
+            #     seed_spacing=(30, 30),  # Adjust based on your image size
+            #     min_region_size=1000    # Adjust based on your expected plane sizes
+            # )
+            # import time 
+            # start_time = time.time()
+            # segments = segment_planes_from_normals_dual_flood(
+            #     resized_normals, 
+            #     seed_spacing=(20, 20),  # Adjust based on your image size
+            #     min_region_size=1000    # Adjust based on your expected plane sizes
+            # )
+            # end_time = time.time()
+            # print(f"Time taken for segment_planes_from_normals_dual_flood: {end_time - start_time:.3f} seconds")
+
+            # #plot both segments and segments_gt 
+            # num_segments = np.max(segments)
+            # #num_segments_gt = np.max(segments_gt)
+            # colors = np.random.randint(0, 255, size=(num_segments+1, 3))
+            # #colors_gt = np.random.randint(0, 255, size=(num_segments_gt+1, 3))
+            # colors[0] = [0, 0, 0]
+            # #colors_gt[0] = [0, 0, 0]
+            # segment_vis = np.zeros_like(input_image_resize)
+            # #segment_vis_gt = np.zeros_like(input_image_resize)
+            # for i in range(1, num_segments+1):
+            #     mask = (segments == i)
+            #     segment_vis[mask] = colors[i]
+            # # for i in range(1, num_segments_gt+1):
+            # #     mask_gt = (segments_gt == i)
+            # #     segment_vis_gt[mask_gt] = colors_gt[i]
+
+            # overlay = cv2.addWeighted(input_image_resize, 0.7, segment_vis, 0.3, 0)
+            # #overlay_gt = cv2.addWeighted(input_image_resize, 0.7, segment_vis_gt, 0.3, 0)
+
+            #fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+            #axes[0].imshow(input_image_resize)
+            #axes[0].set_title('Original Image')
+
+            # axes[1].imshow(segments_gt, cmap='tab20')
+            # axes[1].set_title(f'Segmented GT Planes: {num_segments_gt} found')
+
+            #axes[1].imshow(segments, cmap='tab20')
+            #axes[1].set_title(f'Segmented Planes: {num_segments} found')
+
+            #axes[2].imshow(overlay)
+            #axes[2].set_title('Overlay')
+
+            # axes[4].imshow(overlay_gt)
+            # axes[4].set_title('Overlay GT')
+
+            #plt.tight_layout()
+            # plt.show()
+            
+            
+            
+            # Create a new figure for the segmented image
+            
             
             # Compare different clustering methods
-            print("Clustering normals...")
+            #print("Clustering normals...")
             
             # 1. Bilateral clustering
             # start_time = time.time()
@@ -567,10 +789,10 @@ def main():
             # visualize_clusters(bilateral_clusters, "Bilateral Clustering")
             
             # 2. Region growing
-            start_time = time.time()
-            region_clusters = region_growing_clustering(normals, similarity_threshold=0.90)
-            print(f"Region growing time: {time.time() - start_time:.3f} seconds")
-            visualize_clusters(region_clusters, "Region Growing")
+            # start_time = time.time()
+            # region_clusters = region_growing_clustering(normals, similarity_threshold=0.95)
+            # print(f"Region growing time: {time.time() - start_time:.3f} seconds")
+            # visualize_clusters(region_clusters, "Region Growing")
             
             # # 3. K-means
             # start_time = time.time()
