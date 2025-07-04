@@ -52,7 +52,7 @@ def generate_sample_index(num_frames, skip_frames, sequence_length):
     return sample_index_list
 
 
-class SML_consistent_dataset(Dataset):
+class SML_tartan_consistent_dataset(Dataset):
     def __init__(self,
                  data_root,
                  mode="train",
@@ -81,8 +81,11 @@ class SML_consistent_dataset(Dataset):
         sequence_set = []
 
         for scene in self.scenes:
-            intrinsics = np.genfromtxt(
-                scene/'K.txt').astype(np.float32).reshape((3, 3))
+            intrinsics = np.array([
+                [320,   0, 320],
+                [  0, 320, 240],
+                [  0,   0,   1]
+            ], dtype=np.float32)
 
             # Load image paths
             images_path = scene / 'image'
@@ -93,9 +96,9 @@ class SML_consistent_dataset(Dataset):
             imgs = [imgs[d] for d in frame_index]
 
             #load tgt target depth
-            depth_pred_path = scene / 'depth_infer_dpt'
-            depth_pred = sorted(depth_pred_path.glob('*.npy'))
-            depth_pred = [depth_pred[d] for d in frame_index]
+            # depth_pred_path = scene / 'depth_infer_dpt'
+            # depth_pred = sorted(depth_pred_path.glob('*.npy'))
+            # depth_pred = [depth_pred[d] for d in frame_index]
             
             # Load ga depth inverse
             ga_depth_inv_path = scene / 'ga_depth_inv'
@@ -131,7 +134,7 @@ class SML_consistent_dataset(Dataset):
             for sample_index in sample_index_list:
                 sample = {'intrinsics': intrinsics,
                           'tgt_img': imgs[sample_index['tgt_idx']]}
-                sample['tgt_depth_pred'] = depth_pred[sample_index['tgt_idx']]
+                #sample['tgt_depth_pred'] = depth_pred[sample_index['tgt_idx']]
                 sample['tgt_ga_depth'] = ga_depth_inv[sample_index['tgt_idx']]
                 sample['tgt_gt_depth'] = gt_depth[sample_index['tgt_idx']]
                 sample['tgt_pose'] = poses[sample_index['tgt_idx']]
@@ -225,7 +228,7 @@ class SML_consistent_dataset(Dataset):
         tgt_ga_depth = load_depth_image_from_npy(str(sample['tgt_ga_depth']))
         tgt_interp = load_depth_image_from_npy(str(sample['tgt_interp']))
         tgt_pose = self.convert_to_4x4(np.loadtxt(str(sample['tgt_pose'])))
-        tgt_depth_pred = load_depth_image_from_npy(str(sample['tgt_depth_pred']))
+        #tgt_depth_pred = load_depth_image_from_npy(str(sample['tgt_depth_pred']))
 
         ref_img = [load_input_image(str(ref_img)) for ref_img in sample['ref_imgs']]
         ref_ga_depth = [load_depth_image_from_npy(str(ref_ga_depth)) for ref_ga_depth in sample['ref_ga_depth']]
@@ -238,40 +241,6 @@ class SML_consistent_dataset(Dataset):
         
         # Get original image dimensions
         h, w = tgt_img.shape[:2]
-        # crop_size = (384, 384)
-        
-        # # Calculate crop offsets for center crop
-        # top = (h - crop_size[0]) // 2
-        # left = (w - crop_size[1]) // 2
-        
-        # # Ensure non-negative offsets
-        # top = max(0, top)
-        # left = max(0, left)
-    
-        # # Apply crop to target image and depths
-        # tgt_img = tgt_img[top:top+crop_size[0], left:left+crop_size[1]]
-        # tgt_gt_depth = tgt_gt_depth[top:top+crop_size[0], left:left+crop_size[1]]
-        # tgt_sparse_depth = tgt_sparse_depth[top:top+crop_size[0], left:left+crop_size[1]]
-        # tgt_ga_depth = tgt_ga_depth[top:top+crop_size[0], left:left+crop_size[1]]
-        # tgt_interp = tgt_interp[top:top+crop_size[0], left:left+crop_size[1]]
-        
-        # # Apply crop to reference images and depths
-        # ref_img = [img[top:top+crop_size[0], left:left+crop_size[1]] for img in ref_img]
-        # ref_ga_depth = [depth[top:top+crop_size[0], left:left+crop_size[1]] for depth in ref_ga_depth]
-        # ref_sparse_depth = [depth[top:top+crop_size[0], left:left+crop_size[1]] for depth in ref_sparse_depth]
-        # ref_interp = [depth[top:top+crop_size[0], left:left+crop_size[1]] for depth in ref_interp]
-        # ref_gt_depth = [depth[top:top+crop_size[0], left:left+crop_size[1]] for depth in ref_gt_depth]
-        
-        # # Update intrinsics to account for cropping
-        # # intrinsics is typically [fx, fy, cx, cy] or a 3x3 matrix
-        # if intrinsics.shape == (4,):  # [fx, fy, cx, cy] format
-        #     # Adjust principal point
-        #     intrinsics[2] = intrinsics[2] - left  # cx
-        #     intrinsics[3] = intrinsics[3] - top   # cy
-        # elif intrinsics.shape == (3, 3):  # 3x3 matrix format
-        #     # Adjust principal point
-        #     intrinsics[0, 2] = intrinsics[0, 2] - left  # cx
-        #     intrinsics[1, 2] = intrinsics[1, 2] - top   # cy
         
         mask = (tgt_gt_depth < 5.0)
         mask *= (tgt_gt_depth > 0.2)
@@ -305,114 +274,4 @@ class SML_consistent_dataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
-
-# if __name__ == "__main__":
-#     #dataset = SML_consistent_dataset(data_root='/media/saimouli/Data6T/datasets/VOID_150_test', mode='val', sequence_length=3)
-#     dataset = torch.utils.data.DataLoader(SML_consistent_dataset(data_root='/media/saimouli/Data6T/datasets/VOID_150_test', mode='val'))
-#     # rr.init("3d_points_visualization", spawn=True)
-
-#     #for idx in range(len(dataset)):
-#     for batch_data in dataset:
-#         tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, _, ref_imgs, \
-#         ref_ga_depth, ref_interp, ref_gt_depth, _, tgt_pose, ref_pose, intrinsics, \
-#             tgt_pose_per,ref_pose_per = batch_data #dataset[idx] #Cam2Wld poses (R_ctoG, p_CinG)
-
-#         B, H, W,_ = tgt_img.shape
-#         _, _, DH, DW = tgt_gt_depth_inv.shape
-#         scale_factor = DW / float(W)
-        
-# #       perturbed_pose = ref_pose[0].clone().detach().requires_grad_(True)
-# #       optimizer = torch.optim.Adam([perturbed_pose], lr=1e-3)
-#         ref_rel_poses = [tgt_pose.inverse() @ ref_p for ref_p in ref_pose]
-#         cam = Camera(K=intrinsics.float()).scaled(scale_factor)
-#         ref_cam1 = Camera(K=intrinsics.float(), Twc=ref_rel_poses[0]).scaled(scale_factor)
-#         ref_cam2 = Camera(K=intrinsics.float(), Twc=ref_rel_poses[1]).scaled(scale_factor)
-
-#         gt_depth = utils.inv2depth(tgt_gt_depth_inv)
-#         world_points = cam.reconstruct(gt_depth, frame='w')
-#         print("Min/Max world_points:", world_points.min().item(), world_points.max().item())
-        
-#         # Project world points into reference cameras
-#         ref_coords1 = ref_cam1.project(world_points, frame='w', normalize=True)  # (b, h, w, 2)
-#         ref_coords2 = ref_cam2.project(world_points, frame='w', normalize=True)  # (b, h, w, 2)
-
-#         print("Min/Max ref_coords1:", ref_coords1.min().item(), ref_coords1.max().item(), ref_coords1.median().item())
-#         print("Min/Max ref_coords2:", ref_coords2.min().item(), ref_coords2.max().item(), ref_coords2.median().item())
-        
-#         # Warp reference images into the target view
-#         warped_ref1 = F.grid_sample(ref_imgs[0].permute(0, 3, 1, 2), ref_coords1,
-#                                     mode='bilinear', padding_mode='zeros', align_corners=True)
-#         warped_ref2 = F.grid_sample(ref_imgs[1].permute(0, 3, 1, 2), ref_coords2, 
-#                                     mode='bilinear', padding_mode='zeros', align_corners=True)
-
-#         # Convert tensors to numpy for visualization
-#         tgt_img_np = (tgt_img[0].cpu().numpy() * 255).astype(np.uint8)  # Target image
-#         warped_ref1_np = (warped_ref1.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)  # Warped Ref 1
-#         warped_ref2_np = (warped_ref2.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)  # Warped Ref 2
-
-#         warped_identity = F.grid_sample(
-#             tgt_img.permute(0, 3, 1, 2), ref_coords1,
-#             mode='bilinear', padding_mode='zeros', align_corners=True
-#         )
-#         # Convert images to BGR for OpenCV visualization
-#         tgt_img_bgr = cv2.cvtColor(tgt_img_np, cv2.COLOR_RGB2BGR)
-#         warped_ref1_bgr = cv2.cvtColor(warped_ref1_np, cv2.COLOR_RGB2BGR)
-#         warped_ref2_bgr = cv2.cvtColor(warped_ref2_np, cv2.COLOR_RGB2BGR)
-#         warped_identity_bgr = cv2.cvtColor((warped_identity.squeeze(0).permute(1, 2, 0).cpu().numpy()*255).astype(np.uint8), cv2.COLOR_RGB2BGR)
-
-#         # Create overlays of the target image and the warped reference images
-#         fig, axes = plt.subplots(1, 2, figsize=(15, 5))
-#         axes[0].imshow(cv2.cvtColor(warped_ref1_bgr, cv2.COLOR_BGR2RGB))
-#         axes[0].set_title("Warped Ref Image 1")
-#         axes[1].imshow(cv2.cvtColor(warped_ref2_bgr, cv2.COLOR_BGR2RGB))
-#         axes[1].set_title("Warped Ref Image 2")
-        
-#         overlay_ref1 = cv2.addWeighted(tgt_img_bgr, 0.5, warped_ref1_bgr, 0.5, 0)
-#         overlay_ref2 = cv2.addWeighted(tgt_img_bgr, 0.5, warped_ref2_bgr, 0.5, 0)
-
-#         # Plot the aligned images
-#         fig, axes = plt.subplots(1, 4, figsize=(15, 5))
-
-#         # Target image
-#         axes[0].imshow(cv2.cvtColor(tgt_img_bgr, cv2.COLOR_BGR2RGB))
-#         axes[0].set_title("Target Image")
-#         axes[0].axis("off")
-
-#         # Target + Warped Ref Image 1
-#         axes[1].imshow(cv2.cvtColor(overlay_ref1, cv2.COLOR_BGR2RGB))
-#         axes[1].set_title("Overlay: Target + Warped Ref Image 1")
-#         axes[1].axis("off")
-
-#         # Target + Warped Ref Image 2
-#         axes[2].imshow(cv2.cvtColor(overlay_ref2, cv2.COLOR_BGR2RGB))
-#         axes[2].set_title("Overlay: Target + Warped Ref Image 2")
-#         axes[2].axis("off")
-        
-#         axes[3].imshow(cv2.cvtColor(warped_identity_bgr, cv2.COLOR_BGR2RGB))
-#         axes[3].set_title("Warped Identity")
-#         axes[3].axis("off")
-
-#         plt.tight_layout()
-#         plt.show()
-                
-#         #ref_imgs_np = [ref_img.transpose(1, 2, 0).astype(np.uint8) for ref_img in ref_imgs]
-#         fig, axes = plt.subplots(1, len(ref_imgs) + 1, figsize=(15, 5))
-#         mid_idx = len(ref_imgs) // 2
-#         for i, ref_img_np in enumerate(ref_imgs[:mid_idx]):
-#             axes[i].imshow(ref_img_np[0])
-#             axes[i].set_title(f"Ref Image {i + 1}")
-#             axes[i].axis("off")
-
-#         # Plot the target image in the center
-#         axes[mid_idx].imshow(tgt_img[0])
-#         axes[mid_idx].set_title("Target Image")
-#         axes[mid_idx].axis("off")
-
-#         for i, ref_img_np in enumerate(ref_imgs[mid_idx:], start=mid_idx + 1):
-#             axes[i].imshow(ref_img_np[0])
-#             axes[i].set_title(f"Ref Image {i + 1}")
-#             axes[i].axis("off")
-        
-#         plt.tight_layout()
-#         plt.show()
 

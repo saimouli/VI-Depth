@@ -4,6 +4,7 @@ from torch.utils.data import DataLoader
 import os
 from data.SML_dataset import SML_dataset
 from data.SML_consistent_dataset import SML_consistent_dataset
+from data.SML_tartan_consistent_dataset import SML_tartan_consistent_dataset
 
 class SMLDataConsistentModule(pl.LightningDataModule):
     def __init__(
@@ -25,16 +26,17 @@ class SMLDataConsistentModule(pl.LightningDataModule):
 
     def setup(self, stage: str):
         if stage == "fit":
-            self.train_dataset = SML_consistent_dataset(
+            self.train_dataset = SML_tartan_consistent_dataset( #SML_consistent_dataset(
                 self.data_root,
                 mode="train",
                 sequence_length=self.sequence_length
             )
-            self.test_dataset = SML_consistent_dataset(
+            self.test_dataset = SML_tartan_consistent_dataset( #SML_consistent_dataset(
                 self.data_root,
                 mode="val",
                 sequence_length=self.sequence_length
             )
+            
     def train_dataloader(self):
         return DataLoader(
             self.train_dataset,

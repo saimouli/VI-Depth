@@ -76,7 +76,7 @@ class SML_dataset(Dataset):
         # gt_depth = F.interpolate(torch.tensor(gt_depth).unsqueeze(0).unsqueeze(0), 
         #                                   size=(288, 384), mode='bilinear', align_corners=False).squeeze(0).squeeze(0)
 
-        mask = (gt_depth < 8.0)
+        mask = (gt_depth < 5.0)
         mask *= (gt_depth > 0.2)
         gt_depth[~mask] = np.inf  # set invalid depth
         gt_depth_inv = 1.0 / gt_depth

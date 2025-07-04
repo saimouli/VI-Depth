@@ -106,41 +106,40 @@ class midasNetConsistentModule(pl.LightningModule):
         self.avg_error_w_int_depth.reset()
         self.avg_error_w_pred.reset()
         self.avg_error_pose_pred.reset()
-        
+    
     def validation_step(self, batch, batch_idx):
-        loss = self._common_step(batch, batch_idx, stage="val")
-        pred_depth = loss["pred_depth"]  # (B, H, W)
-        gt_depth = loss["gt_depth"]      # (B, H, W)
-        ga_depth = loss["ga_depth"]      # (B, H, W)
-        ref_gt_poses = loss["ref_gt_poses"]
-        ref_pred_poses = loss["ref_pred_poses"]
+        out = self._common_step(batch, batch_idx, stage="val")
+        pred_depth = out.pop("pred_depth").cpu()   # remove so it can’t leak  # (B, H, W)
+        gt_depth   = out.pop("gt_depth").cpu()      # (B, H, W)
+        ga_depth   = out.pop("ga_depth").cpu()     # (B, H, W) 
+        ref_gt     = out.pop("ref_gt_poses") 
+        ref_pred   = out.pop("ref_pred_poses")
         
-        batch_size = pred_depth.shape[0]
+        batch_sz = pred_depth.size(0)
         max_depth, min_depth = self.max_depth, self.min_depth
         
-        for i in range(batch_size):
+        for i in range(batch_sz):
             tgt_gt = gt_depth[i]
             tgt_ga = ga_depth[i]
             pred = pred_depth[i]
             
             valid_mask = (tgt_gt >= min_depth) & (tgt_gt <= max_depth)
-            ga_metrics = metrics.ErrorMetrics_DDP()
-            ga_metrics.compute(tgt_ga, tgt_gt, valid_mask)
-            self.avg_error_w_int_depth.accumulate(ga_metrics)
+            ga_m   = metrics.ErrorMetrics_DDP();   ga_m.compute(tgt_ga, tgt_gt, valid_mask)
+            pred_m = metrics.ErrorMetrics_DDP(); pred_m.compute(pred, tgt_gt, valid_mask)
+            self.avg_error_w_int_depth.accumulate(ga_m)
+            self.avg_error_w_pred.accumulate(pred_m)
             
-            pred_metrics = metrics.ErrorMetrics_DDP()
-            pred_metrics.compute(pred, tgt_gt, valid_mask)
-            self.avg_error_w_pred.accumulate(pred_metrics)
-            
-            for ref_idx in range(len(ref_pred_poses)):
-                pred_pose = ref_pred_poses[ref_idx][i]
-                gt_pose = ref_gt_poses[ref_idx][i]
-                
-                pose_metrics = metrics.ErrorMetrics_DDP()
-                pose_metrics.compute_pose(pred_pose, gt_pose)
-                self.avg_error_pose_pred.accumulate_pose(pose_metrics)
-                        
-        return loss
+            for k in range(len(ref_pred)):
+                pm = metrics.ErrorMetrics_DDP()
+                pm.compute_pose(ref_pred[k][i], ref_gt[k][i])
+                self.avg_error_pose_pred.accumulate_pose(pm)
+        # ------------- free the big stuff immediately -------------
+        del pred_depth, gt_depth, ga_depth, ref_pred, ref_gt 
+    
+        # print(f"Batch {batch_idx} - Memory allocated: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
+        # print(f"Memory reserved: {torch.cuda.memory_reserved()/1024**3:.2f} GB")
+        
+        return out["loss"].detach()
         
     def compute_exp_weighted_l1loss(self, metric_depth_pred, tgt_gt_depth, gamma=0.85):
         total_loss = 0.0
@@ -460,7 +459,7 @@ class midasNetConsistentModule(pl.LightningModule):
         #input_sparse_depth, input_image, rel_depth_pred, depth_gt, validity_map = batch
         tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp,_, ref_imgs, \
         ref_ga_depth, ref_interp, _, _, tgt_pose, ref_gt_pose, intrinsics, \
-            tgt_pose_perturbed, ref_pose_perturbed,_ = batch
+            tgt_pose_perturbed, ref_pose_perturbed = batch
         
         gt_depth = utils.inv2depth(tgt_gt_depth_inv)
         
