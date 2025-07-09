@@ -35,6 +35,8 @@ class ErrorMetrics_DDP:
 
     def compute(self, estimate: torch.Tensor, target: torch.Tensor, valid_mask: torch.Tensor):
         """Compute metrics using PyTorch tensors directly (inputs: inverse depth 1/m)"""
+        if len(estimate.shape) == 2:
+            estimate = estimate.unsqueeze(0)
         valid_estimate_inv = estimate[valid_mask]
         valid_target_inv = target[valid_mask]
 

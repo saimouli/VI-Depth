@@ -177,7 +177,7 @@ class SML_consistent_dataset(Dataset):
         return img
 
     # Add SE(3) perturbations (mimic VIO drift)
-    def add_perturbation(self, pose, max_trans=0.10, max_rot_deg=4.0):
+    def add_perturbation(self, pose, max_trans=0.12, max_rot_deg=2.0):
         """Add random SE(3) perturbation to pose (3x4 numpy array)"""
         if isinstance(pose, np.ndarray):
             pose = torch.from_numpy(pose).float()
@@ -300,7 +300,7 @@ class SML_consistent_dataset(Dataset):
         #img, gt_depth, ga_depth, interp_scale
         return tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, tgt_sparse_depth, ref_img, \
             ref_ga_depth, ref_interp, ref_gt_depth, ref_sparse_depth, tgt_pose, ref_pose, intrinsics, \
-            tgt_pose_perturbed, ref_pose_perturbed
+            tgt_pose_perturbed, ref_pose_perturbed, tgt_depth_pred
     
     def __len__(self):
         return len(self.samples)

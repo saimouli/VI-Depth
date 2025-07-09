@@ -8,6 +8,7 @@ from modules.interpolator import Interpolator2D
 from tqdm import tqdm
 from PIL import Image
 import cv2
+import os
 
 def load_sparse_depth(input_sparse_depth_fp):
     input_sparse_depth = np.array(Image.open(input_sparse_depth_fp), dtype=np.float32) / 256.0
@@ -69,9 +70,13 @@ def save_priors(data_dir):
 
         sparse_folder = os.path.join(data_dir, folder, "sparse_depth")
         sprase_depth_path = [os.path.join(sparse_folder, f) for f in images]
+        
+        gt_depth_folder = os.path.join(data_dir, folder, "ground_truth")
+        gt_depth_path = [os.path.join(gt_depth_folder, f) for f in images]
 
-        min_depth, max_depth = 0.1, 8.0
-        min_pred, max_pred = 0.1, 8.0
+        min_depth, max_depth = 0.1, 5.0
+        min_pred, max_pred = 0.1, 5.0
+        max_error = 0.08  # 8 cm
 
         # Instantiate method
         method = pipeline.VIDepth(
@@ -81,6 +86,7 @@ def save_priors(data_dir):
 
         print("Images: ", len(images))
         print("Sparse: ", len(sprase_depth_path))
+        print("GT depth: ", len(gt_depth_path))
 
         save_folder = os.path.join(data_dir, folder)
         save_folder = os.path.join(save_folder, "depth_infer_dpt")
@@ -98,15 +104,23 @@ def save_priors(data_dir):
             input_sparse_depth_fp = sprase_depth_path[i]
             input_image = utils.read_image(input_image_fp)
             input_sparse_depth = load_sparse_depth(input_sparse_depth_fp)
+            gt_depth = load_sparse_depth(gt_depth_path[i])
 
             depth_infer_inv = method.infer_depth(input_image)
             input_sparse_depth_valid = (input_sparse_depth < max_depth) * (input_sparse_depth > min_depth)
-
-            input_sparse_depth_valid = input_sparse_depth_valid.astype(bool)
+            
+            error_mask = np.abs(input_sparse_depth - gt_depth) < max_error
+            valid_mask = input_sparse_depth_valid.astype(bool) & error_mask.astype(bool)
+            
             input_sparse_depth[~input_sparse_depth_valid] = np.inf # set invalid depth
             input_sparse_depth_inv = 1.0 / input_sparse_depth
 
-            ga_depth_inv, interp_scale = get_ga_and_scale(depth_infer_inv, input_sparse_depth_inv, input_sparse_depth_valid, min_pred, max_pred )
+            print("# of sparse points: ", np.sum(input_sparse_depth_valid))
+            print(" filtered sparse depth points: ", np.sum(error_mask))
+            if np.sum(valid_mask) < 50:
+                continue
+            
+            ga_depth_inv, interp_scale = get_ga_and_scale(depth_infer_inv, input_sparse_depth_inv, valid_mask, min_pred, max_pred )
 
             # plt.figure(1);plt.imshow(ga_depth_inv)
             # plt.figure(2);plt.imshow(interp_scale)
@@ -166,28 +180,81 @@ def create_frame_index(data_dir):
             #frame1 = cv2.imread(images_path[index[-1]])
             #frame2 = cv2.imread(images_path[idx])
 
-            pose1 = np.loadtxt(pose_path[index[-1]])
-            pose2 = np.loadtxt(pose_path[idx])
+            #pose1 = np.loadtxt(pose_path[index[-1]])
+            #pose2 = np.loadtxt(pose_path[idx])
 
             #if pose movement is > 0.1m?
-            pose_diff = np.linalg.norm(pose1[:3, 3] - pose2[:3, 3])
-            R1, R2 = pose1[:3, :3], pose2[:3, :3]
-            rot_angle = rotation_angle(R1, R2)
+            # pose_diff = np.linalg.norm(pose1[:3, 3] - pose2[:3, 3])
+            # R1, R2 = pose1[:3, :3], pose2[:3, :3]
+            # rot_angle = rotation_angle(R1, R2)
             
-            if pose_diff < 0.1 and rot_angle < 6:
-                continue
+            # if pose_diff < 0.1 and rot_angle < 6:
+            #     continue
             index.append(idx)
             frame_names.append(images[idx])
 
         print(len(images), len(frame_names))
         np.savetxt(os.path.join(data_dir, folder, "frame_index.txt"), index, fmt='%d', delimiter='\n')
+        
+def count_images_in_image_left(folder, exts=('.png', '.jpg', '.jpeg', '.npy')):
+    count = 0
+    for root, dirs, files in os.walk(folder):
+        if os.path.basename(root) == 'image':
+            for f in files:
+                if f.lower().endswith(exts):
+                    count += 1
+    return count
 
+def clean_folders(data_dir):
+    scenes = [d for d in os.listdir(data_dir)
+              if os.path.isdir(os.path.join(data_dir, d))]
+    print(f"Found {len(scenes)} scenes in {data_dir}")
+    
+    for scene in scenes:
+        scene_path = os.path.join(data_dir, scene)
+        interp_dir = os.path.join(scene_path, "interp_scale")
+        if not os.path.isdir(interp_dir):
+            print(f"[{scene}] no interp_scale/, skipping")
+            continue
 
+        # 1) get valid stems
+        interp_files = [f for f in os.listdir(interp_dir) if f.endswith('.npy')]
+        valid_stems = set(os.path.splitext(f)[0] for f in interp_files)
 
+        # 2) folders to prune
+        targets = ["sparse_depth", "absolute_pose", "covariance", "ground_truth", "image"]
+        for sub in targets:
+            subdir = os.path.join(scene_path, sub)
+            if not os.path.isdir(subdir):
+                print(f"[{scene}]   {sub}/ not found, skipping")
+                continue
 
+            removed = 0
+            for fname in os.listdir(subdir):
+                stem, _ = os.path.splitext(fname)
+                if stem not in valid_stems:
+                    os.remove(os.path.join(subdir, fname))
+                    removed += 1
+            print(f"[{scene}]   pruned {removed} files from {sub}/")
+                
 if __name__ == "__main__":
-    data_dir = "/media/saimouli/Data6T/datasets/VOID_150_test/training" #"/media/saimouli/RPNG_FLASH_4/datasets/VOID_150/training"
-    # save_priors(data_dir)
+    root = "/media/saimouli/Data6T/datasets/tartanair/vi_depth/"
+    test_dir = root + "/testing" #"/media/saimouli/RPNG_FLASH_4/datasets/VOID_150/training"
+    train_dir = root + "/training"
+    
+    #save_priors(test_dir)
+    save_priors(train_dir)
+    
+    clean_folders(train_dir)
+    clean_folders(test_dir)
+    
+    create_frame_index(test_dir)
+    create_frame_index(train_dir)
+    
+    train_img_count = count_images_in_image_left(train_dir)
+    test_img_count = count_images_in_image_left(test_dir)
 
-    create_frame_index(data_dir)
-
+    print(f"Total images in train: {train_img_count}")
+    print(f"Total images in test: {test_img_count}")
+    print(f"train %: {train_img_count/(train_img_count + test_img_count) *100}")
+    print(f"test %: {test_img_count/(train_img_count + test_img_count)*100}")

@@ -1,4 +1,4 @@
-from model.mhybrid_consistent_net import midasConsNet
+from model.mhybrid_consistent_net import midasConsNet, UncertaintyAwareMidasNet
 import torch.nn.functional as F
 import pytorch_lightning as pl
 import numpy as np
@@ -20,15 +20,11 @@ class midasNetConsistentModule(pl.LightningModule):
     def __init__(self, lr: float = 0.1, wd: float = 0.1, min_pred: float = 0.1, 
                  max_pred: float = 8.0, min_depth: float = 0.2, 
                  max_depth: float = 5.0, nsamples: int = 150, img_h=480, 
-                 img_w=640, sml_model_path: str = None, useConvGRU: bool = True, is_train: bool = True,
+                 img_w=640, sml_model_path: str = None, useConvGRU: bool = True, is_train: bool = False,
                  *args: Any, **kwargs: Any) -> None:
         super(midasNetConsistentModule, self).__init__(*args, **kwargs)
-        self.model = midasConsNet(min_pred, max_pred, min_depth, max_depth, nsamples, 
-                                  sml_model_path, is_train=is_train, log_fn=self.log, isConvGRU=useConvGRU)
+        
         #print model params
-        print("useConvGRU: ", useConvGRU)
-        print("is_train: ", is_train)
-        print("Model Parameters: ", sum(p.numel() for p in self.model.parameters() if p.requires_grad))
         self.lr = lr
         self.max_depth = max_depth
         self.min_depth = min_depth
@@ -37,7 +33,21 @@ class midasNetConsistentModule(pl.LightningModule):
         self.orig_w = img_w
         self.abs_loss = nn.L1Loss()
         self.useConvGRU = useConvGRU
-
+        self.confidence_threshold = 0.7
+        self.uncertainty_weight = 0.5
+        self.use_uncertainty = False
+        
+        if self.use_uncertainty:
+            self.model = UncertaintyAwareMidasNet(min_pred, max_pred, min_depth, max_depth, nsamples, 
+                                  sml_model_path, is_train=is_train, log_fn=self.log, isConvGRU=useConvGRU)
+        else:
+            self.model = midasConsNet(min_pred, max_pred, min_depth, max_depth, nsamples, 
+                                  sml_model_path, is_train=is_train, log_fn=self.log, isConvGRU=useConvGRU)
+        
+        print("useConvGRU: ", useConvGRU)
+        print("is_train: ", is_train)
+        print("Model Parameters: ", sum(p.numel() for p in self.model.parameters() if p.requires_grad))
+        
     def on_fit_start(self):
         """Ensure that metric averaging uses the correct device after model initialization."""
         self.avg_error_w_int_depth = metrics.ErrorMetricsAverager_DDP(self.device)
@@ -57,6 +67,10 @@ class midasNetConsistentModule(pl.LightningModule):
                 ref_ga_depth, tgt_interp, 
                 ref_interp, tgt_pose, 
                 ref_pose, intrinsics):
+        
+        if self.useConvGRU == False:
+            print("Not using GRU Refinement")
+        #self.model.iter_steps=0
         refined_depth_inv, refined_ref_poses = self.model(tgt_img, ref_img,
                                                             tgt_ga_depth, ref_ga_depth, 
                                                             tgt_interp, ref_interp, 
@@ -113,7 +127,8 @@ class midasNetConsistentModule(pl.LightningModule):
         gt_depth   = out.pop("gt_depth").cpu()      # (B, H, W)
         ga_depth   = out.pop("ga_depth").cpu()     # (B, H, W) 
         ref_gt     = out.pop("ref_gt_poses") 
-        ref_pred   = out.pop("ref_pred_poses")
+        if "ref_pred_poses" in out:
+            ref_pred   = out.pop("ref_pred_poses")
         
         batch_sz = pred_depth.size(0)
         max_depth, min_depth = self.max_depth, self.min_depth
@@ -129,12 +144,15 @@ class midasNetConsistentModule(pl.LightningModule):
             self.avg_error_w_int_depth.accumulate(ga_m)
             self.avg_error_w_pred.accumulate(pred_m)
             
-            for k in range(len(ref_pred)):
-                pm = metrics.ErrorMetrics_DDP()
-                pm.compute_pose(ref_pred[k][i], ref_gt[k][i])
-                self.avg_error_pose_pred.accumulate_pose(pm)
+            if "ref_pred_poses" in out:
+                for k in range(len(ref_pred)):
+                    pm = metrics.ErrorMetrics_DDP()
+                    pm.compute_pose(ref_pred[k][i], ref_gt[k][i])
+                    self.avg_error_pose_pred.accumulate_pose(pm)
         # ------------- free the big stuff immediately -------------
-        del pred_depth, gt_depth, ga_depth, ref_pred, ref_gt 
+        if "ref_pred_poses" in out:
+            del ref_pred
+        del pred_depth, gt_depth, ga_depth, ref_gt
     
         # print(f"Batch {batch_idx} - Memory allocated: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
         # print(f"Memory reserved: {torch.cuda.memory_reserved()/1024**3:.2f} GB")
@@ -312,7 +330,25 @@ class midasNetConsistentModule(pl.LightningModule):
                     )
 
         return total_loss / valid_count
+
+    def compute_uncertainty_loss(self, predicted_depth, gt_depth, predicted_uncertainty, valid_mask):
+        """
+        Compute uncertainty-aware loss
+        """
+        # Compute depth error
+        depth_error = torch.abs(predicted_depth - gt_depth)
         
+        # Uncertainty loss (negative log-likelihood)
+        # L = 0.5 * log(2π * σ²) + (pred - gt)² / (2σ²)
+        # Simplified: L = 0.5 * log(σ²) + (pred - gt)² / (2σ²)
+        uncertainty_loss = 0.5 * torch.log(predicted_uncertainty + 1e-8) + \
+                          (depth_error ** 2) / (2 * predicted_uncertainty + 1e-8)
+        
+        # Apply valid mask
+        uncertainty_loss = uncertainty_loss * valid_mask
+        
+        return uncertainty_loss.mean()
+    
     def compute_loss(self, pred_depth, gt_depth, log_variance=None, mask=None):
         """
         Computes the loss for depth prediction based on L1 depth loss and multiscale gradient matching.
@@ -370,6 +406,57 @@ class midasNetConsistentModule(pl.LightningModule):
             loss_info['uncertainty_loss'] = 0.5 * log_variance.mean().item()
 
         return total_loss, loss_info
+    
+    def compute_standard_depth_loss(self, depth_preds, gt_depth):
+        total_loss = 0.0
+        total_weight = 0.0
+        num_levels = len(depth_preds)
+        gamma = 0.85
+        
+        valid_mask = ((gt_depth > self.min_depth) & (gt_depth <= self.max_depth)).float().detach()
+        for i, pred_depth in enumerate(depth_preds):
+            weight = gamma ** (num_levels - i - 1)
+            total_weight += weight
+            
+            l1_loss = torch.mean(torch.abs(gt_depth - pred_depth) * valid_mask)
+            total_loss += weight * l1_loss
+            
+        return total_loss / total_weight
+    
+    def compute_depth_loss_with_uncertainty(self, depth_preds, uncertainty_preds, gt_depth):
+        """
+        Compute depth loss with uncertainty weighting across multiple scales
+        """
+        total_loss = 0.0
+        total_weight = 0.0
+        num_levels = len(depth_preds)
+        gamma = 0.85
+        lambda_reg = 0.01
+        valid_mask = ((gt_depth > self.min_depth) & (gt_depth <= self.max_depth)).float().detach()
+        
+        for i, (pred_depth, sigma2) in enumerate(zip(depth_preds, uncertainty_preds)):
+            weight = gamma ** (num_levels - i - 1)
+            total_weight += weight
+            
+            #if self.use_uncertainty:
+                # Uncertainty-aware loss
+                #uncertainty_loss = self.compute_uncertainty_loss(pred_depth, gt_depth, uncertainty, valid_mask)
+                #loss_i = uncertainty_loss
+            #else:
+                # Standard L1 loss
+                
+            # clamp to avoid log(0) and exploding gradients
+            # err    = (pred_depth - gt_depth)
+            # nll    = torch.log(sigma2) + err.pow(2) / (2.0 * sigma2)
+            # reg_term = lambda_reg * (torch.log(sigma2) ** 2).mean() 
+            # loss_i = ((nll + reg_term) * valid_mask).sum() / valid_mask.sum().clamp(min=1)
+            
+            l1_loss = torch.mean(torch.abs(gt_depth - pred_depth) * valid_mask)
+            loss_i = l1_loss
+            
+            total_loss += weight * loss_i
+        
+        return total_loss / total_weight        
     
     def calculate_grudepth_loss(self, inv_depths, gt_inv_depths):
         """
@@ -455,6 +542,66 @@ class midasNetConsistentModule(pl.LightningModule):
         
         return total_loss / w_totoal
     
+    def compute_confidence_weighted_pose_loss(self, pred_poses, gt_poses, gt_depth, K, confidence_maps=None):
+        """
+        Compute pose loss with confidence weighting
+        """
+        def huber_loss(x, delta):
+            abs_x = torch.abs(x)
+            return torch.where(abs_x < delta, 0.5 * x**2, delta * (abs_x - 0.5 * delta))
+
+        device = gt_poses[0].device
+        scale_factor = 1
+        MAX_ERROR = 1
+        total_loss = 0
+        w_total = 0
+        gamma = 0.85
+        iter = len(pred_poses[0])
+        
+        min_depth = self.min_depth
+        max_depth = self.max_depth / 4.0
+        
+        gt_depth_mask = (gt_depth > min_depth) & (gt_depth < max_depth)
+        gt_depth_mask = gt_depth_mask.permute(0, 2, 3, 1)
+        
+        for i in range(iter):
+            loss_it = 0
+            w = gamma**(iter - i - 1)
+            w_total += w
+            
+            # Get confidence map for this iteration if available
+            confidence_weight = 1.0
+            if confidence_maps is not None and i < len(confidence_maps):
+                confidence_map = confidence_maps[i]
+                confidence_weight = F.interpolate(confidence_map, 
+                                                size=gt_depth.shape[-2:], 
+                                                mode='bilinear', 
+                                                align_corners=False).permute(0, 2, 3, 1)
+            
+            for view_i, gt_pose_view in enumerate(gt_poses):
+                pred_pose_view = pred_poses[view_i][i]
+                
+                coords_gt, mask_gt = self.get_ref_coords(gt_pose_view, K, gt_depth, scale_factor, device)
+                coords_pred, mask_pred = self.get_ref_coords(pred_pose_view, K, gt_depth, scale_factor, device)
+                
+                # Combine all masks including confidence
+                valid_mask = mask_gt * mask_pred * gt_depth_mask
+                if confidence_maps is not None:
+                    valid_mask = valid_mask * confidence_weight
+                
+                err = coords_pred - coords_gt
+                robust_err = huber_loss(err, delta=1.0)
+                reproj_loss = (valid_mask * confidence_weight * robust_err).sum() / \
+                                (valid_mask * confidence_weight).sum()
+                #reproj_diff = valid_mask * torch.abs(coords_pred - coords_gt).clamp(-MAX_ERROR, MAX_ERROR)
+                #reproj_loss = torch.mean(reproj_diff)
+                loss_it += reproj_loss
+                
+            loss_it = loss_it / len(gt_poses) 
+            total_loss += loss_it * w
+        
+        return total_loss / w_total
+    
     def _common_step(self, batch, batch_idx, stage="train"):
         #input_sparse_depth, input_image, rel_depth_pred, depth_gt, validity_map = batch
         tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp,_, ref_imgs, \
@@ -463,74 +610,69 @@ class midasNetConsistentModule(pl.LightningModule):
         
         gt_depth = utils.inv2depth(tgt_gt_depth_inv)
         
-        # if self.useConvGRU:
-        #     metric_depth_inv_pred = self.model(tgt_img, ref_imgs, tgt_ga_depth, ref_ga_depth, 
-        #                                     tgt_interp, ref_interp,
-        #                                     tgt_pose, ref_pose, intrinsics)
-            
-        #     # Compute depth loss with depth uncertainty
-        #     # loss, loss_info = self.compute_loss(utils.inv2depth(metric_depth_inv_pred), 
-        #     #                                    utils.inv2depth(tgt_gt_depth_inv),
-        #     #                                    log_variance=None)
-            
-        #     metric_depth_pred = utils.inv2depth(metric_depth_inv_pred)
-        #     total_loss = self.compute_exp_weighted_l1loss(metric_depth_pred, 
-        #                                             gt_depth)
-        # else:
         
         #convert to relative poses making the target pose identity
         with torch.no_grad():
             ref_rel_poses = [tgt_pose.inverse() @ ref_p for ref_p in ref_pose_perturbed]
             ref_rel_gtposes = [tgt_pose.inverse() @ ref_p for ref_p in ref_gt_pose]
-            
-        # refined_depth_inv, refined_target_pose, refined_ref_poses, warping_vis = self.model(tgt_img, ref_imgs,
-        #                                                                                     tgt_ga_depth, ref_ga_depth, 
-        #                                                                                     tgt_interp, ref_interp, 
-        #                                                                                     tgt_pose, 
-        #                                                                                     ref_rel_poses, 
-        #                                                                                     intrinsics)
         
         #(b, n, iters, 6) 
-        if self.current_epoch < 10:
+        if self.current_epoch < 14:
             self.model.iter_steps=0   
-            refined_depth_inv, refined_ref_poses = self.model(tgt_img, ref_imgs,
-                                                            tgt_ga_depth, ref_ga_depth, 
-                                                            tgt_interp, ref_interp, 
-                                                            tgt_pose, 
-                                                            ref_rel_gtposes, 
-                                                            intrinsics)
+            use_gt_poses = True
+            depth_only = True
+        
+        # if self.current_epoch >= 4 and self.current_epoch < 15:
+        #     self.model.iter_steps=3   
+        #     use_gt_poses = True
+        #     depth_only = True
             
-        elif self.current_epoch < 30:
-            self.model.iter_steps=3
-            refined_depth_inv, refined_ref_poses = self.model(tgt_img, ref_imgs,
+        # if self.current_epoch >= 15 :
+        #     self.model.iter_steps=3
+        #     use_gt_poses = False
+        #     depth_only = False
+            
+        input_poses = ref_rel_gtposes if use_gt_poses else ref_rel_poses
+        
+        if self.use_uncertainty:
+            outputs = self.model(tgt_img, ref_imgs, tgt_ga_depth, ref_ga_depth, 
+                                 tgt_interp, ref_interp, tgt_pose, input_poses,
+                                 intrinsics, depth_only=depth_only)
+            depth_preds = outputs['depths']
+            uncertainty_preds = outputs['uncertainties']
+            pose_preds = outputs.get('poses', None)
+            confidence_maps = outputs.get('confidence_maps', None)
+            
+            #Compute depth loss with uncertainty
+            depth_loss = self.compute_depth_loss_with_uncertainty(
+                [utils.inv2depth(d) for d in depth_preds],
+                #[d for d in depth_preds],
+                uncertainty_preds,
+                gt_depth
+                #tgt_gt_depth_inv
+            )
+            # depth_loss = self.compute_standard_depth_loss(
+            #     #[utils.inv2depth(d) for d in depth_preds],
+            #     [d for d in depth_preds],
+            #     tgt_gt_depth_inv
+            # )
+            
+            #print(f"Depth Loss: {depth_loss.item()}")
+        else:
+            depth_preds, pose_preds = self.model(tgt_img, ref_imgs,
                                                             tgt_ga_depth, ref_ga_depth, 
                                                             tgt_interp, ref_interp, 
                                                             tgt_pose, 
-                                                            ref_rel_gtposes, 
+                                                            input_poses, 
                                                             intrinsics)
-        
-        # else:
-        #     self.model.iter_steps=3
-        #     refined_depth_inv, refined_ref_poses = self.model(tgt_img, ref_imgs,
-        #                                                     tgt_ga_depth, ref_ga_depth, 
-        #                                                     tgt_interp, ref_interp, 
-        #                                                     tgt_pose, 
-        #                                                     ref_rel_poses, 
-        #                                                     intrinsics)
-        # 1. Depth L1 Loss
-        # depth_loss,_ = self.compute_loss(utils.inv2depth(refined_depth_inv),
-        #                         gt_depth,
-        #                         log_variance=None,
-        #                         mask=None)
-        
-        depth_loss = self.calculate_grudepth_loss(utils.inv2depth(refined_depth_inv), 
-                                            utils.inv2depth(tgt_gt_depth_inv))
-        
-        #visualize flag
-        if batch_idx %10 == 0:
-            log_tb = True
-        else:
-            log_tb = False
+            uncertainty_preds = None
+            confidence_maps = None
+
+            # Compute standard depth loss
+            depth_loss = self.compute_standard_depth_loss(
+                [utils.inv2depth(d) for d in depth_preds],
+                gt_depth
+            )
         
         # 2. Reprojection loss
         # reproj_loss = self.compute_reproj_loss(
@@ -546,68 +688,126 @@ class midasNetConsistentModule(pl.LightningModule):
         # )
         
         # refined_ref_poses shape: (b, num_ref_views, num_iters, 6)
-        pred_poses = []
-        for ref_idx in range(refined_ref_poses.shape[1]):  # Iterate through reference views
-            view_poses = []
-            for iter_idx in range(refined_ref_poses.shape[2]):  # Iterate through refinement steps
-                # Extract pose vector [b, 6]
-                pose_vec = refined_ref_poses[:, ref_idx, iter_idx, :]
-                # Convert to Pose object
-                view_poses.append(se3_to_pose(pose_vec))
-            pred_poses.append(view_poses)  # shape: (num_ref_views, num_iters)
+        pose_loss = 0.0
+        if pose_preds is not None:
+            pred_poses = []
+            for ref_idx in range(pose_preds.shape[1]):  # Iterate through reference views
+                view_poses = []
+                for iter_idx in range(pose_preds.shape[2]):  # Iterate through refinement steps
+                    # Extract pose vector [b, 6]
+                    pose_vec = pose_preds[:, ref_idx, iter_idx, :]
+                    # Convert to Pose object
+                    view_poses.append(se3_to_pose(pose_vec))
+                pred_poses.append(view_poses)  # shape: (num_ref_views, num_iters)
 
-        # Format ground truth poses ---------------------------------------------------
-        # Assuming ref_gt_pose is list of absolute poses: [pose_ref1, pose_ref2,...]
-        # Convert to relative poses if needed (based on your pose parametrization)
-        #refined_rel_poses = [pose_to_se3(fixed_tgt_pose.inverse() @ ref_p) for ref_p in ref_pose]
-        # gt_rel_poses = []
-        # tgt_pose_inv = tgt_pose.inverse()  # Assuming tgt_pose is fixed
-        # for ref_pose in ref_gt_pose:
-        #     # Convert absolute pose to relative pose
-        #     rel_pose = tgt_pose_inv * ref_pose
-        #     gt_rel_poses.append(rel_pose)
-            
-        reproj_loss = self.calc_pose_loss(pred_poses, ref_rel_gtposes, 
-                                          gt_depth, intrinsics)
+            # Compute pose loss with optional confidence weighting
+            if self.use_uncertainty and confidence_maps is not None:
+                pose_loss = self.compute_confidence_weighted_pose_loss(
+                    pred_poses, ref_rel_gtposes, gt_depth, intrinsics, confidence_maps
+                )
+            else:
+                pose_loss = self.calc_pose_loss(pred_poses, ref_rel_gtposes, 
+                                                gt_depth, intrinsics)
         
-        #pose regularization
-        # pose_reg = torch.norm(se3_log_map(refined_target_pose @ tgt_pose.inverse()))
-        # for refined_pose, gt_pose in zip(refined_ref_poses, ref_pose):
-        #     pose_reg += torch.norm(se3_log_map(refined_pose @ gt_pose.inverse()))
-    
-        #total_loss = loss
-        #if self.current_epoch < 0:
-        #   total_loss = depth_loss
-        #else:
-        total_loss = depth_loss + 1.0 * reproj_loss #+ 0.01 * pose_reg
+        total_loss = depth_loss
+        if not depth_only:
+            total_loss += 0.8 * pose_loss #+ 0.01 * pose_reg
         
         #self.logger.experiment.add_scalar(f"{stage}_loss", loss, self.global_step)
         #self.log(f"{stage}/pose_reg_loss", pose_reg, on_step=True, on_epoch=True, sync_dist=True)
-        self.log(f"{stage}/reproj_loss", reproj_loss, on_step=True, on_epoch=True, sync_dist=True)
-        self.log(f"{stage}/l1_depth_loss", depth_loss, on_step=True, on_epoch=True, sync_dist=True)
+        self.log(f"{stage}/pose_loss", pose_loss, on_step=True, on_epoch=True, sync_dist=True)
+        self.log(f"{stage}/depth_loss", depth_loss, on_step=True, on_epoch=True, sync_dist=True)
         self.log(f"{stage}/total_loss", total_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
         
         with torch.no_grad():
-            self.log_refinement_progress(tgt_img, ref_imgs, gt_depth,
-                                        utils.inv2depth(refined_depth_inv), pred_poses,
-                                        ref_rel_gtposes, intrinsics, mode=stage)
+            if batch_idx % 10 == 0:
+                if self.use_uncertainty:
+                    self.log_uncertainty_visualization(
+                        [utils.inv2depth(d) for d in depth_preds],
+                        uncertainty_preds,
+                        confidence_maps,
+                        gt_depth,
+                        stage=stage
+                    )
+                
+                    # self.log_refinement_progress(tgt_img, ref_imgs, gt_depth,
+                    #                             utils.inv2depth(depth_preds[-1]), 
+                    #                             pred_poses,
+                    #                             ref_rel_gtposes, 
+                    #                             intrinsics, 
+                    #                             mode=stage)
             
             #if len(warping_vis) > 0:
             #    self.log_warping(warping_vis, mode=stage)
             # self.log_img_tensorboard(tgt_img, gt_depth, utils.inv2depth(tgt_ga_depth).unsqueeze(0).permute(1,0,2,3), 
             #                          utils.inv2depth(refined_depth_inv), batch_idx, self.current_epoch, mode=stage)
-        return {
+        result = {
             "loss": total_loss,
             "mode": stage,
-            "pred_depth": refined_depth_inv[-1].detach(),
+            "pred_depth": depth_preds[-1].detach(),
             "gt_depth": tgt_gt_depth_inv.detach(),
             "ga_depth": tgt_ga_depth.unsqueeze(0).permute(1,0,2,3).detach(),
             "ref_gt_poses": ref_rel_gtposes,
-            "ref_pred_poses": [view_poses[-1] for view_poses in pred_poses],
         }
-        #TODO: compute loss for the pose as well
+        if not depth_only and pose_preds is not None:
+            result["ref_pred_poses"] = [view_poses[-1] for view_poses in pred_poses]
         
-
+        return result
+        
+    @torch.no_grad()
+    def log_uncertainty_visualization(self, depths, uncertainties, confidence_maps, gt_depth, stage="train"):
+        """
+        Log uncertainty and confidence visualizations to tensorboard
+        """
+        if len(depths) == 0:
+            return
+            
+        # Take the final prediction
+        final_depth = depths[-1][0].cpu().numpy()  # First batch
+        final_uncertainty = uncertainties[-1][0].cpu().numpy() if len(uncertainties) > 0 else None
+        final_confidence = confidence_maps[-1][0].cpu().numpy() if len(confidence_maps) > 0 else None
+        gt = gt_depth[0].cpu().numpy()
+        
+        # Normalize for visualization
+        def normalize_for_vis(x):
+            return ((x - x.min()) / (x.max() - x.min() + 1e-8) * 255).astype(np.uint8)
+        
+        # Create visualization grid
+        vis_list = []
+        
+        # Depth prediction
+        depth_vis = normalize_for_vis(final_depth.squeeze())
+        depth_vis = cv2.applyColorMap(depth_vis, cv2.COLORMAP_PLASMA)
+        vis_list.append(depth_vis)
+        
+        # Ground truth
+        gt_vis = normalize_for_vis(gt.squeeze())
+        gt_vis = cv2.applyColorMap(gt_vis, cv2.COLORMAP_PLASMA)
+        vis_list.append(gt_vis)
+        
+        # Uncertainty map
+        if final_uncertainty is not None:
+            uncertainty_vis = normalize_for_vis(final_uncertainty.squeeze())
+            uncertainty_vis = cv2.applyColorMap(uncertainty_vis, cv2.COLORMAP_HOT)
+            vis_list.append(uncertainty_vis)
+        
+        # Confidence map
+        if final_confidence is not None:
+            confidence_vis = normalize_for_vis(final_confidence.squeeze())
+            confidence_vis = cv2.applyColorMap(confidence_vis, cv2.COLORMAP_VIRIDIS)
+            vis_list.append(confidence_vis)
+        
+        # Combine images
+        combined_vis = np.hstack(vis_list)
+        combined_vis = cv2.cvtColor(combined_vis, cv2.COLOR_BGR2RGB)
+        
+        # Log to tensorboard
+        img_tensor = torch.from_numpy(combined_vis).permute(2, 0, 1)
+        self.logger.experiment.add_image(f"{stage}_uncertainty_analysis", 
+                                       img_tensor, 
+                                       global_step=self.global_step,
+                                       dataformats="CHW")
+        
     @torch.no_grad()
     def log_refinement_progress(self, tgt_img, ref_imgs, gt_depth, 
                                 inv_depth_predictions, refined_ref_poses,

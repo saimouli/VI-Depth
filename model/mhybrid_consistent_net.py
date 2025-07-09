@@ -105,9 +105,6 @@ class ProjectionInputPose(nn.Module):
         out= torch.cat([out_p, pose], dim=1)
         return self.downsample(out)
     
-#Limitations: 
-# limited receptive field: (1,5) and (5,1) convolutions separable
-# lack of global context
 class SepConvGRU(nn.Module):
     def __init__(self, hidden_dim=128, input_dim=192+128):
         super(SepConvGRU, self).__init__()
@@ -166,6 +163,7 @@ class OutputScaleConv(nn.Module):
     def forward(self, x):        
         return self.output_conv(x)
     
+
 class BasicUpdateBlockDepth(nn.Module):
     def __init__(self, hidden_dim=128, cost_dim=64, ratio=3, context_dim=64, min_pred=None, max_pred=None, log_fn=None):
         super(BasicUpdateBlockDepth, self).__init__()
@@ -238,7 +236,123 @@ class BasicUpdateBlockDepth(nn.Module):
             mask_list.append(mask)
             
         return hidden, mask_list, inv_depth_list, cost_means
+
+class UncertaintyAwareDepthHead(nn.Module):
+    """
+    Depth head that predicts both depth scale and uncertainty
+    """
+    def __init__(self, features, groups, activation, non_negative):
+        super(UncertaintyAwareDepthHead, self).__init__()
+        
+        # Shared features
+        self.shared_conv = nn.Sequential(
+            nn.Conv2d(features, features//2, kernel_size=3, stride=1, padding=1, groups=groups),
+            nn.ReLU(inplace=True),
+            
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(features//2, 32, kernel_size=3, stride=1, padding=1),
+            activation,
+            
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1),
+            activation,
+        )
+        
+        # Depth scale prediction
+        self.depth_head = nn.Sequential(
+            nn.Conv2d(32, 1, kernel_size=1, stride=1, padding=0),
+            # Ensure positive scale factors
+            nn.ReLU(True) if non_negative else nn.Identity(),
+            nn.Identity(),
+        )
+        
+        ## Uncertainty prediction (log variance)
+        self.uncertainty_head = nn.Sequential(
+            nn.Conv2d(32, 1, kernel_size=1, stride=1, padding=0),
+            #nn.ReLU(True) if non_negative else nn.Identity(),
+            #nn.Identity(),
+        )
+        
+    def forward(self, x):
+        shared_features = self.shared_conv(x)
+        
+        # Depth scale - ensure positive
+        depth_scale = self.depth_head(shared_features)
+        #depth_scale = 1.0 + 0.5 * torch.tanh(depth_scale)  # [0.5, 1.5]
+        
+        # Uncertainty - log variance (can be negative)
+        log_sigma_inv = self.uncertainty_head(shared_features)
+        log_sigma_inv = log_sigma_inv.clamp_(min=-5, max=5)
+        sigma2_inv    = torch.exp(log_sigma_inv)
+        #uncertainty = torch.exp(log_variance)  # Convert to variance
+        
+        return depth_scale, sigma2_inv
     
+class UncertaintyAwareBasicUpdateBlockDepth(nn.Module):
+    """
+    Depth update block that predicts uncertainty alongside depth
+    """
+    def __init__(self, hidden_dim=128, cost_dim=64, ratio=3, context_dim=64, min_pred=None, max_pred=None):
+        super().__init__()
+        
+        self.encoder = ProjectionInputDepth(cost_dim=1, hidden_dim=hidden_dim, out_chs=hidden_dim, downsample_ratio=1)
+        self.depth_gru = SepConvGRU(hidden_dim=hidden_dim, input_dim=self.encoder.out_chs+context_dim)
+        
+        # Uncertainty-aware depth head
+        self.depth_uncertainty_head = UncertaintyAwareDepthHead(features=hidden_dim, 
+                                                                groups=1, 
+                                                                activation=nn.ReLU(False), 
+                                                                non_negative=False)
+        
+        self.mask = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim*2, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim*2, ratio*ratio*9, 1, padding=0))
+        
+        self.min_pred = min_pred
+        self.max_pred = max_pred
+
+    def forward(self, hidden, cost_func, inv_depth, context, seq_len=4):
+        inv_depth_list = [] 
+        uncertainty_list = []
+        mask_list = []
+        
+        for i in range(seq_len):
+            cost, _ = cost_func(inv_depth)
+            
+            # Downsample if needed
+            if cost.shape[-2:] != inv_depth.shape[-2:]:
+                inv_depth_low = F.interpolate(inv_depth, size=cost.shape[-2:], mode='bilinear', align_corners=True)
+            else:
+                inv_depth_low = inv_depth
+                
+            input_features = self.encoder(inv_depth_low, cost)
+            inp_i = torch.cat([context, input_features], dim=1)
+            
+            hidden = self.depth_gru(hidden, inp_i)
+            
+            # Predict depth scale and uncertainty
+            delta_scales, uncertainty = self.depth_uncertainty_head(hidden)
+            
+            inv_depth_pred = inv_depth * delta_scales
+            
+            # Clamp depth
+            if self.min_pred is not None and self.max_pred is not None:
+                inv_depth_pred = torch.clamp(
+                    inv_depth_pred, 
+                    min=1.0 / self.max_pred, 
+                    max=1.0 / self.min_pred
+                )
+            
+            inv_depth = inv_depth_pred
+            mask = 0.25 * self.mask(hidden)
+            
+            inv_depth_list.append(inv_depth_pred)
+            uncertainty_list.append(uncertainty)
+            mask_list.append(mask)
+            
+        return hidden, mask_list, inv_depth_list, uncertainty_list
+     
 class PoseHead(nn.Module):
     def __init__(self, input_dim=256, hidden_dim=128):
         super(PoseHead, self).__init__()
@@ -291,6 +405,71 @@ class UpMaskNet(nn.Module):
         mask = .25 * self.mask(feat)
         return mask
     
+class ConfidenceWeightedPoseOptimizer(nn.Module):
+    """
+    Pose optimizer that uses depth confidence for weighting
+    """
+    def __init__(self, hidden_dim=128, cost_dim=64, context_dim=64):
+        super().__init__()
+        
+        self.encoder = ProjectionInputPose(cost_dim=1, hidden_dim=hidden_dim, out_chs=hidden_dim, downsample_ratio=2)
+        self.pose_gru = SepConvGRU(hidden_dim=hidden_dim, input_dim=self.encoder.out_chs+context_dim)
+        
+        # Confidence-aware pose head
+        self.pose_head = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim//2, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim//2, 32, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+            nn.Linear(32, 6)
+        )
+        
+        # Learnable pose scaling
+        self.trans_scale = nn.Parameter(torch.tensor(0.1))
+        self.rot_scale = nn.Parameter(torch.tensor(0.05))
+        
+    def forward(self, hidden_p, cost_func, ref_pose, inp, depth_confidence, seq_len=4):
+        pose_list = []
+        ref_pose_init = pose_to_se3(ref_pose)
+        
+        for i in range(seq_len):
+            res = cost_func(poseC2W=ref_pose)
+            cost = res['cost']
+            
+            # Weight cost by depth confidence
+            if depth_confidence is not None:
+                # Downsample confidence to match cost resolution
+                confidence_resized = F.interpolate(depth_confidence, size=cost.shape[-2:], 
+                                                 mode='bilinear', align_corners=True)
+                # Apply confidence weighting
+                cost = cost * confidence_resized
+            
+            input_features = self.encoder(ref_pose_init, cost)
+            inp_i = torch.cat([inp, input_features], dim=1)
+            
+            hidden_p = self.pose_gru(hidden_p, inp_i)
+            
+            # Predict pose delta
+            pose_delta = self.pose_head(hidden_p)
+            
+            # Apply learnable scaling
+            pose_delta = torch.cat([
+                pose_delta[:, :3] * self.trans_scale,
+                pose_delta[:, 3:] * self.rot_scale
+            ], dim=1)
+            
+            # Update pose
+            pose = ref_pose @ se3_to_pose(pose_delta)
+            pose_list.append(pose)
+            
+            # Update for next iteration
+            ref_pose = pose
+            ref_pose_init = pose_to_se3(ref_pose)
+            
+        return hidden_p, pose_list
+    
 class midasConsNet(nn.Module):
     def __init__(self, min_pred, max_pred, min_depth, max_depth, nsamples, sml_model_path, 
                  is_train=True, log_fn=None, isConvGRU=False):
@@ -310,40 +489,9 @@ class midasConsNet(nn.Module):
         self.iter_steps = 3
         self.seq_len = 3
         
-        # Feature extractor (frozen)
-        # self.FeatExtractor = MidasNet_small_cons_videpth(
-        #     path=sml_model_path,
-        #     in_channels=3,
-        #     features=32,
-        #     min_pred=self.min_pred,
-        #     max_pred=self.max_pred,
-        #     output_downsample=True,
-        #     backbone="efficientnet_lite3",
-        # )
-        # for param in self.FeatExtractor.parameters():
-        #     param.requires_grad = False
-        # self.FeatExtractor.eval()
-        
         self.fnet = ResNetEncoder(out_chs=self.cost_dim, stride=4)
         self.cnet_depth = ResNetEncoder(out_chs=self.hidden_dim + self.cost_dim, stride=4, context_num=2, pretrained=False)
-    
-        # self.contextLearner = MidasNet_small_cons_videpth(
-        #     in_channels=2,
-        #     features=64,
-        #     path=sml_model_path,
-        #     min_pred=self.min_pred,
-        #     max_pred=self.max_pred,
-        #     output_downsample=False,
-        #     backbone="efficientnet_lite3",
-        # )
-        # self.contextLearner.train()
-        
-        # self.context_conv = nn.Conv2d(
-        #     in_channels=64,
-        #     out_channels=self.hidden_dim + self.cost_dim, 
-        #     kernel_size=3, stride=1, padding=1
-        # )
-        #self.refine_net = DepthPoseRefineNet(hidden_dim=self.hidden_dim)
+
         
         if self.UseConvGRU:
             self.contextPose = ResNetEncoder(out_chs=self.hidden_dim+self.cost_dim, 
@@ -486,7 +634,11 @@ class midasConsNet(nn.Module):
             x = x.to(device)
             batch_inputs.append(x)
         
-        return torch.stack(batch_inputs, dim=0)
+        result = torch.stack(batch_inputs, dim=0)
+        
+        del batch_inputs
+        del sample 
+        return result
     
     def forward(self, tgt_img, ref_imgs, tgt_ga_depth, ref_ga_depth, 
                 tgt_interp, ref_interp, tgt_pose, ref_pose, intrinsics, depth_only=False):
@@ -552,7 +704,7 @@ class midasConsNet(nn.Module):
         # -------- ConvGRU-Based Iterative Refinement --------            
         inv_depth_predictions = [depth_init_up] #[metric_depth_inv_tgt] #to see the history of depth predictions
         pose_predictions = [[pose_to_se3((pose).clone()) for pose in pose_list_init]] #to see the history of pose predictions
-            
+        
         # get optimization init
         if self.iter_steps > 0:
             #context_feat = self.context_conv(context_feats) #to make the output dim = hidden_dim + cost_dim #[1,160,144,192]
@@ -624,7 +776,7 @@ class midasConsNet(nn.Module):
 
             if self.log_fn:
                 with torch.no_grad():
-                    print(f"Iter {itr} cost progression: {cost_means}")
+                    #print(f"Iter {itr} cost progression: {cost_means}")
                     self.log_fn(f"Iter_{itr}/depth_mean", refined_depth_inv.mean().item(), on_step=True, logger=True)
                     self.log_fn(f"Iter_{itr}/depth_var", refined_depth_inv.var().item(), on_step=True, logger=True)
                         
@@ -666,3 +818,294 @@ class midasConsNet(nn.Module):
             return inv_depth_predictions[-1],\
                 torch.stack(pose_predictions[-1], dim=1).view(tgt_img.shape[0], len(ref_imgs), 6) #(b, n, 6)
 
+class UncertaintyAwareMidasNet(nn.Module):
+    def __init__(self, min_pred, max_pred, min_depth, max_depth, nsamples, sml_model_path, 
+                 is_train=True, log_fn=None, isConvGRU=False):
+        super().__init__()
+        
+        self.is_train = is_train
+        self.log_fn = log_fn
+        self.min_pred, self.max_pred = min_pred, max_pred
+        self.min_depth, self.max_depth = min_depth, max_depth
+        
+        model_transforms = transforms.get_transforms("dpt_hybrid", "void", str(nsamples))
+        self.ScaleMapLearner_transform = model_transforms["sml_model"]
+        
+        # Network parameters
+        self.hidden_dim = 128
+        self.cost_dim = 64
+        self.iter_steps = 3
+        self.seq_len = 3
+        
+        self.confidence_threshold = 0.7  # Only use regions with confidence > 0.7
+        self.min_confident_pixels = 600  # Minimum number of confident pixels for pose update
+        
+        # Feature extractors (same as before)
+        self.fnet = ResNetEncoder(out_chs=self.cost_dim, stride=4)
+        self.cnet_depth = ResNetEncoder(out_chs=self.hidden_dim + self.cost_dim, stride=4, context_num=2, pretrained=False)
+        self.contextPose = ResNetEncoder(out_chs=self.hidden_dim+self.cost_dim, stride=8, num_input_images=2)
+        
+        # Uncertainty-aware update blocks
+        self.update_block_depth = UncertaintyAwareBasicUpdateBlockDepth(
+            hidden_dim=self.hidden_dim, 
+            cost_dim=self.cost_dim,
+            context_dim=self.cost_dim,
+            min_pred=self.min_pred,
+            max_pred=self.max_pred
+        )
+        
+        self.update_block_pose = ConfidenceWeightedPoseOptimizer(
+            hidden_dim=self.hidden_dim,
+            cost_dim=self.cost_dim,
+            context_dim=self.cost_dim
+        )
+        
+        ## Initial scale output
+        #self.scaleOutput = OutputScaleConv(features=self.hidden_dim + self.cost_dim, groups=1, 
+        #                                    activation=nn.ReLU(False), non_negative=False)
+        
+        self.scaleOutput = UncertaintyAwareDepthHead(features=self.hidden_dim + self.cost_dim, groups=1,
+                                                      activation=nn.ReLU(False), non_negative=False)
+        
+    def compute_depth_confidence(self, uncertainty, depth):
+        """
+        Convert uncertainty to confidence score
+        """
+        # Confidence = 1 / (1 + uncertainty)
+        confidence = 1.0 / (1.0 + uncertainty)
+        
+        # Additional confidence based on depth validity
+        depth_valid = (depth > 1.0/self.max_pred) & (depth < 1.0/self.min_pred)
+        confidence = confidence * depth_valid.float()
+        
+        return confidence
+        
+    def get_confident_regions_mask(self, confidence):
+        """
+        Get mask of high-confidence regions for pose optimization
+        """
+        confident_mask = (confidence > self.confidence_threshold).float()
+        
+        # Check if we have enough confident pixels
+        confident_pixels = confident_mask.sum()
+        if confident_pixels < self.min_confident_pixels:
+            # If not enough confident pixels, use top-k pixels
+            k = min(self.min_confident_pixels, confidence.numel())
+            _, top_indices = torch.topk(confidence.flatten(), k)
+            confident_mask = torch.zeros_like(confidence.flatten())
+            confident_mask[top_indices] = 1.0
+            confident_mask = confident_mask.reshape(confidence.shape)
+            
+        return confident_mask
+
+    def preprocess_batch(self, *args, keys, device=None):
+        assert len(args) == len(keys)
+        
+        batch_size = args[0].shape[0]
+        batch_inputs = []
+        device = device or args[0].device
+
+        for i in range(batch_size):
+            sample = {key: arg[i].squeeze().cpu().numpy() for key, arg in zip(keys, args)}
+
+            sample = self.ScaleMapLearner_transform(sample)
+            
+            x = torch.cat([torch.tensor(sample[key]) for key in keys], 0)
+            x = x.to(device)
+            batch_inputs.append(x)
+        
+        result = torch.stack(batch_inputs, dim=0)
+        
+        del batch_inputs
+        del sample 
+        return result
+    
+    def depth_cost_calc(self, inv_depth, fmap, fmaps_ref, pose_list, tgt_pose, K, scale_factor):
+        cost_list = []
+        warping_vis = []
+        for idx, (pose, fmap_r) in enumerate(zip(pose_list, fmaps_ref)):
+            result = self.get_cost_each(tgt_pose, pose, fmap, fmap_r, 
+                                      utils.inv2depth(inv_depth), K, scale_factor)
+            
+            if idx == 0 and self.is_train:
+                warping_vis.append({
+                    'src_feat': result['fmap'][0].detach(),
+                    'warped_feat': result['fmap_warped'][0].detach(),
+                    'valid_mask': result['valid_mask'][0].detach(),
+                    'cost': result['cost'][0].detach()
+                })
+
+            cost_list.append(result['cost'])  # (b, c,h, w) (1,64,144,192)
+        
+        cost = torch.stack(cost_list, dim=1).mean(dim=1)
+        return cost, warping_vis
+    
+    def forward(self, tgt_img, ref_imgs, tgt_ga_depth, ref_ga_depth,
+                tgt_interp, ref_interp, tgt_pose, ref_pose, intrinsics, depth_only=False):
+        """
+        Forward pass with uncertainty-aware optimization
+        """
+        ref_inputs = [
+            self.preprocess_batch(ref_img, keys=["image"], device=ref_img.device)
+            for ref_img in ref_imgs
+        ]
+        
+        processed_batch = self.preprocess_batch(
+            tgt_img, tgt_ga_depth, tgt_ga_depth, tgt_interp, 
+            keys=["image", "int_depth", "int_depth_c", "int_scales_c"], 
+            device=tgt_img.device
+        )
+        
+        tgt_input, context_depth_input = torch.split(processed_batch, [4, 2], dim=1) #[1,4,288,384]
+        init_metric_depth_inv = context_depth_input[:, 0:1, :, :] #Ga_depth
+        tgt_input = processed_batch[:, :3, :, :]
+        
+        #extract features
+        fmaps = self.fnet(torch.cat([tgt_input] + ref_inputs, dim=0))
+        fmaps = torch.split(fmaps, [tgt_input.shape[0]] * (1 + len(ref_inputs)), dim=0)
+        tgt_feats, ref_feats = fmaps[0], fmaps[1:]
+        
+        context_feats = self.cnet_depth(context_depth_input)
+        scale_factor = tgt_img.permute(0,3,1,2).shape[2] / tgt_feats.shape[2]
+        
+        # Initial depth and uncertainty prediction
+        initial_scale, sigma2_scale = self.scaleOutput(context_feats)
+        #initial_scale = self.scaleOutput(context_feats)
+        delta_scales = F.relu(1.0 + initial_scale)
+        inv_depth_pred = init_metric_depth_inv * delta_scales
+        sigma2_invdepth = sigma2_scale
+        
+        # Clamp initial depth
+        if self.min_pred is not None and self.max_pred is not None:
+            inv_depth_pred = torch.clamp(
+                inv_depth_pred, 
+                min=1.0/self.max_pred, 
+                max=1.0/self.min_pred
+            )
+            
+        # Initialize tracking
+        inv_depth_predictions = []
+        uncertainty_predictions = []
+        pose_predictions = []
+        confidence_maps = []
+        
+        # Initial upsampling
+        refined_depth_inv = F.interpolate(inv_depth_pred, size=(tgt_img.shape[1], tgt_img.shape[2]), 
+                                        mode='bicubic', align_corners=False)
+        refined_uncertainty = F.interpolate(sigma2_invdepth, size=(tgt_img.shape[1], tgt_img.shape[2]), 
+                                          mode='bicubic', align_corners=False)
+        
+        inv_depth_predictions.append(refined_depth_inv)
+        uncertainty_predictions.append(refined_uncertainty)
+        
+        if self.iter_steps > 0:
+            # Initialize pose context
+            img_pairs = []
+            for ref_img in ref_inputs:
+                img_pairs.append(torch.cat([tgt_input, ref_img], dim=1))
+            cnet_pose_list = self.contextPose(img_pairs)
+            
+            hidden_p_list, inp_p_list = [], []
+            for cnet_pose in cnet_pose_list:
+                hidden_p, inp_p = torch.split(cnet_pose, [self.hidden_dim, self.cost_dim], dim=1)
+                hidden_p_list.append(torch.tanh(hidden_p))
+                inp_p_list.append(torch.relu(inp_p))
+                
+            # Initialize depth context
+            hidden_d, inp_d = torch.split(context_feats, [self.hidden_dim, self.cost_dim], dim=1)
+            hidden_d = torch.tanh(hidden_d)
+            inp_d = torch.relu(inp_d)
+        
+        pose_list = ref_pose
+        refined_inv_depth = inv_depth_pred
+        
+        #Iterative refinement
+        for itr in range(self.iter_steps):
+            #Phase 1: Depth refinement with uncertainty
+            pose_list_detached = [pose.detach() for pose in pose_list]
+            
+            depth_cost_map_func = partial(self.depth_cost_calc, 
+                                        fmap=tgt_feats,
+                                        fmaps_ref=ref_feats,
+                                        pose_list=pose_list_detached,
+                                        tgt_pose=None,
+                                        K=intrinsics,
+                                        scale_factor=1.0/scale_factor)
+            
+            # Update depth with uncertainty
+            hidden_d, up_mask_seqs, inv_depth_seqs, uncertainty_seqs = self.update_block_depth(
+                hidden_d, depth_cost_map_func, refined_inv_depth, inp_d, seq_len=self.seq_len)
+            
+            refined_inv_depth = inv_depth_seqs[-1]
+            current_uncertainty = uncertainty_seqs[-1]
+            
+            # Upsample depth and uncertainty
+            refined_depth_inv = F.interpolate(refined_inv_depth, size=(tgt_img.shape[1], tgt_img.shape[2]), 
+                                            mode='bicubic', align_corners=False)
+            refined_uncertainty = F.interpolate(current_uncertainty, size=(tgt_img.shape[1], tgt_img.shape[2]), 
+                                               mode='bicubic', align_corners=False)
+            
+            inv_depth_predictions.append(refined_depth_inv)
+            uncertainty_predictions.append(refined_uncertainty)
+            
+            #Phase 2: pose refinment with confidence weightingin
+            if not depth_only:
+                # Compute confidence from uncertainty
+                confidence = self.compute_depth_confidence(current_uncertainty, refined_inv_depth)
+                confident_mask = self.get_confident_regions_mask(confidence)
+                confidence_maps.append(confident_mask)
+                
+                # Update poses using confident regions
+                pose_list_new = []
+                for i, (ref_pose, hidden_p) in enumerate(zip(pose_list, hidden_p_list)):
+                    pose_cost_func = partial(self.get_cost_each, 
+                                           tgt_poseC2W=None,
+                                           fmap=tgt_feats, 
+                                           fmap_ref=ref_feats[i],
+                                           depth=utils.inv2depth(refined_inv_depth),
+                                           K=intrinsics, 
+                                           scale_factor=1.0/scale_factor)
+
+                    #update pose with confidence weighting
+                    hidden_p, pose_seqs = self.update_block_pose(
+                        hidden_p, pose_cost_func, ref_pose, inp_p_list[i],
+                        depth_confidence=confident_mask, seq_len=self.seq_len)
+                    
+                    hidden_p_list[i] = hidden_p
+                    pose_list_new.append(pose_seqs[-1])
+                
+                pose_list = pose_list_new
+                pose_predictions.append([pose_to_se3(pose.clone()) for pose in pose_list])
+            
+            if self.log_fn:
+                with torch.no_grad():
+                    avg_confidence = confidence.mean().item() if not depth_only else 0.0
+                    avg_uncertainty = current_uncertainty.mean().item()
+                    confident_ratio = (confident_mask.sum() / confident_mask.numel()).item() if not depth_only else 0.0
+                    
+                    self.log_fn(f"Iter_{itr}/avg_confidence", avg_confidence, on_step=True, logger=True)
+                    self.log_fn(f"Iter_{itr}/avg_uncertainty", avg_uncertainty, on_step=True, logger=True)
+                    self.log_fn(f"Iter_{itr}/confident_ratio", confident_ratio, on_step=True, logger=True)
+                    self.log_fn(f"Iter_{itr}/depth_mean", refined_depth_inv.mean().item(), on_step=True, logger=True)
+        
+        if self.is_train:
+            if len(pose_predictions) > 0:
+                pose_tensor = torch.stack([torch.stack(poses_ref, dim=1) for poses_ref in pose_predictions], dim=2)
+            else:
+                pose_tensor = torch.stack([pose_to_se3(pose.clone()) for pose in pose_list], dim=1).unsqueeze(2)
+            
+            return {
+                'depths': inv_depth_predictions,
+                'poses': pose_tensor,
+                'uncertainties': uncertainty_predictions,
+                'confidence_maps': confidence_maps                
+            }
+        else:
+            final_poses = pose_predictions[-1] if len(pose_predictions) > 0 else [pose_to_se3(pose.clone()) for pose in pose_list]
+            return {
+                'depth': inv_depth_predictions[-1],
+                'poses': torch.stack(final_poses, dim=1).view(tgt_img.shape[0], len(ref_imgs), 6),
+                'uncertainty': uncertainty_predictions[-1],
+                'confidence': confidence_maps[-1] if len(confidence_maps) > 0 else None
+            }              
+                    

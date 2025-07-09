@@ -15,6 +15,7 @@ from modules.interpolator import Interpolator2D
 from model.main_consistent import midasNetConsistentModule
 from utils_eval import compute_ls_solution
 
+@torch.no_grad()
 def run_evaluation(args):
     """Run evaluation with varying point reduction percentages"""
     
@@ -301,15 +302,15 @@ def plot_results(results, output_dir, experiment_name):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate VI-Depth with varying point reduction")
-    parser.add_argument("--data_root", type=str, default='/home/sai/Documents/void_small', 
+    parser.add_argument("--data_root", type=str, default='/media/saimouli/Data6T/datasets/void_150', 
                         help="Path to dataset")
     parser.add_argument("--sml_model_path", type=str, 
                         default="weights/sml_model.dpredictor.dpt_hybrid.nsamples.150.ckpt",
                         help="Path to SML model weights")
     parser.add_argument("--checkpoint_path", type=str, 
-                        default="/home/sai/Downloads/v1_gru_pose_depth/total_loss=0.086.ckpt",
+                        default="/home/saimouli/Downloads/total_loss=0.095.ckpt",
                         help="Path to model checkpoint")
-    parser.add_argument("--experiment_name", type=str, default="gru_6_iter",
+    parser.add_argument("--experiment_name", type=str, default="gru_new_6iter",
                         help="Name for this experiment")
     parser.add_argument("--reduction_start", type=float, default=0,
                         help="Starting point reduction percentage")

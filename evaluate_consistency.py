@@ -131,7 +131,7 @@ def plot_depth(tgt_img_cpu, tgt_gt_depth_inv_cpu, tgt_ga_depth_cpu, tgt_pred_dep
     
 #currently evaluating the GT depth consistency TODO: include valid mask for gt depth
 if __name__ == "__main__":
-    dataset = SML_consistent_dataset(data_root='/home/sai/Documents/void_small', mode='val')
+    dataset = SML_consistent_dataset(data_root='/media/saimouli/Data6T/datasets/void_150', mode='val')
     dataloader = torch.utils.data.DataLoader(dataset)
     
     sml_model_path = "weights/sml_model.dpredictor.dpt_hybrid.nsamples.150.ckpt"
@@ -153,8 +153,8 @@ if __name__ == "__main__":
     # model.eval()
     # model.to(device)
     
-    model = midasNetConsistentModule(sml_model_path=sml_model_path, useConvGRU=True, is_train=False)
-    model = model.load_from_checkpoint("/home/sai/Downloads/v1_gru_pose_depth/total_loss=0.086.ckpt")
+    model = midasNetConsistentModule(sml_model_path=sml_model_path, useConvGRU=False, is_train=False)
+    model = model.load_from_checkpoint("/home/saimouli/Downloads/base_gru_res_void/checkpoints/epoch=21-val/total_loss=0.083.ckpt")
     #model = model.load_from_checkpoint("/home/saimouli/Documents/github/VI_Depth_sai/weights/withcostv/total_loss=0.088.ckpt")
     #model = model.load_from_checkpoint("/home/saimouli/Documents/github/VI_Depth_sai/weights/without_costv/total_loss=0.086.ckpt")
     model.eval()
@@ -181,44 +181,45 @@ if __name__ == "__main__":
                 for item in batch_data
             ]
         )
-    
+        
         # Unpack batch data
         tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp, tgt_sparse_depth, ref_img, \
-        ref_ga_depth, ref_interp, ref_gt_depth, ref_sparse_depth, tgt_pose, ref_gt_pose, intrinsics, _, ref_pose_perturbed, tgt_depth_pred = batch_data #dataset[idx] #Cam2Wld poses (R_ctoG, p_CinG)
+        ref_ga_depth, ref_interp, ref_gt_depth, ref_sparse_depth, tgt_pose, ref_gt_pose, \
+            intrinsics, tgt_pose_perturbed, ref_pose_perturbed,_ = batch_data #dataset[idx] #Cam2Wld poses (R_ctoG, p_CinG)
         
         ##########################################################################
-        #reduce tgt sparse depth and try interpolating again and then pass
-        validity_map = (tgt_sparse_depth > 0).squeeze().cpu().numpy().astype(np.uint8)
-        print("Before Pts: ", np.count_nonzero(validity_map))
-        reduce_pts = int(np.count_nonzero(validity_map) * 0.95)
-        nonzero_indices = np.argwhere(validity_map == 1)
-        remove_indices = np.random.choice(len(nonzero_indices), size=reduce_pts, replace=False)
-        points_to_remove = nonzero_indices[remove_indices]
-        for x, y in points_to_remove:
-            validity_map[x, y] = 0
-        print("After Pts: ", np.count_nonzero(validity_map))
-        input_sparse_depth_valid = validity_map.astype(bool)
-        tgt_sparse_depth = tgt_sparse_depth.squeeze().cpu().numpy()
-        tgt_sparse_depth[~input_sparse_depth_valid] = np.inf
-        tgt_sparse_depth = 1.0 / tgt_sparse_depth 
+        # #reduce tgt sparse depth and try interpolating again and then pass
+        # validity_map = (tgt_sparse_depth > 0).squeeze().cpu().numpy().astype(np.uint8)
+        # print("Before Pts: ", np.count_nonzero(validity_map))
+        # reduce_pts = int(np.count_nonzero(validity_map) * 0.95)
+        # nonzero_indices = np.argwhere(validity_map == 1)
+        # remove_indices = np.random.choice(len(nonzero_indices), size=reduce_pts, replace=False)
+        # points_to_remove = nonzero_indices[remove_indices]
+        # for x, y in points_to_remove:
+        #     validity_map[x, y] = 0
+        # print("After Pts: ", np.count_nonzero(validity_map))
+        # input_sparse_depth_valid = validity_map.astype(bool)
+        # tgt_sparse_depth = tgt_sparse_depth.squeeze().cpu().numpy()
+        # tgt_sparse_depth[~input_sparse_depth_valid] = np.inf
+        # tgt_sparse_depth = 1.0 / tgt_sparse_depth 
         
-        #recompute tgt_ga_depth
-        tgt_ga_depth = tgt_ga_depth.squeeze().cpu().numpy()
-        tgt_ga_depth,_,_ = compute_ls_solution(tgt_depth_pred.squeeze().cpu().numpy(), tgt_sparse_depth, input_sparse_depth_valid, min_pred, max_pred)
-        tgt_ga_depth = torch.from_numpy(tgt_ga_depth).unsqueeze(0).float().to(device)
+        # #recompute tgt_ga_depth
+        # tgt_ga_depth = tgt_ga_depth.squeeze().cpu().numpy()
+        # tgt_ga_depth,_,_ = compute_ls_solution(tgt_depth_pred.squeeze().cpu().numpy(), tgt_sparse_depth, input_sparse_depth_valid, min_pred, max_pred)
+        # tgt_ga_depth = torch.from_numpy(tgt_ga_depth).unsqueeze(0).float().to(device)
         
-        ScaleMapInterpolator = Interpolator2D(
-            pred_inv = tgt_ga_depth.squeeze().cpu().numpy(),
-            sparse_depth_inv = tgt_sparse_depth,
-            valid = input_sparse_depth_valid,
-        )
-        ScaleMapInterpolator.generate_interpolated_scale_map(
-            interpolate_method='linear', 
-            fill_corners=False
-        )
-        int_scales = ScaleMapInterpolator.interpolated_scale_map.astype(np.float32)
-        int_scales = utils.normalize_unit_range(int_scales)
-        tgt_interp = torch.from_numpy(int_scales).unsqueeze(0).float().to(device)
+        # ScaleMapInterpolator = Interpolator2D(
+        #     pred_inv = tgt_ga_depth.squeeze().cpu().numpy(),
+        #     sparse_depth_inv = tgt_sparse_depth,
+        #     valid = input_sparse_depth_valid,
+        # )
+        # ScaleMapInterpolator.generate_interpolated_scale_map(
+        #     interpolate_method='linear', 
+        #     fill_corners=False
+        # )
+        # int_scales = ScaleMapInterpolator.interpolated_scale_map.astype(np.float32)
+        # int_scales = utils.normalize_unit_range(int_scales)
+        # tgt_interp = torch.from_numpy(int_scales).unsqueeze(0).float().to(device)
         ##################################################################################
         
         ref_rel_poses = [tgt_pose.inverse() @ ref_p for ref_p in ref_pose_perturbed]
