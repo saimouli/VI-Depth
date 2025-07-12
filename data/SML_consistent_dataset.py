@@ -177,7 +177,7 @@ class SML_consistent_dataset(Dataset):
         return img
 
     # Add SE(3) perturbations (mimic VIO drift)
-    def add_perturbation(self, pose, max_trans=0.10, max_rot_deg=4.0):
+    def add_perturbation(self, pose, max_trans=0.10, max_rot_deg=1.0):
         """Add random SE(3) perturbation to pose (3x4 numpy array)"""
         if isinstance(pose, np.ndarray):
             pose = torch.from_numpy(pose).float()
