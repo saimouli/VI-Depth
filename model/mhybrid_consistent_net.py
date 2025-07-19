@@ -137,6 +137,51 @@ class SepConvGRU(nn.Module):
 
         return h
 
+class OutputScaleConvWithUncertainty(nn.Module):
+    """Output conv block that predicts both depth scale and uncertainty.
+    """
+    def __init__(self, features, groups, activation, non_negative):
+        super(OutputScaleConvWithUncertainty, self).__init__()
+
+        self.depth_output = nn.Sequential(
+            nn.Conv2d(features, features//2, kernel_size=3, stride=1, padding=1, groups=groups),
+            nn.ReLU(inplace=True),
+            
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(features//2, 32, kernel_size=3, stride=1, padding=1),
+            activation,
+            
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1),
+            activation,
+            
+            # Final 1x1 conv to get single-channel scale map
+            nn.Conv2d(32, 1, kernel_size=1, stride=1, padding=0),
+            nn.ReLU(True) if non_negative else nn.Identity(),
+        )
+        
+        # Separate branch for uncertainty (log variance)
+        self.uncertainty_output = nn.Sequential(
+            nn.Conv2d(features, features//2, kernel_size=3, stride=1, padding=1, groups=groups),
+            nn.ReLU(inplace=True),
+            
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(features//2, 32, kernel_size=3, stride=1, padding=1),
+            activation,
+            
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1),
+            activation,
+            
+            # Output log variance (can be negative)
+            nn.Conv2d(32, 1, kernel_size=1, stride=1, padding=0),
+        )
+
+    def forward(self, x):        
+        depth_scale = self.depth_output(x)
+        log_variance = self.uncertainty_output(x)
+        return depth_scale, log_variance
+    
 class OutputScaleConv(nn.Module):
     """Output conv block.
     """
@@ -172,7 +217,9 @@ class BasicUpdateBlockDepth(nn.Module):
                 
         self.encoder = ProjectionInputDepth(cost_dim=1, hidden_dim=hidden_dim, out_chs=hidden_dim, downsample_ratio=1)
         self.depth_gru = SepConvGRU(hidden_dim=hidden_dim, input_dim=self.encoder.out_chs+context_dim)
-        self.depth_head = OutputScaleConv(features=hidden_dim, groups=1, activation=nn.ReLU(False), non_negative=False)
+        #self.depth_head = OutputScaleConv(features=hidden_dim, groups=1, activation=nn.ReLU(False), non_negative=False)
+        self.depth_head = OutputScaleConvWithUncertainty(features=hidden_dim, groups=1,
+                                                         activation=nn.ReLU(False), non_negative=False)
         self.mask = nn.Sequential(
             nn.Conv2d(hidden_dim, hidden_dim*2, 3, padding=1),
             nn.ReLU(inplace=True),
@@ -183,6 +230,7 @@ class BasicUpdateBlockDepth(nn.Module):
 
     def forward(self, hidden, cost_func, inv_depth, context, seq_len=4):
         inv_depth_list = [] 
+        uncertainty_list = []
         mask_list = []
         cost_means = []
         for i in range(seq_len):
@@ -211,13 +259,13 @@ class BasicUpdateBlockDepth(nn.Module):
             #if self.log_fn:
             #    self.log_fn(f"UpdateBlock/Iteration_{i}/hidden_state_norm_after", hidden.norm().item(), on_step=True, logger=True)
                 
-            delta_scales = self.depth_head(hidden)
+            delta_scales, log_variance = self.depth_head(hidden)
             delta_scales = 1.0 + 0.5 * torch.tanh(delta_scales)  # [0.5, 1.5] range #ensure positive scale
             #print(f"inv_depth mean step {i}: {inv_depth.mean().item()}")
             #print("delta_scales mean step", i, delta_scales.mean().item())
             
-            if self.log_fn:
-                self.log_fn(f"UpdateBlock/Iteration_{i}/delta_scales_mean", delta_scales.mean().item(), on_step=True, logger=True)
+            #if self.log_fn:
+            #    self.log_fn(f"UpdateBlock/Iteration_{i}/delta_scales_mean", delta_scales.mean().item(), on_step=True, logger=True)
                 
             inv_depth_pred = inv_depth * delta_scales
 
@@ -235,9 +283,10 @@ class BasicUpdateBlockDepth(nn.Module):
             mask = 0.25 * self.mask(hidden) #helps numerical stability
             
             inv_depth_list.append(inv_depth_pred)
+            uncertainty_list.append(log_variance)
             mask_list.append(mask)
             
-        return hidden, mask_list, inv_depth_list, cost_means
+        return hidden, mask_list, inv_depth_list, uncertainty_list, cost_means
     
 class PoseHead(nn.Module):
     def __init__(self, input_dim=256, hidden_dim=128):
@@ -368,9 +417,11 @@ class midasConsNet(nn.Module):
             pass
             #self.refine_net = DepthPoseRefineNet(hidden_dim=self.hidden_dim)
             
-        self.scaleOutput = OutputScaleConv(features=self.hidden_dim + self.cost_dim, groups=1, 
-                                            activation=nn.ReLU(False), non_negative=False)
-
+        # self.scaleOutput = OutputScaleConv(features=self.hidden_dim + self.cost_dim, groups=1, 
+        #                                     activation=nn.ReLU(False), non_negative=False)
+        
+        self.scaleUncerOutput = OutputScaleConvWithUncertainty(features=self.hidden_dim + self.cost_dim, groups=1,
+                                                                activation=nn.ReLU(False), non_negative=False)
     def freeze_pose_branch(self, freeze=True):
         """
         Freeze or unfreeze the pose refinement branch of the model
@@ -524,7 +575,8 @@ class midasConsNet(nn.Module):
         scale_factor =  tgt_img.permute(0,3,1,2).shape[2] / tgt_feats.shape[2]
         
         # Step 3: get initial depth and pose
-        scale_map = self.scaleOutput(context_feats)
+        #scale_map = self.scaleOutput(context_feats)
+        scale_map, log_variance = self.scaleUncerOutput(context_feats)
         delta_scales = F.relu(1.0 + scale_map)  # Ensure scale is positive
         inv_depth_pred = init_metric_depth_inv * delta_scales
             
@@ -544,6 +596,14 @@ class midasConsNet(nn.Module):
                 align_corners=False
         )  # shape => [B, 1, 480, 640]
         
+        # Upsample uncertainty as well
+        uncertainty_up = F.interpolate(
+                log_variance,
+                size=(tgt_img.shape[1], tgt_img.shape[2]),
+                mode='bicubic',
+                align_corners=False
+        )
+        
         #fixed_tgt_pose = tgt_pose.detach().requires_grad_(False) #T_vio_cam2wld
         #refined_rel_poses = [pose_to_se3(fixed_tgt_pose.inverse() @ ref_p) for ref_p in ref_pose] #T_relative 6D
         # initial pose from VIO
@@ -551,6 +611,7 @@ class midasConsNet(nn.Module):
         
         # -------- ConvGRU-Based Iterative Refinement --------            
         inv_depth_predictions = [depth_init_up] #[metric_depth_inv_tgt] #to see the history of depth predictions
+        uncertainty_predictions = [uncertainty_up]
         pose_predictions = [[pose_to_se3((pose).clone()) for pose in pose_list_init]] #to see the history of pose predictions
             
         # get optimization init
@@ -598,9 +659,10 @@ class midasConsNet(nn.Module):
                                         scale_factor=1.0/scale_factor)
                 
             #update depth #TODO: check and understand this function
-            hidden_d, up_mask_seqs, inv_depth_seqs, cost_means = self.update_block_depth(hidden_d, depth_cost_map_func,
-                                                                            refined_inv_depth, inp_d,
-                                                                            seq_len=self.seq_len)
+            hidden_d, up_mask_seqs, inv_depth_seqs, uncertainty_seqs, cost_means = self.update_block_depth(
+                hidden_d, depth_cost_map_func,
+                refined_inv_depth, inp_d,
+                seq_len=self.seq_len)
                 
             #we won't supervise the intermediate predictions
             #up_mask_seqs, inv_depth_seqs = [up_mask_seqs[-1]], [inv_depth_seqs[-1]]
@@ -619,12 +681,20 @@ class midasConsNet(nn.Module):
                 mode='bicubic',
                 align_corners=False
             )  # shape => [B, 1, 480, 640]
+            
+            refined_uncertainty = F.interpolate(
+                uncertainty_seqs[-1],
+                size=(tgt_img.shape[1], tgt_img.shape[2]),
+                mode='bicubic',
+                align_corners=False
+            )
                     
             inv_depth_predictions.append(refined_depth_inv)
+            uncertainty_predictions.append(refined_uncertainty)
 
             if self.log_fn:
                 with torch.no_grad():
-                    print(f"Iter {itr} cost progression: {cost_means}")
+                    #print(f"Iter {itr} cost progression: {cost_means}")
                     self.log_fn(f"Iter_{itr}/depth_mean", refined_depth_inv.mean().item(), on_step=True, logger=True)
                     self.log_fn(f"Iter_{itr}/depth_var", refined_depth_inv.var().item(), on_step=True, logger=True)
                         
@@ -660,9 +730,9 @@ class midasConsNet(nn.Module):
              #refined_rel_poses = [pose_to_se3(fixed_tgt_pose.inverse() @ ref_p) for ref_p in ref_abspose_list]
                 
         if self.is_train:
-            return inv_depth_predictions, \
+            return inv_depth_predictions, uncertainty_predictions, \
                 torch.stack([torch.stack(poses_ref, dim=1) for poses_ref in pose_predictions], dim=2) #(b, n, iters, 6)
         else:
-            return inv_depth_predictions[-1],\
+            return inv_depth_predictions[-1], uncertainty_predictions[-1],\
                 torch.stack(pose_predictions[-1], dim=1).view(tgt_img.shape[0], len(ref_imgs), 6) #(b, n, 6)
 

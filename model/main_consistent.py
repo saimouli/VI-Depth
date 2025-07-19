@@ -455,6 +455,88 @@ class midasNetConsistentModule(pl.LightningModule):
         
         return total_loss / w_totoal
     
+    def calculate_uncertainty_depth_loss_simple(self, inv_depths, uncertainties, gt_inv_depths):
+        """
+        Simpler uncertainty loss that balances depth accuracy with uncertainty prediction.
+        """
+        num_scales = len(inv_depths)
+        total_loss = 0
+        total_w = 0
+        gamma = 0.85
+        min_disp = self.min_depth
+        max_disp = self.max_depth
+        
+        for i in range(num_scales):
+            w = gamma**(num_scales - i - 1)
+            total_w += w
+            
+            pred_depth = inv_depths[i]
+            log_var = uncertainties[i]
+            
+            # Valid mask
+            valid = ((gt_inv_depths > min_disp) & (gt_inv_depths < max_disp)).detach().float()
+            depth_error = pred_depth - gt_inv_depths
+            log_b = log_var
+            b      = torch.exp(log_b) + 1e-6   # ensure >0
+            laplace_nll = torch.abs(depth_error) / b + log_b
+            valid_loss = (laplace_nll * valid).sum() / (valid.sum() + 1e-6)
+            total_loss += w * valid_loss
+            
+            
+            # depth_error = torch.abs(pred_depth - gt_inv_depths)
+            # depth_loss  = (depth_error * valid).sum() / (valid.sum() + 1e-6)
+            
+            # # 2) Uncertainty regularizer
+            # sigma = torch.exp(log_var)  # variance
+            # uncertainty_reg = sigma.mean() + torch.mean(log_var ** 2)
+            
+            # # 3) Correlation consistency
+            # e = (depth_error  * valid).view(-1)
+            # s = (sigma        * valid).view(-1)
+            # valid_inds = (valid.view(-1) > 0)
+            # e = e[valid_inds]
+            # s = s[valid_inds]
+            # e_c = e - e.mean()
+            # s_c = s - s.mean()
+            # cov = (e_c * s_c).mean()
+            # corr = cov / (e_c.std(unbiased=False) * s_c.std(unbiased=False) + 1e-6)
+            # corr_loss = 1.0 - corr
+            
+            # total_loss += w * (
+            #     depth_loss
+            #     + 0.1 * uncertainty_reg
+            #     + 0.05 * corr_loss)
+            
+            #log likelihood loss
+            # depth_error = (pred_depth - gt_inv_depths) ** 2
+            # precision = torch.exp(-log_var)
+            # uncertainty_loss = 0.5 * precision * depth_error + 0.5 * log_var
+            # valid_loss = (uncertainty_loss * valid).sum() / (valid.sum() + 1e-6)
+            # total_loss += w * valid_loss
+            
+            # depth_loss = torch.mean(valid * torch.abs(pred_depth - gt_inv_depths))
+            # var = torch.exp(log_var)  # precision = 1/variance
+            # nll_map    = F.gaussian_nll_loss(
+            #     pred_depth, gt_inv_depths, torch.exp(log_var),
+            #     eps=1e-6, full=True, reduction='none'
+            # )
+            # uncert_loss = (nll_map * valid).sum() / (valid.sum() + 1e-6)
+            # total_loss += w * (depth_loss + 0.1 * uncert_loss)
+            
+            # L1 depth loss
+            # depth_error = torch.abs(pred_depth - gt_inv_depths)
+            # depth_loss = (depth_error * valid).sum() / (valid.sum() + 1e-6)
+            # # Uncertainty should correlate with error
+            # # Encourage low uncertainty where error is low, high uncertainty where error is high
+            # uncertainty = torch.exp(log_var)  # Convert log-var to variance
+            # # Uncertainty regularization: penalize very high or very low uncertainties
+            # uncertainty_reg = torch.mean(uncertainty) + 0.1 * torch.mean(log_var ** 2)
+            # # Adaptive weighting: high error should have high uncertainty
+            # error_uncertainty_consistency = torch.mean(valid * torch.abs(depth_error - uncertainty))
+            # total_loss += w * (depth_loss + 0.1 * uncertainty_reg + 0.1 * error_uncertainty_consistency)
+        
+        return total_loss / total_w
+    
     def _common_step(self, batch, batch_idx, stage="train"):
         #input_sparse_depth, input_image, rel_depth_pred, depth_gt, validity_map = batch
         tgt_img, tgt_gt_depth_inv, tgt_ga_depth, tgt_interp,_, ref_imgs, \
@@ -491,23 +573,23 @@ class midasNetConsistentModule(pl.LightningModule):
         #                                                                                     intrinsics)
         
         #(b, n, iters, 6) 
-        if self.current_epoch < 10:
-            self.model.iter_steps=0   
-            refined_depth_inv, refined_ref_poses = self.model(tgt_img, ref_imgs,
+        if self.current_epoch < 24:
+            self.model.iter_steps=3   
+            refined_depth_inv, uncertainties, refined_ref_poses = self.model(tgt_img, ref_imgs,
                                                             tgt_ga_depth, ref_ga_depth, 
                                                             tgt_interp, ref_interp, 
                                                             tgt_pose, 
                                                             ref_rel_gtposes, 
                                                             intrinsics)
             
-        elif self.current_epoch < 30:
-            self.model.iter_steps=3
-            refined_depth_inv, refined_ref_poses = self.model(tgt_img, ref_imgs,
-                                                            tgt_ga_depth, ref_ga_depth, 
-                                                            tgt_interp, ref_interp, 
-                                                            tgt_pose, 
-                                                            ref_rel_gtposes, 
-                                                            intrinsics)
+        # elif self.current_epoch >= 3:
+        #     self.model.iter_steps=3
+        #     refined_depth_inv, uncertainties, refined_ref_poses = self.model(tgt_img, ref_imgs,
+        #                                                     tgt_ga_depth, ref_ga_depth, 
+        #                                                     tgt_interp, ref_interp, 
+        #                                                     tgt_pose, 
+        #                                                     ref_rel_gtposes, 
+        #                                                     intrinsics)
         
         # else:
         #     self.model.iter_steps=3
@@ -523,15 +605,16 @@ class midasNetConsistentModule(pl.LightningModule):
         #                         log_variance=None,
         #                         mask=None)
         
-        depth_loss = self.calculate_grudepth_loss(utils.inv2depth(refined_depth_inv), 
-                                            utils.inv2depth(tgt_gt_depth_inv))
+        # depth_loss = self.calculate_grudepth_loss(utils.inv2depth(refined_depth_inv), 
+        #                                     utils.inv2depth(tgt_gt_depth_inv))
         
-        #visualize flag
-        if batch_idx %10 == 0:
-            log_tb = True
-        else:
-            log_tb = False
+        depth_loss = self.calculate_uncertainty_depth_loss_simple(
+                utils.inv2depth(refined_depth_inv), 
+                uncertainties,
+                utils.inv2depth(tgt_gt_depth_inv)
+            )
         
+ 
         # 2. Reprojection loss
         # reproj_loss = self.compute_reproj_loss(
         #     gt_depth, gt_depth,
@@ -588,10 +671,16 @@ class midasNetConsistentModule(pl.LightningModule):
         self.log(f"{stage}/total_loss", total_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
         
         with torch.no_grad():
-            self.log_refinement_progress(tgt_img, ref_imgs, gt_depth,
-                                        utils.inv2depth(refined_depth_inv), pred_poses,
-                                        ref_rel_gtposes, intrinsics, mode=stage)
-            
+            if batch_idx % 20 == 0:
+                self.log_refinement_progress(tgt_img, ref_imgs, gt_depth,
+                                            utils.inv2depth(refined_depth_inv), pred_poses,
+                                            ref_rel_gtposes, intrinsics, mode=stage)
+                
+                self.log_uncertainty_visualization(tgt_img=tgt_img,gt_depth=gt_depth,
+                                                    depth_predictions=utils.inv2depth(refined_depth_inv),
+                                                    uncertainties=uncertainties,
+                                                    mode=stage)
+                
             #if len(warping_vis) > 0:
             #    self.log_warping(warping_vis, mode=stage)
             # self.log_img_tensorboard(tgt_img, gt_depth, utils.inv2depth(tgt_ga_depth).unsqueeze(0).permute(1,0,2,3), 
@@ -608,6 +697,127 @@ class midasNetConsistentModule(pl.LightningModule):
         #TODO: compute loss for the pose as well
         
 
+    @torch.no_grad()
+    def log_uncertainty_visualization(self, tgt_img, gt_depth, depth_predictions, uncertainties, mode="train"):
+        """
+        Compact uncertainty visualization for TensorBoard.
+        Creates a 2x3 grid showing: RGB, Pred Depth, GT Depth (top row)
+                                    Uncertainty, Error, Error/Uncertainty (bottom row)
+        
+        Args:
+            tgt_img: [B, H, W, 3] RGB image
+            gt_depth: [B, 1, H, W] or [B, H, W] ground truth depth
+            depth_predictions: list of [B, 1, H, W] predicted depths
+            uncertainties: list of [B, 1, H, W] log variance predictions
+            mode: str, logging stage name
+        """
+        
+        def apply_colormap(tensor, colormap="viridis", vmin=None, vmax=None):
+            """Apply colormap to tensor for visualization"""
+            tensor_np = tensor.squeeze().cpu().numpy()
+            if vmin is None:
+                vmin = np.percentile(tensor_np[tensor_np > 0], 2) if (tensor_np > 0).any() else tensor_np.min()
+            if vmax is None:
+                vmax = np.percentile(tensor_np[tensor_np > 0], 98) if (tensor_np > 0).any() else tensor_np.max()
+            
+            norm = np.clip((tensor_np - vmin) / (vmax - vmin + 1e-6), 0, 1)
+            cmap = plt.get_cmap(colormap)
+            colored = cmap(norm)[:, :, :3]  # Drop alpha channel
+            return torch.from_numpy(colored).permute(2, 0, 1).float()
+
+        def add_text_overlay(image, text, position=(10, 25), font_scale=0.6, color=(255, 255, 255)):
+            """Add text overlay to image"""
+            image_np = (image.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            cv2.putText(image_np, text, position, cv2.FONT_HERSHEY_SIMPLEX, 
+                    font_scale, color, thickness=2, lineType=cv2.LINE_AA)
+            return torch.from_numpy(image_np).permute(2, 0, 1).float() / 255.0
+
+        # Select first sample in batch
+        idx = 0
+        rgb_img = tgt_img[idx].cpu()  # [H, W, 3]
+        pred_depth = depth_predictions[-1][idx].squeeze().cpu()  # Take final prediction
+        uncertainty_log_var = uncertainties[-1][idx].squeeze().cpu()
+        gt_depth_tensor = gt_depth[idx].squeeze().cpu() if gt_depth.dim() > 2 else gt_depth.squeeze().cpu()
+        
+        # Convert RGB to CHW format if needed
+        if rgb_img.dim() == 3 and rgb_img.shape[-1] == 3:
+            rgb_img = rgb_img.permute(2, 0, 1)
+        
+        # Convert log variance to standard deviation  
+        uncertainty_var = torch.exp(uncertainty_log_var)
+        uncertainty_std = torch.sqrt(uncertainty_var)
+        
+        # Calculate depth error
+        valid_mask = (gt_depth_tensor > self.min_depth) & (gt_depth_tensor < self.max_depth)
+        depth_error = torch.abs(pred_depth - gt_depth_tensor)
+        depth_error[~valid_mask] = 0  # Mask invalid regions
+        
+        # Calculate uncertainty-normalized error (lower is better calibrated)
+        error_over_uncertainty = depth_error / (uncertainty_std + 1e-6)
+        error_over_uncertainty[~valid_mask] = 0
+        
+        # Calculate statistics for text overlays
+        pred_rmse = torch.sqrt((depth_error[valid_mask] ** 2).mean()).item() if valid_mask.any() else 0
+        uncertainty_mean = uncertainty_std[valid_mask].mean().item() if valid_mask.any() else 0
+        uncertainty_max = uncertainty_std[valid_mask].max().item() if valid_mask.any() else 0
+        
+        # Calculate correlation between error and uncertainty
+        if valid_mask.sum() > 10:
+            valid_error = depth_error[valid_mask].flatten()
+            valid_uncertainty = uncertainty_std[valid_mask].flatten()
+            if valid_error.std() > 1e-6 and valid_uncertainty.std() > 1e-6:
+                correlation = torch.corrcoef(torch.stack([valid_error, valid_uncertainty]))[0, 1]
+                correlation = correlation.item() if not torch.isnan(correlation) else 0.0
+            else:
+                correlation = 0.0
+        else:
+            correlation = 0.0
+        
+        # Create visualizations with consistent colormaps
+        rgb_vis = rgb_img.clone()
+        pred_depth_vis = apply_colormap(pred_depth, 'viridis')
+        gt_depth_vis = apply_colormap(gt_depth_tensor, 'viridis') 
+        uncertainty_vis = apply_colormap(uncertainty_std, 'plasma')  # Purple to yellow
+        error_vis = apply_colormap(depth_error, 'Reds')  # White to red
+        calibration_vis = apply_colormap(error_over_uncertainty, 'RdYlBu_r')  # Red=bad, Blue=good
+        
+        # Add informative text overlays
+        rgb_vis = add_text_overlay(rgb_vis, "RGB Input", (10, 25))
+        pred_depth_vis = add_text_overlay(pred_depth_vis, f"Pred Depth (RMSE: {pred_rmse:.3f}m)", (10, 25))
+        gt_depth_vis = add_text_overlay(gt_depth_vis, "GT Depth", (10, 25))
+        uncertainty_vis = add_text_overlay(uncertainty_vis, f"Uncertainty (μ:{uncertainty_mean:.3f}, max:{uncertainty_max:.3f})", (10, 25))
+        error_vis = add_text_overlay(error_vis, f"Depth Error (Corr: {correlation:.3f})", (10, 25))
+        calibration_vis = add_text_overlay(calibration_vis, "Error/Uncertainty (Blue=Good)", (10, 25))
+        
+        # Create 2x3 grid: RGB, Pred Depth, GT Depth (top)
+        #                  Uncertainty, Error, Calibration (bottom)
+        top_row = torch.cat([rgb_vis, pred_depth_vis, gt_depth_vis], dim=2)
+        bottom_row = torch.cat([uncertainty_vis, error_vis, calibration_vis], dim=2)
+        final_grid = torch.cat([top_row, bottom_row], dim=1)
+        
+        # Log to TensorBoard
+        self.logger.experiment.add_image(
+            f"{mode}_uncertainty_analysis",
+            final_grid,
+            global_step=self.global_step,
+            dataformats="CHW"
+        )
+        
+        # Also log scalar metrics for easy tracking
+        self.log(f"{mode}/uncertainty_mean", uncertainty_mean, on_step=False, on_epoch=True, sync_dist=True)
+        self.log(f"{mode}/uncertainty_max", uncertainty_max, on_step=False, on_epoch=True, sync_dist=True)
+        self.log(f"{mode}/depth_rmse", pred_rmse, on_step=False, on_epoch=True, sync_dist=True)
+        self.log(f"{mode}/error_uncertainty_correlation", correlation, on_step=False, on_epoch=True, sync_dist=True)
+        
+        ## Log uncertainty distribution as histogram
+        # if valid_mask.any():
+        #     uncertainty_flat = uncertainty_std[valid_mask].cpu().numpy()
+        #     self.logger.experiment.add_histogram(
+        #         f"{mode}_uncertainty_distribution",
+        #         uncertainty_flat,
+        #         global_step=self.global_step
+        #     )
+            
     @torch.no_grad()
     def log_refinement_progress(self, tgt_img, ref_imgs, gt_depth, 
                                 inv_depth_predictions, refined_ref_poses,

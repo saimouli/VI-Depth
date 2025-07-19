@@ -26,12 +26,12 @@ class SMLDataConsistentModule(pl.LightningDataModule):
 
     def setup(self, stage: str):
         if stage == "fit":
-            self.train_dataset = SML_tartan_consistent_dataset( #SML_consistent_dataset(
+            self.train_dataset = SML_consistent_dataset( #SML_consistent_dataset( #SML_tartan_consistent_dataset
                 self.data_root,
                 mode="train",
                 sequence_length=self.sequence_length
             )
-            self.test_dataset = SML_tartan_consistent_dataset( #SML_consistent_dataset(
+            self.test_dataset = SML_consistent_dataset( #SML_consistent_dataset( #SML_tartan_consistent_dataset
                 self.data_root,
                 mode="val",
                 sequence_length=self.sequence_length

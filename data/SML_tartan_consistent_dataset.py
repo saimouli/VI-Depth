@@ -286,10 +286,15 @@ class SML_tartan_consistent_dataset(Dataset):
 
         self.samples = sequence_set
     
-    def convert_to_4x4(self, pose):
+    def convert_to_4x4(self, pose, convert=False):
         if pose.shape == (3, 4):
+            R = pose[:, :3]
+            t = pose[:,  3]
+            if convert:
+                R = R.T
             pose_4x4 = np.eye(4)
-            pose_4x4[:3, :4] = pose
+            pose_4x4[:3, :3] = R
+            pose_4x4[:3,3] = t
             return pose_4x4
         elif pose.shape == (4, 4):
             return pose
@@ -358,7 +363,7 @@ class SML_tartan_consistent_dataset(Dataset):
     
         # Check motion using VIO poses (or GT poses - your choice)
         all_poses = [tgt_pose] + ref_pose  # Using VIO poses for filtering
-        max_translation = 1.0  # 100 cm
+        max_translation = 0.80  # 80 cm
         max_rotation = 12.0 
     
         for i in range(len(all_poses) - 1):
@@ -381,8 +386,8 @@ class SML_tartan_consistent_dataset(Dataset):
         
             # Skip entire sequence if ANY consecutive pair has large motion
             if trans_magnitude > max_translation : #or angle_deg > max_rotation:
-                print(f"Skipping sequence {index}: large gap between frames {i} and {i+1} "
-                    f"(trans={trans_magnitude:.3f}m, rot={angle_deg:.1f}°)")
+                # print(f"Skipping sequence {index}: large gap between frames {i} and {i+1} "
+                #     f"(trans={trans_magnitude:.3f}m, rot={angle_deg:.1f}°)")
                 # Return next sample instead (with wraparound)
                 next_index = (index + 1) % len(self.samples)
                 return self.__getitem__(next_index)
@@ -393,8 +398,8 @@ class SML_tartan_consistent_dataset(Dataset):
         tgt_ga_depth = load_depth_image_from_npy(str(sample['tgt_ga_depth']))
         tgt_interp = load_depth_image_from_npy(str(sample['tgt_interp']))
         
-        tgt_pose = self.convert_to_4x4(np.loadtxt(str(sample['tgt_pose'])))
-        tgt_ov_pose = self.convert_to_4x4(np.loadtxt(str(sample['tgt_ov_pose'])))
+        #tgt_pose = self.convert_to_4x4(np.loadtxt(str(sample['tgt_pose'])))
+        #tgt_ov_pose = self.convert_to_4x4(np.loadtxt(str(sample['tgt_ov_pose'])))
         
         #tgt_depth_pred = load_depth_image_from_npy(str(sample['tgt_depth_pred']))
 
@@ -404,8 +409,8 @@ class SML_tartan_consistent_dataset(Dataset):
         ref_interp = [load_depth_image_from_npy(str(ref_interp)) for ref_interp in sample['ref_interp']]
         ref_gt_depth = [load_sparse_depth(str(ref_gt_depth), depth_scale=self.depth_scale) for ref_gt_depth in sample['ref_gt_depth']]
         
-        ref_pose = [self.convert_to_4x4(np.loadtxt(pose)) for pose in sample['ref_pose']]
-        ref_ov_pose = [self.convert_to_4x4(np.loadtxt(pose)) for pose in sample['ref_ov_pose']]
+        #ref_pose = [self.convert_to_4x4(np.loadtxt(pose)) for pose in sample['ref_pose']]
+        #ref_ov_pose = [self.convert_to_4x4(np.loadtxt(pose)) for pose in sample['ref_ov_pose']]
 
         intrinsics = np.copy(sample['intrinsics'])
         
